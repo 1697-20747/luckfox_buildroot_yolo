@@ -1,0 +1,8 @@
+*.local.md
+*.onnx
+*.rknn
+*.pt
+*.whl
+__pycache__/
+*.pyc
+.DS_Store
