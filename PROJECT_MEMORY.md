@@ -154,25 +154,50 @@ a known category by checking Rockchip's own `rknn_model_zoo` yolov8 README: thei
 (`airockchip/ultralytics_yolov8`) with the DFL head's output graph restructured specifically to
 avoid ops like this one (same "optimized model, different from the official original model"
 pattern the yolo11 README also documents). Downloaded that real pre-optimized `yolov8n.onnx` from
-Rockchip's own CDN and re-ran the same toolkit-1.6.0 conversion against it -- **result pending,
-not yet tested on real hardware as of this note** (see next session's update / check
-`convert_v8n_opt_log.txt`-equivalent in this repo's history for the real outcome, don't assume).
+Rockchip's own CDN and re-ran the same toolkit-1.6.0 conversion against it.
+
+**Result: real success, confirmed on actual hardware.** Build produced 9 outputs (3 detection
+scales x [box coords, class scores, a reducesum+clip confidence sum] -- the softmax-free graph
+restructuring the README described, confirmed by output names: `318`/`onnx::ReduceSum_326`/`331`
+for the first scale, etc.). Deployed and ran for real on the Luckfox:
+```
+RESULT: INIT_OK
+io_num: n_input=1 n_output=9
+RESULT: INPUT_MEM_SET_OK
+RESULT: OUTPUT_MEM_SET_OK
+=== rknn_run ===
+RESULT: RUN_OK, got 9 output(s)
+RESULT: REAL_HARDWARE_INFERENCE_PASSED
+```
+**This is the first fully working real-hardware RKNN inference pass this investigation has
+produced** -- `rknn_init`, the zero-copy memory setup, and `rknn_run` all completed cleanly against
+the real NPU, all 9 output tensors with correct shapes (`[1,80,80,64]`/`[1,80,80,80]`/`[1,80,80,1]`
+and the 40x40/20x20 equivalents for the other two scales). Still only confirms the runtime PATH
+works end-to-end, not detection correctness -- the dummy input was zeroed, and no decode/NMS has
+been written yet to turn these 9 raw int8 tensors into real boxes; that's the next real step if
+this path is pursued further.
 
 **Note also, for completeness: RV1103/RV1106 is not in the "Current Support Platform" list even
-for this officially-optimized yolov8 export** -- so even a clean result here would be an
-unofficial-but-empirically-working configuration, not a documented-supported one.
+for this officially-optimized yolov8 export** -- so this is an unofficial-but-empirically-working
+configuration, not a documented-supported one. Worth remembering if this ever needs debugging
+without a matching official reference to lean on.
 
 ## What this means for the original goal (YOLO26 offload, replacing slow Pi-5-CPU inference)
 
-Not resolved as of this note. The honest picture: this specific board's specific real hardware
-constraints (a genuinely weak, RV1103/1106-family "mini" NPU, an old vendor runtime with no newer
-version to move to, and the zero-copy-only memory API) make it a harder target than the Hailo-8
-path already working elsewhere in `apex_ros` for the same detection problem. If the Pi-5-CPU
-framerate problem needs solving via NPU offload specifically, the honest options once this
-investigation is done being run are: (1) accept yolov8n or an even older/simpler architecture here
-if bug 2b turns out fixable, trading detection quality/recency for actually running; (2) a
-different, more capable Rockchip chip (RK3566/RK3588-class) that officially supports YOLO11/likely
-YOLO26 once official examples land, if a board swap is on the table; (3) stay on the already-working
-Hailo-8 AI HAT+ path for this problem and treat the Luckfox as unsuitable for this specific model
-family. None of these are decided -- recorded here as the real, current state of the tradeoff, not
-a recommendation made without 1697-20747's input.
+**Real, working proof that this exact chip CAN run a real YOLO detector end-to-end now exists**
+(yolov8n via Rockchip's own optimized export) -- the earlier pessimistic read ("architecturally
+blocked") turned out to be specific to YOLO26/YOLO11's attention block, not this board generally.
+YOLO26 itself is still blocked at model-load time by the same real C2PSA MatMul issue found
+earlier -- that finding stands, confirmed on real hardware, not superseded by this result. The
+honest current picture: (1) yolov8n (or a similarly attention-free architecture) is a real,
+demonstrated-working path on this exact board today, at some cost in detection quality/recency
+versus YOLO26; (2) YOLO26 specifically would need either upstream Rockchip/Ultralytics support for
+the attention op on this chip family (tracked nowhere publicly yet), or someone doing the same kind
+of graph-surgery Rockchip did for yolov8's DFL head, applied to YOLO26's C2PSA block instead -- a
+real, substantial, accuracy-risking undertaking, not attempted here; (3) a different, more capable
+Rockchip chip (RK3566/RK3588-class) would sidestep this entirely, official YOLO11 support already
+exists there. None of these are decided -- recorded here as the real, current state of the
+tradeoff, not a recommendation made without 1697-20747's input. Next real step either way: write the
+int8 dequant + box decode for the 9-output layout above and confirm real detections against a real
+image (needs a camera on the board, or at least a real labeled test image copied over -- not done
+yet, no camera physically attached as of this session).
