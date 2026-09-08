@@ -21,15 +21,27 @@ block blocker is addressed. See `PROJECT_MEMORY.md` for the full details.
 
 `scripts/luckfox_video_hud_stream.c` runs a persistent detection pipeline against a video file and
 serves it as a live MJPEG stream with an always-visible HUD overlay (boxes, labels, fps/inference-
-time readout — apex_hud-inspired, not a literal port). Real, measured performance on this hardware:
-**~4.5-4.8fps steady state, not 30fps** — NPU inference alone is a hard ~67ms/frame (~14.7fps)
-ceiling, and JPEG-encode+network-send adds another ~90ms/frame on top, all competing for this
-chip's single CPU core. See `PROJECT_MEMORY.md` for the full profiled breakdown.
+time readout — apex_hud-inspired, not a literal port). Display resolution is decoupled from
+inference resolution: the NPU always sees a 640x640 downscaled copy (inference cost stays
+constant), while the stream/HUD renders at the source video's own native resolution by default —
+real, measured tradeoff: full native res looks better but costs real fps (JPEG-encode+network-send
+scale with pixel count). See `PROJECT_MEMORY.md` for the full profiled breakdown at both
+resolutions; 30fps is not achievable at either.
 
 ```
-sudo ./luckfox_video_hud_stream <model.rknn> <video.mp4> coco_80_labels_list.txt [port]
+sudo ./luckfox_video_hud_stream <model.rknn> <video.mp4> [labels.txt] [port] [display_w] [display_h]
 ```
-Then open `http://<board-ip>:<port>/` in a browser on the same WiFi network.
+`display_w`/`display_h` default to the source video's own resolution (auto-probed via `ffprobe`) —
+pass them explicitly (e.g. `960 540`) to trade quality for fps. Then open
+`http://<board-ip>:<port>/` in a browser on the same WiFi network.
+
+## Live camera
+
+Not connected yet. Real compatibility gap found before physically trying: this board's vendor image
+ships only one camera sensor driver (`sc3336.ko`) — no IMX219/IMX708/OV5647 (Raspberry Pi Camera
+Module) driver exists on it. A Pi Camera on the ribbon connector may not be electrically compatible
+either, separate from the driver question. See `PROJECT_MEMORY.md` for the plan once a module is
+physically connected (check `dmesg`/I2C detection first, before investing in kernel driver work).
 
 ## Try it yourself
 

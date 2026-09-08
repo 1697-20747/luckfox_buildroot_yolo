@@ -338,3 +338,59 @@ no movement) or someone doing real model surgery to remove/replace the attention
 large, accuracy-risking, and would need retraining/fine-tuning, not just a graph edit -- unlike the
 DFL-softmax removal that made yolov8 work here, which was a pure postprocessing restructuring with
 no effect on the trained weights).
+
+## Decoupled display/inference resolution -- real, working, real tradeoff measured (2026-09-08, same session)
+
+1697-20747 asked: can full camera-feed resolution go to the stream/HUD while a reduced resolution feeds
+inference? Yes -- implemented in `luckfox_video_hud_stream.c`: `ffmpeg` now decodes/scales to the
+source's own native resolution (auto-probed via `ffprobe`, no longer hardcoded to 640x640), a
+separate cheap in-process downscale (`downscale_for_inference()`, nearest-neighbor) produces the
+640x640 copy the NPU actually sees, detections decode in that small copy's coordinate space and get
+rescaled back up (`scale_x`/`scale_y`) before drawing on the FULL-res frame. Real, not assumed --
+tested against `bikes.mp4`'s native 1280x720.
+
+**Real measured tradeoff, exactly as predicted before implementing, now confirmed with numbers, not
+assumed:** full-res streaming makes the picture better but real fps drops, it does not improve:
+
+| stage | 640x640 stream | 1280x720 stream (native) |
+|---|---|---|
+| ffmpeg read | ~15-20ms | ~26-34ms |
+| inference (+ the new downscale step) | ~67ms | ~85-93ms |
+| JPEG encode + network send | ~90-100ms | ~150-160ms |
+| real steady-state fps | ~4.5-4.8 | ~3.0-3.1 |
+
+The downscale-for-inference step itself is a real, non-negligible added cost (~18-26ms) -- nearest-
+neighbor over ~410K pixels with a per-pixel integer division, on a weak single ARMv7 core with no
+guaranteed vectorization. Worth optimizing (precomputed row/col index tables, or a faster resize
+algorithm) if this path gets pursued further; not done this pass.
+
+`display_w`/`display_h` are now optional CLI args (`luckfox_video_hud_stream <model> <video>
+[labels] [port] [display_w] [display_h]`), defaulting to the source's own resolution when omitted
+-- 1697-20747 (or whoever runs this) can pick the real quality/speed tradeoff point directly (e.g.
+960x540 as a middle ground) rather than the tool silently choosing one.
+
+## Live camera: not connected, and a real compatibility gap found before physically trying (2026-09-08, same session)
+
+Checked hardware state for the "live camera next" step: `dmesg` shows the kernel's MIPI-CSI camera
+stack IS present and initialized (`rkcif`, `rockchip-mipi-csi2`, `csi2-dphy` all probed
+successfully) but every capture stream reports `get remote terminal sensor failed` -- no physical
+sensor currently answers on the bus, confirming no camera is connected (matches what 1697-20747 already
+said).
+
+1697-20747's plan: use a Raspberry Pi Camera Module (v1/OV5647, v2/IMX219, or v3/IMX708 -- not yet
+confirmed which) on the ribbon connector, "given restrictions" (presumably no SC3336-compatible
+module on hand). **Checked before any physical connection, per this project's own "verify before
+recommending" discipline:** this board's vendor image ships exactly ONE camera sensor kernel
+module -- `/oem/usr/lib/ko/sc3336.ko` (Rockchip's own SmartSens SC3336). No IMX219/IMX708/OV5647
+driver exists anywhere on this filesystem. A physically-compatible-looking ribbon connector does
+NOT guarantee the kernel will recognize the sensor -- without a matching driver, it likely won't
+appear as a working V4L2 device even if electrically connected. Real, stacked risks: (1) driver
+support, confirmed missing; (2) FPC pinout/electrical compatibility between a genuine Pi Camera
+ribbon and this board's MIPI-CSI connector, unconfirmed either way.
+
+**Plan going forward, not yet executed:** once physically connected, check `dmesg`/I2C bus
+detection first (`i2cdetect`, not yet confirmed installed) -- that answers whether the board sees
+anything electrically at all, before investing in the real, nontrivial work of cross-compiling a
+kernel sensor driver against this exact kernel build (would need the matching kernel source/headers,
+not yet confirmed available on-device or via the Luckfox SDK). Not attempted yet -- waiting on
+1697-20747 to physically connect the module and confirm which Pi Camera version it is.

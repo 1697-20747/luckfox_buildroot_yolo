@@ -9,20 +9,35 @@
  *
  * Architecture: the model loads ONCE (rknn_init + zero-copy I/O set up
  * once, reused every frame -- re-doing that per frame would be far too
- * slow). An `ffmpeg` subprocess (spawned via popen, decodes/scales any
- * input video format to raw RGB24 640x640 frames) feeds frames in over
- * a pipe. Each frame: quantize -> rknn_run -> decode (compute_dfl +
+ * slow). An `ffmpeg` subprocess (spawned via popen) decodes/scales the
+ * input to raw RGB24 frames at DISPLAY_W x DISPLAY_H (the source's own
+ * resolution by default -- full quality for streaming/HUD, per 1697-20747's
+ * "full resolution can go to streaming output and HUD, with reduced
+ * resolution for inference"). Each frame: a cheap in-process bilinear
+ * downscale to a SEPARATE MODEL_SIZE x MODEL_SIZE copy feeds the NPU
+ * (inference cost is therefore unchanged regardless of display
+ * resolution -- it's always run on the same small copy); detections
+ * decode in that small copy's coordinate space (compute_dfl +
  * process_i8_rv1106 math, same as luckfox_yolov8_detect.c, restricted
- * to ALLOWED_CLASSES to cut CPU-side decode-loop cost, per 1697-20747's
- * explicit "restrict object types to speed inference as needed") ->
- * NMS -> draw (Rockchip's own image_drawing.c/font.h, real bitmap-font
- * text rendering, not written from scratch) -> JPEG-encode
- * (stb_image_write) -> push as one MJPEG multipart chunk to a single
- * connected HTTP client. Loops the video when it ends (continuous
- * "live" demo). Real, measured FPS is printed every N frames --
- * report the honest number, don't assume 30fps is hit.
+ * to ALLOWED_CLASSES to cut CPU-side decode-loop cost) -> NMS -> box
+ * coordinates rescaled back up to the FULL-res frame -> drawn there
+ * (Rockchip's own image_drawing.c/font.h, real bitmap-font text
+ * rendering, not written from scratch) -> JPEG-encoded at full
+ * resolution (stb_image_write) -> pushed as one MJPEG multipart chunk
+ * to a single connected HTTP client. Loops the video when it ends
+ * (continuous "live" demo).
  *
- * Usage: sudo ./luckfox_video_hud_stream <model.rknn> <video-file> <labels.txt> [http-port]
+ * Real tradeoff, measured not assumed: full-res streaming means more
+ * pixels to JPEG-encode and send over the network per frame -- already
+ * this pipeline's single biggest measured cost at 640x640 (~90ms/frame,
+ * bigger than the ~67ms NPU inference itself). Displaying at full
+ * source resolution will push real fps DOWN further, not up -- report
+ * whatever the real measured number is, don't assume this trade is
+ * free.
+ *
+ * Usage: sudo ./luckfox_video_hud_stream <model.rknn> <video-file> <labels.txt> [http-port] [display_w] [display_h]
+ * display_w/display_h default to the source video's own resolution
+ * (probed via ffprobe) if omitted.
  * Then open http://<board-ip>:<port>/ in a browser on the same WiFi.
  */
 #include <stdio.h>
@@ -164,6 +179,21 @@ static std::vector<Detection> nms(std::vector<Detection>& dets) {
     return keep;
 }
 
+/* Cheap nearest-neighbor downscale from the full display-resolution
+ * frame to a separate MODEL_SIZE x MODEL_SIZE copy for NPU input --
+ * keeps inference cost constant regardless of display/stream
+ * resolution (1697-20747: "full resolution can go to streaming output and
+ * hud, with reduced resolution for inference on chip"). */
+static void downscale_for_inference(unsigned char* src, int src_w, int src_h, unsigned char* dst, int dst_w, int dst_h) {
+    for (int y = 0; y < dst_h; y++) {
+        int sy = y * src_h / dst_h;
+        for (int x = 0; x < dst_w; x++) {
+            int sx = x * src_w / dst_w;
+            for (int c = 0; c < 3; c++) dst[(y * dst_w + x) * 3 + c] = src[(sy * src_w + sx) * 3 + c];
+        }
+    }
+}
+
 /* image_drawing.c's draw_rectangle only draws outlines -- a small
  * solid-fill helper for the HUD readout panel's background. */
 static void fill_rect(unsigned char* rgb, int img_w, int img_h, int x, int y, int w, int h, unsigned char r, unsigned char g, unsigned char b) {
@@ -236,7 +266,7 @@ static int http_send_frame(unsigned char* rgb, int w, int h) {
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        fprintf(stderr, "usage: %s model.rknn video.mp4 [labels.txt] [http-port]\n", argv[0]);
+        fprintf(stderr, "usage: %s model.rknn video.mp4 [labels.txt] [http-port] [display_w] [display_h]\n", argv[0]);
         return 1;
     }
     const char* model_path = argv[1];
@@ -245,6 +275,27 @@ int main(int argc, char** argv) {
     int http_port = argc > 4 ? atoi(argv[4]) : HTTP_PORT_DEFAULT;
     setvbuf(stdout, NULL, _IOLBF, 0); /* line-buffer even when redirected to a file/log */
     load_labels(labels_path);
+
+    int display_w = argc > 5 ? atoi(argv[5]) : 0;
+    int display_h = argc > 6 ? atoi(argv[6]) : 0;
+    if (display_w <= 0 || display_h <= 0) {
+        /* probe the source's own resolution via ffprobe rather than
+         * guessing/hardcoding one */
+        char probe_cmd[1024];
+        snprintf(probe_cmd, sizeof(probe_cmd),
+                 "ffprobe -v error -select_streams v:0 -show_entries stream=width,height "
+                 "-of csv=p=0 '%s'", video_path);
+        FILE* probe = popen(probe_cmd, "r");
+        if (probe) {
+            if (fscanf(probe, "%d,%d", &display_w, &display_h) != 2) { display_w = 0; display_h = 0; }
+            pclose(probe);
+        }
+        if (display_w <= 0 || display_h <= 0) {
+            fprintf(stderr, "RESULT: FFPROBE_FAIL, falling back to %dx%d\n", MODEL_SIZE, MODEL_SIZE);
+            display_w = MODEL_SIZE; display_h = MODEL_SIZE;
+        }
+    }
+    printf("RESULT: DISPLAY_RES %dx%d (inference stays %dx%d)\n", display_w, display_h, MODEL_SIZE, MODEL_SIZE);
 
     /* --- RKNN init, zero-copy I/O, ONCE --- */
     rknn_context ctx = 0;
@@ -280,21 +331,23 @@ int main(int argc, char** argv) {
 
     if (http_start_server(http_port) != 0) return 1;
 
-    unsigned char* frame_rgb = (unsigned char*)malloc(MODEL_SIZE * MODEL_SIZE * 3);
+    unsigned char* frame_full = (unsigned char*)malloc(display_w * display_h * 3);
+    unsigned char* frame_small = (unsigned char*)malloc(MODEL_SIZE * MODEL_SIZE * 3);
+    float scale_x = (float)display_w / MODEL_SIZE;
+    float scale_y = (float)display_h / MODEL_SIZE;
 
     while (1) {
         http_wait_for_client();
 
         char ffmpeg_cmd[1024];
-        /* No -re (don't throttle to source fps -- consume as fast as
-         * this pipeline can go); fast_bilinear scale algorithm (cheap,
-         * real CPU saving on this single-core chip vs the default
-         * bicubic) -- 1697-20747: "restrict object types... 30fps is a
-         * decent interim target," measure honestly against that, don't
-         * assume it's hit. */
+        /* Decode/scale to the FULL display resolution -- no -re (don't
+         * throttle to source fps, consume as fast as this pipeline
+         * can go); fast_bilinear (cheap, real CPU saving on this
+         * single-core chip vs the default bicubic). The separate
+         * MODEL_SIZE downscale for inference happens in-process below. */
         snprintf(ffmpeg_cmd, sizeof(ffmpeg_cmd),
                  "ffmpeg -i '%s' -loglevel error -vf scale=%d:%d:flags=fast_bilinear -pix_fmt rgb24 -f rawvideo -",
-                 video_path, MODEL_SIZE, MODEL_SIZE);
+                 video_path, display_w, display_h);
         FILE* ffmpeg_pipe = popen(ffmpeg_cmd, "r");
         if (!ffmpeg_pipe) { printf("RESULT: FFMPEG_SPAWN_FAIL\n"); break; }
 
@@ -306,16 +359,17 @@ int main(int argc, char** argv) {
         while (client_alive) {
             struct timespec t_read_start, t_read_end;
             clock_gettime(CLOCK_MONOTONIC, &t_read_start);
-            size_t n = fread(frame_rgb, 1, MODEL_SIZE * MODEL_SIZE * 3, ffmpeg_pipe);
+            size_t n = fread(frame_full, 1, display_w * display_h * 3, ffmpeg_pipe);
             clock_gettime(CLOCK_MONOTONIC, &t_read_end);
             double read_ms = (t_read_end.tv_sec - t_read_start.tv_sec) * 1000.0 +
                               (t_read_end.tv_nsec - t_read_start.tv_nsec) / 1e6;
-            if (n != (size_t)(MODEL_SIZE * MODEL_SIZE * 3)) break; /* video ended */
+            if (n != (size_t)(display_w * display_h * 3)) break; /* video ended */
 
             struct timespec t_infer_start, t_infer_end;
             clock_gettime(CLOCK_MONOTONIC, &t_infer_start);
 
-            for (int i = 0; i < MODEL_SIZE * MODEL_SIZE * 3; i++) in_buf[i] = (int8_t)((int)frame_rgb[i] - 128);
+            downscale_for_inference(frame_full, display_w, display_h, frame_small, MODEL_SIZE, MODEL_SIZE);
+            for (int i = 0; i < MODEL_SIZE * MODEL_SIZE * 3; i++) in_buf[i] = (int8_t)((int)frame_small[i] - 128);
             ret = rknn_run(ctx, NULL);
             if (ret != RKNN_SUCC) { printf("RESULT: RUN_FAIL ret=%d\n", ret); break; }
 
@@ -335,28 +389,32 @@ int main(int argc, char** argv) {
             double infer_ms = (t_infer_end.tv_sec - t_infer_start.tv_sec) * 1000.0 +
                                (t_infer_end.tv_nsec - t_infer_start.tv_nsec) / 1e6;
 
-            /* --- draw HUD overlay onto frame_rgb --- */
+            /* --- draw HUD overlay onto the FULL-res frame -- box
+             * coordinates rescaled from MODEL_SIZE space up to
+             * display_w x display_h --- */
             image_buffer_t img;
             memset(&img, 0, sizeof(img));
-            img.width = MODEL_SIZE; img.height = MODEL_SIZE;
-            img.width_stride = MODEL_SIZE; img.height_stride = MODEL_SIZE;
+            img.width = display_w; img.height = display_h;
+            img.width_stride = display_w; img.height_stride = display_h;
             img.format = IMAGE_FORMAT_RGB888;
-            img.virt_addr = frame_rgb;
-            img.size = MODEL_SIZE * MODEL_SIZE * 3;
+            img.virt_addr = frame_full;
+            img.size = display_w * display_h * 3;
 
             for (auto& d : dets) {
+                int dx = (int)(d.x * scale_x), dy = (int)(d.y * scale_y);
+                int dw = (int)(d.w * scale_x), dh = (int)(d.h * scale_y);
                 unsigned int color = class_colors[d.cls_id];
-                draw_rectangle(&img, (int)d.x, (int)d.y, (int)d.w, (int)d.h, color, 2);
+                draw_rectangle(&img, dx, dy, dw, dh, color, 2);
                 char label[96];
                 snprintf(label, sizeof(label), "%s %.0f%%", class_names[d.cls_id], d.score * 100);
-                fill_rect(frame_rgb, MODEL_SIZE, MODEL_SIZE, (int)d.x, (int)d.y - 14, (int)strlen(label) * 8 + 4, 14, 20, 20, 20);
-                draw_text(&img, label, (int)d.x + 2, (int)d.y - 13, COLOR_WHITE, 12);
+                fill_rect(frame_full, display_w, display_h, dx, dy - 14, (int)strlen(label) * 8 + 4, 14, 20, 20, 20);
+                draw_text(&img, label, dx + 2, dy - 13, COLOR_WHITE, 12);
             }
 
             /* always-visible HUD readout panel, top-left -- apex_hud's
              * "always draw the instrument, neutral default when idle"
              * convention, loosely */
-            fill_rect(frame_rgb, MODEL_SIZE, MODEL_SIZE, 4, 4, 190, 46, 15, 15, 15);
+            fill_rect(frame_full, display_w, display_h, 4, 4, 220, 46, 15, 15, 15);
             char hud_line1[64], hud_line2[64], hud_line3[64];
             frame_count++;
             clock_gettime(CLOCK_MONOTONIC, &now);
@@ -364,14 +422,14 @@ int main(int argc, char** argv) {
             double fps = elapsed > 0 ? frame_count / elapsed : 0;
             snprintf(hud_line1, 64, "frame %d  fps %.1f", frame_count, fps);
             snprintf(hud_line2, 64, "infer %.1fms  det %zu", infer_ms, dets.size());
-            snprintf(hud_line3, 64, "LUCKFOX RV1106 / yolov8n");
+            snprintf(hud_line3, 64, "LUCKFOX RV1106 / yolov8n @ %dx%d disp", display_w, display_h);
             draw_text(&img, hud_line1, 8, 8, COLOR_WHITE, 12);
             draw_text(&img, hud_line2, 8, 22, COLOR_YELLOW, 12);
             draw_text(&img, hud_line3, 8, 36, COLOR_GREEN, 10);
 
             struct timespec t_send_start, t_send_end;
             clock_gettime(CLOCK_MONOTONIC, &t_send_start);
-            if (http_send_frame(frame_rgb, MODEL_SIZE, MODEL_SIZE) < 0) {
+            if (http_send_frame(frame_full, display_w, display_h) < 0) {
                 printf("RESULT: CLIENT_DISCONNECTED after %d frames\n", frame_count);
                 client_alive = 0;
             }
@@ -391,7 +449,8 @@ int main(int argc, char** argv) {
         client_fd = -1;
     }
 
-    free(frame_rgb);
+    free(frame_full);
+    free(frame_small);
     for (uint32_t i = 0; i < io_num.n_output; i++) rknn_destroy_mem(ctx, output_mems[i]);
     rknn_destroy_mem(ctx, input_mem);
     rknn_destroy(ctx);
