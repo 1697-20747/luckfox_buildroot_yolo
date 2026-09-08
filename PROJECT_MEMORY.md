@@ -293,3 +293,48 @@ video, full stop.
 
 Ubuntu update check (1697-20747 asked, addendum): also confirmed `ffmpeg` installs cleanly via the
 existing Jammy `apt` repos (`7:4.4.2-0ubuntu0.22.04.1`), no issues.
+
+## Re-checked whether YOLO26 is now viable, and why "YOLOv10+/YOLO26 is faster" doesn't transfer here (2026-09-08, same session)
+
+1697-20747 asked directly: given YOLOv10+/YOLO26 are supposed to be much faster than YOLOv8, worth
+trying the YOLO26 path again, or is the chipset the real constraint? Re-checked fresh rather than
+assuming yesterday's answer still holds: `rknn-toolkit2` latest release still v2.3.2 (unchanged),
+`rknpu2` latest tag still v1.5.2 (unchanged), the tracked upstream issue
+(`airockchip/rknn-toolkit2#498`, "YOLO26 support") still has zero new comments since 2026-01-28, a
+fresh GitHub search for "C2PSA RV1106" / "RV1106 attn MatMul" across all repos found nothing new.
+**Re-ran the exact same real on-device test against the already-exported `yolo26n` model -- same
+failure, byte-for-byte identical error, reproduced right now, not stale:**
+```
+E RKNN: unsupport cpu MatMul op, op name: MatMul:/model.10/m/m.0/attn/MatMul_1
+```
+
+**Answering the actual question: the chipset is the real constraint, and it's not a speed
+question, it's a hard compatibility one.** Two different "update paths" were already tried across
+this investigation (2.3.2 toolkit against the old runtime -> model-version mismatch; 1.6.0 toolkit
+matching the real runtime -> model builds fine, passes the simulator, but fails at real
+`rknn_init` on hardware) -- neither is a version-skew problem to fix by updating something, because
+the root cause is that RV1106's actual NPU silicon + driver genuinely has no support for the
+`MatMul` op YOLO26's C2PSA self-attention block needs, with no CPU fallback either. That's real,
+current, and unchanged.
+
+**Why "YOLOv10+/YOLO26 is faster" doesn't help even if it did load:** that speed claim is real, but
+specifically about eliminating NMS postprocessing overhead (the "one-to-one" NMS-free head) --
+which matters most on hardware where NMS is a genuine bottleneck (GPUs, or edge NPUs handling many
+candidate boxes). On THIS chip, the real bus.jpg test already showed NMS is not the bottleneck: only
+31 raw candidate boxes survived the confidence threshold, an IoU sort over 31 items costs
+microseconds on any CPU -- the real, measured 67ms/frame cost is backbone convolution compute
+(NPU MAC throughput), not postprocessing. YOLO26's C2PSA attention block, layered on top of a
+similar backbone to YOLOv8's, is architecturally MORE NPU compute per frame than YOLOv8, not less
+-- so even setting the load-failure aside entirely, there's no real reason to expect YOLO26 would
+be faster than the already-working yolov8n pipeline on this specific ~1 TOPS chip. The general
+"YOLO26 is faster" claim is true on the hardware it was measured on (GPUs, RK3588-class NPUs in
+Ultralytics' own benchmarks) and doesn't transfer to RV1106's specific bottleneck.
+
+**Conclusion, unchanged from before but now freshly re-verified rather than assumed stale:** yolov8n
+(via Rockchip's optimized export) remains the real, working path on this exact board. YOLO26 stays
+blocked on a real hardware/driver limitation, not a version or speed issue -- the only way past it
+would be Rockchip/Ultralytics landing real operator support for this chip family (tracked nowhere,
+no movement) or someone doing real model surgery to remove/replace the attention block (untried,
+large, accuracy-risking, and would need retraining/fine-tuning, not just a graph edit -- unlike the
+DFL-softmax removal that made yolov8 work here, which was a pure postprocessing restructuring with
+no effect on the trained weights).
