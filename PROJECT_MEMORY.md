@@ -394,3 +394,51 @@ anything electrically at all, before investing in the real, nontrivial work of c
 kernel sensor driver against this exact kernel build (would need the matching kernel source/headers,
 not yet confirmed available on-device or via the Luckfox SDK). Not attempted yet -- waiting on
 1697-20747 to physically connect the module and confirm which Pi Camera version it is.
+
+## Camera ribbon fixed (wrong orientation), accelerometer checked, static LAN IP, WiFi set up (2026-09-09)
+
+**Camera ribbon cable orientation:** 1697-20747 had it backwards. Real official source checked before
+answering (wiki.luckfox.com/Luckfox-Pico-Ultra/CSI-Camera/, not guessed): metal contacts face the
+chip (RV1106) side of the board; also open the connector's black latch with even force on both
+sides, not one side only (real damage risk otherwise). 1697-20747 fixed it. **Re-ran the exact same live
+sensor-negotiation test after the fix -- identical failure, fresh timestamp, not stale:**
+`rkcif_update_sensor_info: stream[0] get remote terminal sensor failed!`. Confirms the earlier
+driver-gap finding (no IMX219/IMX708/OV5647 driver on this image) was the real blocker all along,
+not cable orientation -- cable is now correct and it still doesn't work, isolating the variable.
+
+**Accelerometer: attached, but genuinely undetectable by any method tried so far.** No matching
+`/sys/bus/iio/devices/` entry (only the SoC's own ADC controller shows up), no new `dmesg` activity
+since it was attached, and Luckfox's own vendor test tools (`/oem/usr/bin/luckfox_i2c_test` etc.)
+turned out to be built for a DIFFERENT C library entirely -- `readelf -l` shows they require
+`/lib/ld-uClibc.so.0` (Luckfox's standard Buildroot/uClibc SDK image's dynamic linker), which
+doesn't exist on this board's actual glibc-based Ubuntu image -- a real, previously-unknown
+incompatibility between the vendor tooling and this specific OS image, not a bug in the tools
+themselves. Tried the standard Ubuntu path instead: `i2c-tools` is already installed, but
+`modprobe i2c-dev` failed outright -- **`/lib/modules/5.10.160` doesn't exist on this system at
+all**, meaning this kernel build has no loadable-module directory; most drivers (including,
+apparently, generic I2C character-device access) are compiled directly into the kernel image or
+simply weren't included, not something addable by loading a module. Real blocker, not yet solved
+-- need to know the exact accelerometer chip/model to know if there's any real path forward (a
+built-in IIO driver for that specific chip might already exist and just need device-tree wiring,
+or it may need the same kind of real kernel-rebuild work the camera driver gap would need).
+
+**Static LAN IP set, confirmed working, not just applied-and-hoped:** `eth0` was on DHCP
+(192.168.1.180 at the time). Used `nmcli connection modify "Wired connection 1" ipv4.method manual
+...` with the SAME IP/gateway/DNS already active (deliberately, to avoid a real risk of losing the
+only remote-management path if a genuinely different address was chosen), then `nmcli connection
+up` to apply. Verified with a fresh SSH connection after applying, not assumed -- confirmed clean
+reconnect at the same IP. This survives reboots (NetworkManager profile, not a one-off `ip addr`
+command).
+
+**WiFi configured, connected, and set to auto-connect -- LAN cable should no longer be required
+going forward, per 1697-20747's ask.** `nmcli device wifi connect "EE-597TSN" password "..." ifname
+wlan0` -- real credentials 1697-20747 provided, connected on the first attempt, got a real DHCP lease
+(192.168.1.196), `autoconnect=yes` confirmed in the saved profile (survives reboot). **One real,
+explained (not glossed over) test limitation:** couldn't cleanly confirm SSH reachability via the
+WiFi IP alone while the LAN cable was still connected -- `ip route` shows `eth0` at metric 100 vs
+`wlan0` at metric 600, so with both interfaces up on the identical 192.168.1.0/24 subnet, reply
+traffic prefers `eth0` regardless of which interface a request arrived on, a normal Linux
+multi-homed-same-subnet routing artifact, not a sign WiFi itself is broken. Real, definitive
+confirmation needs 1697-20747 to physically unplug the LAN cable and test `ssh pico@192.168.1.196` (or
+whatever IP `wlan0` gets next boot) -- not done yet, this is the one item in this batch not fully
+closed out.
