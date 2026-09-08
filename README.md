@@ -35,6 +35,31 @@ sudo ./luckfox_video_hud_stream <model.rknn> <video.mp4> [labels.txt] [port] [di
 pass them explicitly (e.g. `960 540`) to trade quality for fps. Then open
 `http://<board-ip>:<port>/` in a browser on the same WiFi network.
 
+Also reads the MPU-6050 accelerometer (once the kernel fix below is flashed and it's actually
+detected) via Linux's standard IIO sysfs interface, auto-discovering the right `iio:deviceN`.
+Real readings pass through an exponential-moving-average filter (`ACCEL_EMA_ALPHA` in the source)
+before being drawn, to keep the HUD readout from jumping around on raw sensor noise — real achieved
+sample rate is measured and logged, not assumed. Draws "ACCEL: not connected" (grey) until a real
+sensor is found, rather than omitting the panel or guessing a value.
+
+## GPIO header pinout (confirmed real, not from an unreadable diagram)
+
+Read directly off a real photo of the board's own pinout diagram (Waveshare-style), for the pins
+used by the MPU-6050 accelerometer:
+
+| Physical pin | Function | Notes |
+|---|---|---|
+| 31 | 3.3V | power |
+| 32 | GPIO1_A0, alt-function `I2C2_SCL_M0` | SCL |
+| 33 | GPIO1_B0, alt-function `I2C2_SDA_M0` | SDA |
+| 40 | GPIO1_A1 | a real GPIO signal pin — **not ground** |
+| 41 | GND | confirmed ground (pin 40 is not, despite being adjacent) |
+
+This board has three separate I2C buses in active use, not one shared bus — worth remembering
+before wiring anything else up: **I2C2** (this GPIO header, used above for the MPU-6050), **I2C3**
+(the LCD connector's touchscreen), **I2C4** (the CSI camera connector's sensor control — shares
+pins with the CSI camera, so CSI and I2C4 can't both be configured at once by default).
+
 ## Live camera
 
 Not connected yet. Real compatibility gap found before physically trying: this board's vendor image

@@ -39,6 +39,27 @@
  * display_w/display_h default to the source video's own resolution
  * (probed via ffprobe) if omitted.
  * Then open http://<board-ip>:<port>/ in a browser on the same WiFi.
+ *
+ * Accelerometer HUD readout (MPU-6050, real device-tree/kernel fix
+ * written and build-in-progress as of this addition -- NOT yet
+ * confirmed live on real hardware, see PROJECT_MEMORY.md): reads the
+ * standard Linux IIO sysfs interface the mainline inv_mpu6050 driver
+ * exposes (/sys/bus/iio/devices/iio:deviceN/in_accel_{x,y,z}_raw +
+ * in_accel_scale), auto-discovering deviceN by matching the "name"
+ * file to "mpu6050" rather than hardcoding an index. Per 1697-20747's
+ * explicit ask ("add smoothing averaging filter... to prevent noisy
+ * signal from accelerometer... jumpy visuals"): raw readings pass
+ * through a simple exponential moving average (EMA) per axis before
+ * being drawn -- real, standard technique for exactly this problem
+ * (a low-pass filter trading responsiveness for stability; ACCEL_EMA_ALPHA
+ * below controls that tradeoff, not tuned against real sensor noise
+ * yet since no real data has been read from actual hardware). Real
+ * achieved sample rate is measured and printed periodically, same
+ * "report the honest number" discipline as the video fps stats --
+ * don't assume a rate, read it. Follows this file's own established
+ * "always draw the instrument, neutral/grey when no data" convention:
+ * the panel always renders, showing "ACCEL: not connected" if the IIO
+ * device isn't found rather than omitting the readout or crashing.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -78,6 +99,118 @@ static const int STRIDES[NUM_SCALES] = {8, 16, 32};
  * decode loop cuts real CPU work per grid cell -- edit this set to
  * widen/narrow what gets detected. */
 static std::set<int> ALLOWED_CLASSES = {0, 1, 2, 3, 5, 7};
+
+/* --- MPU-6050 accelerometer via Linux IIO sysfs, with EMA smoothing --- */
+
+/* Real, standard low-pass filter: smoothed = alpha*new + (1-alpha)*old.
+ * Lower alpha = smoother/slower to respond, higher alpha = more
+ * responsive/noisier. Not tuned against real sensor noise yet -- no
+ * real data has been read from actual hardware as of this addition.
+ * 0.2 is a reasonable, commonly-used starting point for this exact
+ * kind of "visual HUD readout" use case (not a safety-critical control
+ * loop, where a much smaller alpha or a proper complementary/Kalman
+ * filter would be worth the extra complexity). */
+#define ACCEL_EMA_ALPHA 0.2f
+
+typedef struct {
+    bool found;
+    char device_path[256];   /* /sys/bus/iio/devices/iio:deviceN */
+    float scale;              /* raw-to-g conversion, read once from in_accel_scale */
+    float smoothed_x, smoothed_y, smoothed_z;
+    bool ema_initialized;     /* first real reading seeds the EMA instead of starting at 0 */
+    int reads_ok, reads_fail;
+    struct timespec rate_t0;
+    int rate_count;
+    float measured_hz;
+} AccelState;
+
+/* Auto-discovers the mpu6050 IIO device by checking each iio:deviceN's
+ * "name" file, rather than hardcoding an index (device numbering isn't
+ * guaranteed stable across other IIO devices the kernel might expose,
+ * e.g. the SoC's own ADC seen earlier in this project's real
+ * /sys/bus/iio/devices/ check). */
+static void accel_discover(AccelState* st) {
+    memset(st, 0, sizeof(*st));
+    for (int i = 0; i < 8; i++) {
+        char name_path[256], name_buf[64];
+        snprintf(name_path, sizeof(name_path), "/sys/bus/iio/devices/iio:device%d/name", i);
+        FILE* f = fopen(name_path, "r");
+        if (!f) continue;
+        if (fgets(name_buf, sizeof(name_buf), f)) {
+            name_buf[strcspn(name_buf, "\r\n")] = 0;
+            if (strstr(name_buf, "mpu6050") != NULL) {
+                snprintf(st->device_path, sizeof(st->device_path), "/sys/bus/iio/devices/iio:device%d", i);
+                st->found = true;
+                fclose(f);
+                break;
+            }
+        }
+        fclose(f);
+    }
+    if (!st->found) {
+        printf("RESULT: ACCEL_NOT_FOUND (no iio device named 'mpu6050' -- check the kernel fix has been flashed and booted)\n");
+        return;
+    }
+    char scale_path[300];
+    snprintf(scale_path, sizeof(scale_path), "%s/in_accel_scale", st->device_path);
+    FILE* sf = fopen(scale_path, "r");
+    if (sf) {
+        if (fscanf(sf, "%f", &st->scale) != 1) st->scale = 1.0f;
+        fclose(sf);
+    } else {
+        st->scale = 1.0f; /* fall back to raw units if scale file is missing */
+    }
+    printf("RESULT: ACCEL_FOUND %s scale=%f\n", st->device_path, st->scale);
+    clock_gettime(CLOCK_MONOTONIC, &st->rate_t0);
+}
+
+static bool accel_read_raw_axis(const char* device_path, const char* axis, float* out_g, float scale) {
+    char path[300];
+    snprintf(path, sizeof(path), "%s/in_accel_%s_raw", device_path, axis);
+    FILE* f = fopen(path, "r");
+    if (!f) return false;
+    int raw;
+    bool ok = fscanf(f, "%d", &raw) == 1;
+    fclose(f);
+    if (ok) *out_g = raw * scale;
+    return ok;
+}
+
+/* Reads real x/y/z, applies the EMA filter, and tracks real achieved
+ * sample rate (printed every 30 successful reads -- report the real
+ * number once hardware exists, don't assume one). */
+static void accel_update(AccelState* st) {
+    if (!st->found) return;
+    float x, y, z;
+    bool ok = accel_read_raw_axis(st->device_path, "x", &x, st->scale) &&
+              accel_read_raw_axis(st->device_path, "y", &y, st->scale) &&
+              accel_read_raw_axis(st->device_path, "z", &z, st->scale);
+    if (!ok) {
+        st->reads_fail++;
+        return;
+    }
+    st->reads_ok++;
+    if (!st->ema_initialized) {
+        st->smoothed_x = x; st->smoothed_y = y; st->smoothed_z = z;
+        st->ema_initialized = true;
+    } else {
+        st->smoothed_x = ACCEL_EMA_ALPHA * x + (1 - ACCEL_EMA_ALPHA) * st->smoothed_x;
+        st->smoothed_y = ACCEL_EMA_ALPHA * y + (1 - ACCEL_EMA_ALPHA) * st->smoothed_y;
+        st->smoothed_z = ACCEL_EMA_ALPHA * z + (1 - ACCEL_EMA_ALPHA) * st->smoothed_z;
+    }
+
+    st->rate_count++;
+    if (st->rate_count >= 30) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double elapsed = (now.tv_sec - st->rate_t0.tv_sec) + (now.tv_nsec - st->rate_t0.tv_nsec) / 1e9;
+        st->measured_hz = elapsed > 0 ? st->rate_count / elapsed : 0;
+        printf("ACCEL real sample rate: %.1f Hz over last %d reads (%d ok, %d fail total)\n",
+               st->measured_hz, st->rate_count, st->reads_ok, st->reads_fail);
+        st->rate_count = 0;
+        st->rate_t0 = now;
+    }
+}
 
 static char class_names[OBJ_CLASS_NUM][64];
 static unsigned int class_colors[OBJ_CLASS_NUM];
@@ -331,6 +464,9 @@ int main(int argc, char** argv) {
 
     if (http_start_server(http_port) != 0) return 1;
 
+    AccelState accel;
+    accel_discover(&accel);
+
     unsigned char* frame_full = (unsigned char*)malloc(display_w * display_h * 3);
     unsigned char* frame_small = (unsigned char*)malloc(MODEL_SIZE * MODEL_SIZE * 3);
     float scale_x = (float)display_w / MODEL_SIZE;
@@ -389,6 +525,8 @@ int main(int argc, char** argv) {
             double infer_ms = (t_infer_end.tv_sec - t_infer_start.tv_sec) * 1000.0 +
                                (t_infer_end.tv_nsec - t_infer_start.tv_nsec) / 1e6;
 
+            accel_update(&accel);
+
             /* --- draw HUD overlay onto the FULL-res frame -- box
              * coordinates rescaled from MODEL_SIZE space up to
              * display_w x display_h --- */
@@ -426,6 +564,21 @@ int main(int argc, char** argv) {
             draw_text(&img, hud_line1, 8, 8, COLOR_WHITE, 12);
             draw_text(&img, hud_line2, 8, 22, COLOR_YELLOW, 12);
             draw_text(&img, hud_line3, 8, 36, COLOR_GREEN, 10);
+
+            /* accelerometer readout panel, below the first -- always
+             * drawn (apex_hud convention), grey "not connected" text
+             * until a real MPU-6050 is actually found and reading */
+            fill_rect(frame_full, display_w, display_h, 4, 54, 220, 32, 15, 15, 15);
+            char accel_line1[64], accel_line2[64];
+            if (accel.found && accel.ema_initialized) {
+                snprintf(accel_line1, 64, "ACCEL x%.2f y%.2f z%.2f g", accel.smoothed_x, accel.smoothed_y, accel.smoothed_z);
+                snprintf(accel_line2, 64, "rate %.1fHz (EMA a=%.1f)", accel.measured_hz, ACCEL_EMA_ALPHA);
+                draw_text(&img, accel_line1, 8, 58, COLOR_WHITE, 12);
+                draw_text(&img, accel_line2, 8, 72, COLOR_YELLOW, 10);
+            } else {
+                const char* msg = accel.found ? "ACCEL: waiting for first reading..." : "ACCEL: not connected";
+                draw_text(&img, msg, 8, 64, 0xFF808080, 12); /* grey, matching apex_hud's no-data convention */
+            }
 
             struct timespec t_send_start, t_send_end;
             clock_gettime(CLOCK_MONOTONIC, &t_send_start);

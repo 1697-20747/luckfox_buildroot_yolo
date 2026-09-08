@@ -479,3 +479,69 @@ not a real adapter number. Not a real signal; the "zero adapters" finding above 
    available).
 3. Stay on this image, accept no camera/accelerometer for now, keep the working RKNN/yolov8n
    detection pipeline as-is.
+
+## Real kernel fix for the accelerometer in progress: pinout identified, official SDK cloned, patches applied (2026-09-09)
+
+1697-20747 sent a real photo of the board's own pinout diagram (Waveshare-style), letting the exact
+physical pins be read directly: **pin 31 = 3.3V, pin 32 = GPIO1_A0/`I2C2_SCL_M0`, pin 33 =
+GPIO1_B0/`I2C2_SDA_M0`, pin 40 = GPIO1_A1 (a real GPIO, not ground), pin 41 = GND** (1697-20747's
+suspicion that 41 was the real ground pin, not 40, was correct). This resolved which of the
+board's several I2C buses (I2C2 here, separate from I2C3 = touchscreen and I2C4 = camera) the
+MPU-6050 is actually wired to.
+
+**Real, official kernel source confirms this is a clean device-tree fix, not driver-writing:**
+Cloned `LuckfoxTECH/luckfox-pico` (the real official SDK, ~1GB, shallow-cloned in a Docker Ubuntu
+22.04 x86_64 container per Luckfox's own documented build requirement). Found:
+- The real mainline `inv_mpu6050` IIO driver already exists in this kernel tree
+  (`drivers/iio/imu/inv_mpu6050/`) -- confirmed via the real Documentation binding file
+  (`inv_mpu6050.txt`), which documents the exact `compatible = "invensense,mpu6050"` /
+  `reg = <0x68>` node syntax used below.
+- `CONFIG_I2C_RK3X=y` and `CONFIG_IIO=y` (the I2C controller driver and the IIO subsystem) are
+  already enabled in this board's real defconfig -- only `CONFIG_INV_MPU6050_I2C=y` was missing.
+- The i2c2 controller itself is defined in `rv1106.dtsi` with `pinctrl-0 = <&i2c2m0_xfer>` but
+  `status = "disabled"` by default (standard Rockchip convention -- SoC-level dtsi defines
+  everything disabled, board-level dtsi enables what's actually wired).
+
+**Found and fixed a real risk of editing the wrong file first:** the board's exact
+`/proc/device-tree/compatible` (`rockchip,rv1103g-38x38-ipc-v10`, `rockchip,rv1106g3`) matches TWO
+different files in the SDK -- a generic reference-board dts (`rv1106g-38x38-ipc-v10.dts`) and the
+real board-specific one (`rv1106g-luckfox-pico-ultra.dts`, which includes
+`rv1106-luckfox-pico-ultra-ipc.dtsi`). Confirmed which is real by checking WiFi/eMMC/Bluetooth
+content against the actual board's known real features -- `rv1106g-luckfox-pico-ultra.dts` is the
+correct one. Almost patched the wrong file.
+
+**A real, unresolved discrepancy found while checking the existing i2c4 (camera) config in this
+same file, worth remembering, not glossed over:** current upstream HEAD already has `&i2c4`
+`status = "okay"` with a real `sc3336@30` sensor node configured by default -- but the actual
+running board reports ZERO I2C adapters anywhere (`/sys/bus/i2c/devices/` empty, confirmed earlier
+this session). If i2c4 were really enabled as this source shows, at minimum the adapter itself
+should register in sysfs even if the wrong sensor fails to probe. This means the board's actual
+currently-running kernel was very likely built from a different source snapshot than current
+GitHub HEAD -- proceeding anyway by building fresh from current HEAD with the targeted i2c2 patch,
+treating this as a real kernel update rather than a minimal exact-diff patch. Real, honest
+uncertainty: the rebuilt kernel may behave somewhat differently from the currently-running one in
+ways beyond just the intended i2c2/mpu6050 fix (hopefully only improvements, not regressions) --
+this can only really be confirmed once actually flashed and booted.
+
+**Two real, minimal patches applied to the cloned SDK:**
+1. `sysdrv/source/kernel/arch/arm/boot/dts/rv1106-luckfox-pico-ultra-ipc.dtsi` -- `&i2c2` block
+   changed from just a pinctrl override to `status = "okay"`, `clock-frequency = <100000>`, plus a
+   child `mpu6050@68` node (`compatible = "invensense,mpu6050"`, `reg = <0x68>`). Interrupt line
+   deliberately omitted (INT pin not confirmed wired) -- the driver should still probe and work in
+   polling mode without it.
+2. `sysdrv/source/kernel/arch/arm/configs/luckfox_rv1106_linux_defconfig` -- added
+   `CONFIG_INV_MPU6050_I2C=y` right after the existing `CONFIG_IIO=y` line.
+
+**Kernel build launched** (`./build.sh lunch` with HW_INDEX=5/RV1106_Luckfox_Pico_Ultra, EMMC boot
+medium, Buildroot system -- matching the real `BoardConfig-EMMC-Buildroot-RV1106_Luckfox_Pico_Ultra-IPC.mk`
+that confirmed `RK_KERNEL_DTS=rv1106g-luckfox-pico-ultra.dts` and
+`RK_KERNEL_DEFCONFIG=luckfox_rv1106_linux_defconfig`, exactly the two files just patched), then
+`./build.sh kernel` -- a real, targeted kernel-only build using the bundled
+`arm-rockchip830-linux-uclibcgnueabihf` cross-toolchain already in the SDK, no external toolchain
+needed. Real build in progress as of this note -- result not yet known, don't assume success.
+
+**Still fully open: flashing.** Even once a real kernel+dtb is built, deploying it needs a physical
+USB connection from the Mac directly to the board while it's in a special maskrom/loader mode,
+using Rockchip's own flashing tool (the SDK's own `rkflash.sh`, not yet inspected in detail) --
+whether that tool runs on macOS at all is still unconfirmed. Real next step once the build result
+is known.
