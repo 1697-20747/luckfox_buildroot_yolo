@@ -35,12 +35,15 @@ sudo ./luckfox_video_hud_stream <model.rknn> <video.mp4> [labels.txt] [port] [di
 pass them explicitly (e.g. `960 540`) to trade quality for fps. Then open
 `http://<board-ip>:<port>/` in a browser on the same WiFi network.
 
-Also reads the MPU-6050 accelerometer (once the kernel fix below is flashed and it's actually
-detected) via Linux's standard IIO sysfs interface, auto-discovering the right `iio:deviceN`.
-Real readings pass through an exponential-moving-average filter (`ACCEL_EMA_ALPHA` in the source)
-before being drawn, to keep the HUD readout from jumping around on raw sensor noise — real achieved
-sample rate is measured and logged, not assumed. Draws "ACCEL: not connected" (grey) until a real
-sensor is found, rather than omitting the panel or guessing a value.
+Also reads the MPU-6050 accelerometer via Linux's standard IIO sysfs interface, auto-discovering
+the right `iio:deviceN`. **Working end-to-end as of 2026-09-09** on a custom-built kernel (see
+`PROJECT_MEMORY.md`) — confirmed live: `RESULT: ACCEL_FOUND /sys/bus/iio/devices/iio:device1
+scale=0.000598`, real x/y/z readings, real measured sample rate **~3.6 Hz**, tied 1:1 to the video
+loop's own ~3.5 fps steady-state (one `accel_update()` per rendered frame, not an independent
+sensor-bus rate — a real IRQ line on pin 40 would decouple these, see below). Real readings pass
+through an exponential-moving-average filter (`ACCEL_EMA_ALPHA` in the source) before being drawn,
+to keep the HUD readout from jumping around on raw sensor noise. Draws "ACCEL: not connected"
+(grey) as a fallback if no sensor is found, rather than omitting the panel or guessing a value.
 
 ## GPIO header pinout (confirmed real, not from an unreadable diagram)
 

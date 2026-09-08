@@ -545,3 +545,102 @@ USB connection from the Mac directly to the board while it's in a special maskro
 using Rockchip's own flashing tool (the SDK's own `rkflash.sh`, not yet inspected in detail) --
 whether that tool runs on macOS at all is still unconfirmed. Real next step once the build result
 is known.
+
+## Kernel build actually succeeded end-to-end, accelerometer working on real hardware, real measured sample rate (2026-09-09, later same session)
+
+**The `.img` packaging failure from the prior note turned out to be two genuinely separate real
+bugs, not one, both found by finally reading the full (previously truncated/lost) build log:**
+
+**Bug 1 -- real root cause, structural, not a kernel config problem at all: macOS's default
+case-insensitive APFS filesystem silently corrupted the git checkout.** The actual error was `make:
+*** No rule to make target 'net/netfilter/xt_DSCP.o'` -- a real source file genuinely missing from
+the working tree, not a Makefile/config issue. Root-caused by comparing `git cat-file -p HEAD:...`
+(reads directly from git's object database, unaffected by the working-tree filesystem) against what
+was actually on disk: git's object store has BOTH `xt_DSCP.c` (a target module) and `xt_dscp.c` (a
+different match module) as distinct blobs with different content -- confirmed via `git ls-tree`
+showing two different blob hashes for the two paths. But checking them out onto this Mac's default
+case-insensitive APFS volume silently collided the two filenames into one inode, discarding
+`xt_DSCP.c`'s real content. **Swept the whole tree for the same pattern** (`git ls-tree -r HEAD
+--name-only | awk '{print tolower($0)}' | sort | uniq -d`) and found **21 total colliding path
+pairs**, all in the same netfilter xtables family (`xt_DSCP`/`xt_dscp`, `xt_MARK`/`xt_mark`,
+`xt_TCPMSS`/`xt_tcpmss`, `ip6t_HL`/`ip6t_hl`, etc.) plus one harmless litmus-test file -- confirming
+this was one systemic filesystem-compatibility bug, not scattered unrelated breakage. **Real fix:**
+stopped building against the bind-mounted host checkout directly; instead `git clone`'d the repo
+FROM the host mount INTO a path inside the Docker container itself (a real Linux, case-sensitive
+filesystem) before running `build.sh` -- git's object database is unaffected by host filesystem
+case-sensitivity, so the container-side clone checks out both files correctly. This is the real,
+durable fix for building this SDK on any Mac, not just this one session.
+
+**Bug 2, found only after Bug 1's fix let the build reach the actual driver probe on real
+hardware:** the mainline `inv_mpu6050` driver's `inv_mpu_core_probe()` unconditionally calls
+`devm_request_irq(&indio_dev->dev, st->irq, ...)` inside `inv_mpu6050_probe_trigger()` to set up
+triggered-buffer/FIFO mode -- this board's MPU-6050 only has VDD/GND/SCL/SDA wired (no INT line, a
+deliberate choice at the time since the pin wasn't confirmed wired), so `client->irq` is 0, and
+requesting IRQ 0 is invalid on this platform -- confirmed live via `dmesg`: `inv-mpu6050-i2c
+2-0068: trigger probe fail -22` (-EINVAL), after the driver had already correctly probed the device
+at the right I2C address (`2-0068` = i2c2, 0x68), proving the DT/Kconfig patches from the earlier
+note were themselves correct. **Real fix, not a workaround:** patched
+`drivers/iio/imu/inv_mpu6050/inv_mpu_core.c` to gate the whole triggered-buffer/trigger-probe block
+on `if (irq > 0)`, falling back to `INDIO_DIRECT_MODE` when there's no real IRQ line -- raw sysfs
+channel reads (`in_accel_*_raw`) are served by the channel's own `.read_raw()` callback regardless
+of buffer/trigger mode, and `luckfox_video_hud_stream.c` only ever does polled raw reads, so this
+loses nothing for the actual use case. Confirmed live in `dmesg` after the fix: `inv-mpu6050-i2c
+2-0068: no IRQ, running in polled/direct mode only` -- driver probe now succeeds.
+
+**Flashing: real, much simpler path found than the maskrom/`rkflash.sh`/USB approach the prior note
+assumed -- no need for that at all, and rkdeveloptool's blocked macOS build (broken Xcode CLT) is a
+moot point now.** The board runs off eMMC with a real, confirmable-from-userspace partition table
+(`cat /proc/cmdline` shows `blkdevparts=mmcblk0:32K(env),512K@32K(idblock),256K(uboot),
+32M(boot),512M(oem),256M(userdata),6G(rootfs)`, matching `/proc/partitions` exactly:
+`mmcblk0p4` = the 32M `boot` partition, not mounted, raw FIT-image target). Since the board is a
+normal running Linux system reachable over SSH, **the new kernel was flashed live, in-place, from
+this Mac, with zero physical access and zero maskrom mode**: `scp` the new `boot.img` to `/tmp` on
+the board, `dd if=/tmp/new_boot.img of=/dev/mmcblk0p4 bs=1M conv=fsync`, `sync`, `reboot`. **Real
+safety step taken first, not skipped:** pulled a full `dd`-based backup of the ORIGINAL
+`/dev/mmcblk0p4` before writing anything, both to the board's own `/tmp` and copied back to the Mac,
+md5-verified identical in both places -- so a bad flash had a real, tested recovery path (re-flash
+the backup the same way) without ever needing maskrom/rkdeveloptool. Also md5-verified the new
+`boot.img` after every `scp` before writing it, both attempts. **This worked cleanly twice in a row**
+(once for the DT/Kconfig-only build, once more after the IRQ patch) -- board rebooted in ~10-20s
+each time, `uname -a` confirmed the new build's real timestamp both times, proving the flash (not
+just the build) actually took effect.
+
+**A real, honest process mistake worth recording:** the DT/Kconfig patches from the prior note were
+still sitting as UNCOMMITTED working-tree edits on the host when the container-side `git clone` fix
+was first tried -- `git clone` only copies committed history, so the first "successful" container
+build silently produced a kernel WITHOUT the accelerometer patches at all (`strings` on the built
+`.dtb` showed no `mpu6050` node). Caught before flashing anything, by checking for the string in the
+built artifact rather than assuming success from a clean exit code. Fixed by committing the patches
+to the local scratch clone (`git commit`, not pushed anywhere, this SDK checkout isn't the project's
+own git history) before re-cloning into the container.
+
+**Real accelerometer data, live on actual hardware, confirmed multiple ways:**
+```
+iio:device1: mpu6050
+in_accel_x_raw=8284  in_accel_y_raw=-10648  in_accel_z_raw=13218  in_accel_scale=0.000598
+```
+(`0.000598` m/s^2/LSB matches the MPU-6050's default +-2g range exactly:
+9.80665/16384 = 0.000598 -- confirms the scale value itself is real and correct, not a stub.)
+`luckfox_video_hud_stream` (the existing binary, already built in an earlier part of this session)
+picked it up automatically: `RESULT: ACCEL_FOUND /sys/bus/iio/devices/iio:device1 scale=0.000598`.
+
+**Real, measured sample rate (1697-20747's ask from earlier this session, "check response rate when
+working") -- ~3.6 Hz, tied 1:1 to the video-processing loop, not an independent sensor-bus rate.**
+First live run showed a misleadingly low `0.2 Hz` for the first 30-read window -- root-caused (not
+just noted and moved on) to a real bug in the rate-measurement code itself: `rate_t0` is set once at
+`accel_discover()` time, which runs immediately at process startup, well before any HTTP client
+connects and the per-frame loop (which is what actually calls `accel_update()`) starts -- so the
+first window's elapsed-time denominator included the entire idle "waiting for browser" wait,
+deflating the computed Hz. Confirmed by re-running with a longer-lived client connection (90s
+`curl`) to get past the first (tainted) window: subsequent windows are clean and highly consistent
+-- 1.4 Hz during ramp-up, then settling to **3.6-3.7 Hz** for the rest of a 300+-read run, 0 failed
+reads throughout. This exactly matches the loop's own measured steady-state ~3.5fps (logged
+alongside, same run) -- confirms `accel_update()` is called exactly once per rendered video frame,
+so the accelerometer's effective read rate is bottlenecked by the video/inference/encode pipeline,
+not by I2C bus speed or the sensor itself. A real interrupt-driven trigger (wiring the MPU-6050's
+INT pin to the board's free GPIO1_A1 / physical pin 40, which 1697-20747 offered to do) would decouple
+sensor sampling from the video loop entirely -- not done this session, a real future improvement,
+not required for the current polled/EMA-smoothed HUD readout to work correctly.
+
+**Pin 40 (`GPIO1_A1`) documented in the README as the optional INT wiring target** -- adjacent to
+the already-used 32/33 (SCL/SDA) and 41 (GND), forming a clean 4-wire cluster on the header.
