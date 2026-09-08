@@ -442,3 +442,40 @@ multi-homed-same-subnet routing artifact, not a sign WiFi itself is broken. Real
 confirmation needs 1697-20747 to physically unplug the LAN cable and test `ssh pico@192.168.1.196` (or
 whatever IP `wlan0` gets next boot) -- not done yet, this is the one item in this batch not fully
 closed out.
+
+## Accelerometer identified from real photos; root cause traced to a shared, structural gap with the camera problem (2026-09-09)
+
+1697-20747 sent two real photos of the physically-connected module. **Identified directly from the
+silkscreen and pinout, not guessed:** a GY-521 breakout board carrying an **InvenSense MPU-6050**
+(3-axis accel + 3-axis gyro combo, "ITG/MPU" silkscreen, standard VCC/GND/SCL/SDA/XDA/XCL/ADO/INT
+pinout). **Green LED lit in the photo confirms it IS receiving power correctly** -- wired into the
+GPIO header near the board's "CAM"/"LCD" silkscreen labels (a different header from the CSI ribbon
+connector).
+
+**Real, decisive root-cause finding, not another dead end to add to the pile:** `/sys/bus/i2c/
+devices/` is completely empty -- zero I2C adapters registered anywhere in this kernel, for any
+purpose, not just this specific bus. `/proc/devices` shows the I2C core framework itself IS present
+(major number 89 registered), but no actual adapter driver is bound to any of the RV1106's physical
+I2C controllers -- the framework exists, the board-specific peripheral driver that activates it
+doesn't. **This is the exact same pattern as the camera failure** (the CIF/CSI capture framework
+initializes fine, but no sensor subdevice driver ever registers) -- both point to ONE shared,
+structural cause rather than two independent peripheral bugs: this specific community/third-party
+Ubuntu image for the Pico Ultra ships a kernel with camera-sensor and I2C-adapter drivers left out,
+compared to Luckfox's own official Buildroot SDK image (which demonstrably has them -- that's
+exactly why `sc3336.ko` and the vendor `luckfox_*_test` tools exist, just built for a different
+C library/kernel that isn't this one).
+
+(Also resolves a loose thread from the earlier camera investigation: the stray "bus 2" that showed
+up in one check turned out to be a bug in my own shell loop -- an unexpanded glob `/dev/i2c-*`
+whose literal string got fed through `grep -o "[0-9]*"`, which pulled the "2" out of "i2c" itself,
+not a real adapter number. Not a real signal; the "zero adapters" finding above is the accurate one.)
+
+**Real options going forward, not decided yet -- 1697-20747's call:**
+1. Switch to Luckfox's own official Buildroot SDK image -- camera + accelerometer would very likely
+   just work (drivers are there), but loses the glibc Ubuntu environment (Python/pip/apt, the
+   RKNN/ffmpeg/detection pipeline built so far) this whole investigation has relied on.
+2. Rebuild/patch this Ubuntu image's kernel to add the missing I2C-adapter and camera-sensor
+   drivers -- real, substantial kernel-level work, needs matching kernel source (not yet confirmed
+   available).
+3. Stay on this image, accept no camera/accelerometer for now, keep the working RKNN/yolov8n
+   detection pipeline as-is.
