@@ -52,13 +52,22 @@ used by the MPU-6050 accelerometer:
 | 31 | 3.3V | power |
 | 32 | GPIO1_A0, alt-function `I2C2_SCL_M0` | SCL |
 | 33 | GPIO1_B0, alt-function `I2C2_SDA_M0` | SDA |
-| 40 | GPIO1_A1 | a real GPIO signal pin — **not ground** |
+| 40 | GPIO1_A1 | MPU-6050 **INT** (data-ready IRQ) — optional, see below |
 | 41 | GND | confirmed ground (pin 40 is not, despite being adjacent) |
 
 This board has three separate I2C buses in active use, not one shared bus — worth remembering
 before wiring anything else up: **I2C2** (this GPIO header, used above for the MPU-6050), **I2C3**
 (the LCD connector's touchscreen), **I2C4** (the CSI camera connector's sensor control — shares
 pins with the CSI camera, so CSI and I2C4 can't both be configured at once by default).
+
+Pin 40 (`GPIO1_A1`) is wired to the MPU-6050's `INT` pin for real interrupt-driven data-ready
+signaling. It's optional, not load-bearing: the mainline `inv_mpu6050` driver hard-requires a real
+IRQ line to set up its triggered-buffer/FIFO mode (`devm_request_irq()` on IRQ 0 fails with
+`-EINVAL` otherwise), so without `INT` wired, the kernel driver patch in this repo's
+`PROJECT_MEMORY.md` skips that setup and falls back to plain polled sysfs reads
+(`in_accel_*_raw`) — which is all `luckfox_video_hud_stream.c` actually uses. Wiring `INT` unlocks
+lower-latency/jitter interrupt-driven sampling as a future improvement, not a requirement to get
+real readings.
 
 ## Live camera
 
