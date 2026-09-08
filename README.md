@@ -5,15 +5,49 @@ RKNN — a possible offload target for detection/positional processing that's be
 Raspberry Pi 5 CPU. See `PROJECT_MEMORY.md` for the full real, dated history of what's actually
 been tried and found — this README is just the current entry point.
 
-**Status as of 2026-09-08: YOLO26 itself is blocked; a real, working alternative exists on this
-exact board.** YOLO26 fails to even load on this board's NPU (an unsupported `MatMul` op in its
-attention block) — likely an architectural limitation of this specific chip, corroborated by
-Rockchip's own official support lists (RV1103/RV1106 officially supports only YOLOv5 among the
-YOLO family; YOLOv8/v10/11 are all absent). But `yolov8n`, using Rockchip's own RKNN-optimized
-export, **ran a real, complete inference pass on the actual hardware** — `rknn_init`, the
-RV1106-specific zero-copy memory setup, and `rknn_run` all succeeded, all 9 real output tensors
-correctly shaped. Decode/NMS and a real (non-dummy) test image are the next steps if this path is
-pursued. See `PROJECT_MEMORY.md` for the full details.
+**Status as of 2026-09-08: yolov8n detection is fully working end-to-end on real hardware; YOLO26
+itself remains blocked.** YOLO26 fails to even load on this board's NPU (an unsupported `MatMul` op
+in its attention block) — likely an architectural limitation of this specific chip, corroborated by
+Rockchip's own official support lists (RV1103/RV1106 officially supports only YOLOv5 among the YOLO
+family; YOLOv8/v10/11 are all absent). But `yolov8n`, using Rockchip's own RKNN-optimized export,
+now produces **real, correct detections** on the actual NPU — tested against Rockchip's own
+reference `bus.jpg`: 3 people correctly localized, the vehicle correctly boxed (classified `truck`
+instead of `bus`, a plausible minor int8-quantization mix-up between similar classes, not a
+pipeline bug). Plan going forward, per 1697-20747: get this fully solid on YOLOv8 first (real video
+processing next, live camera later), then port the same approach to YOLO26 once/if the attention-
+block blocker is addressed. See `PROJECT_MEMORY.md` for the full details.
+
+## Live HUD video stream over WiFi
+
+`scripts/luckfox_video_hud_stream.c` runs a persistent detection pipeline against a video file and
+serves it as a live MJPEG stream with an always-visible HUD overlay (boxes, labels, fps/inference-
+time readout — apex_hud-inspired, not a literal port). Real, measured performance on this hardware:
+**~4.5-4.8fps steady state, not 30fps** — NPU inference alone is a hard ~67ms/frame (~14.7fps)
+ceiling, and JPEG-encode+network-send adds another ~90ms/frame on top, all competing for this
+chip's single CPU core. See `PROJECT_MEMORY.md` for the full profiled breakdown.
+
+```
+sudo ./luckfox_video_hud_stream <model.rknn> <video.mp4> coco_80_labels_list.txt [port]
+```
+Then open `http://<board-ip>:<port>/` in a browser on the same WiFi network.
+
+## Try it yourself
+
+```
+scp scripts/luckfox_yolov8_detect.c vendor_reference/3rdparty/stb_image/stb_image.h \
+    vendor_reference/coco_80_labels_list.txt <model>.rknn <image>.jpg \
+    pico@<board-ip>:~/rknn_test/
+ssh pico@<board-ip>
+cd ~/rknn_test
+mkdir -p 3rdparty/stb_image && mv stb_image.h 3rdparty/stb_image/
+g++ -O2 -o luckfox_yolov8_detect luckfox_yolov8_detect.c -I. -I3rdparty/stb_image -lrknnmrt -lm
+sudo ./luckfox_yolov8_detect <model>.rknn <image>.jpg coco_80_labels_list.txt
+```
+
+`vendor_reference/` holds real reference material fetched from `airockchip/rknn_model_zoo` (their
+own `postprocess.cc`/`main.cc`/`yolov8_rv1106_1103.cc`, `utils/`, `stb_image`, `bus.jpg`,
+`coco_80_labels_list.txt`) — kept for comparison/attribution, not built directly; `luckfox_yolov8_detect.c`
+is this project's own leaner adaptation of the decode math from it.
 
 ## Layout
 

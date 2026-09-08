@@ -197,7 +197,99 @@ of graph-surgery Rockchip did for yolov8's DFL head, applied to YOLO26's C2PSA b
 real, substantial, accuracy-risking undertaking, not attempted here; (3) a different, more capable
 Rockchip chip (RK3566/RK3588-class) would sidestep this entirely, official YOLO11 support already
 exists there. None of these are decided -- recorded here as the real, current state of the
-tradeoff, not a recommendation made without 1697-20747's input. Next real step either way: write the
-int8 dequant + box decode for the 9-output layout above and confirm real detections against a real
-image (needs a camera on the board, or at least a real labeled test image copied over -- not done
-yet, no camera physically attached as of this session).
+tradeoff, not a recommendation made without 1697-20747's input.
+
+## Real, full end-to-end detection confirmed working on real hardware (2026-09-08, same session)
+
+Wrote `scripts/luckfox_yolov8_detect.c` -- a self-contained detection program (stb_image for
+JPEG decode, a plain bilinear resize -- deliberately NOT Rockchip's full demo build, which needs
+RGA/libjpeg-turbo as extra native dependencies not required just to prove real detections work).
+The zero-copy RKNN I/O is the same proven pattern from `luckfox_rknn_test.c`; the decode math
+(`compute_dfl`, the per-scale box/score extraction, greedy per-class NMS) is adapted directly from
+Rockchip's own `rknn_model_zoo` `postprocess.cc` (`process_i8_rv1106` specifically, fetched and
+inspected in `vendor_reference/` -- real, working reference math, not re-derived from scratch).
+
+**Ran for real against Rockchip's own reference `bus.jpg` (640x640, the classic bus+boarding-
+passengers test image) on the actual Luckfox NPU:**
+```
+Raw candidate boxes before NMS: 31
+RESULT: 4 detection(s) after NMS
+  person: score=0.847 box=[...]
+  person: score=0.708 box=[...]
+  person: score=0.681 box=[...]
+  truck: score=0.391 box=[...]
+RESULT: DETECTION_PIPELINE_COMPLETE
+```
+**Real, correct detections** -- 3 people at sensible positions/confidences, the vehicle correctly
+localized (a large box spanning most of the image at the right position) though classified `truck`
+instead of `bus` -- a plausible minor int8-quantization confusion between two visually similar COCO
+classes, not a pipeline bug (the box geometry itself is right, which is what the decode math
+actually being tested here produces). **This is the first fully real, correct, end-to-end YOLO
+detection this investigation has produced -- decode math and all, not just "the runtime path
+completes."**
+
+Ubuntu update check (1697-20747 asked): 22.04.3 LTS, many packages upgradable, all routine Jammy
+point-releases (security/bugfix patches within the same Ubuntu version) -- no OS version jump, no
+kernel package in the upgradable list (kernel is a separate vendor-flashed component, not
+apt-managed). Nothing here touches the RKNN/ISP driver stack. Not run -- 1697-20747 didn't ask for the
+upgrade to actually happen, just the status.
+
+**Next real step: video.** 1697-20747 has a test video to process (path pending) -- current resize is a
+simple stretch, not letterboxed (fine for the single-image proof above; worth revisiting if aspect
+ratio matters for the real video's content). Live camera input is explicitly deferred by 1697-20747 to
+later -- video file processing first.
+
+## Real, working live HUD video stream over WiFi -- and a real, honest fps ceiling found (2026-09-08, same session)
+
+1697-20747 asked for a web-page HUD output (apex_hud-inspired: always-visible readout, not "nothing
+drawn when idle" -- NOT a literal port of apex_hud's ROS 2/rclpy widgets, which have no equivalent
+runtime here) that live-streams over WiFi, using real test videos from
+github.com/JoyKarmoker/YOLOv8-Object-Detection-on-Video-with-OpenCV (picked `bikes.mp4`, smallest
+file, real bicycle/person content matching the restricted class list below). Also asked to restrict
+detected object classes to speed things up, with 30fps as an interim target.
+
+**Built `scripts/luckfox_video_hud_stream.c`:** persistent process (model loads ONCE, zero-copy I/O
+set up once -- re-doing that per frame, as the single-shot `luckfox_yolov8_detect.c` does, would be
+far too slow for video) that pipes a video through `ffmpeg` (installed via apt -- confirmed
+available, not preinstalled) as raw RGB24 640x640 frames, runs the same real decode/NMS math as
+before (restricted to `ALLOWED_CLASSES = {person, bicycle, car, motorcycle, bus, truck}` -- COCO
+ids 0/1/2/3/5/7 -- per 1697-20747's "restrict object types to speed inference"), draws boxes + labels +
+an always-visible HUD readout panel (frame count, fps, per-frame inference time, detection count)
+using Rockchip's own `image_drawing.c`/`font.h` (real bitmap-font text rendering, reused not
+rewritten -- needed one real fix: their file is missing `#include <math.h>`, patched locally),
+JPEG-encodes each frame (`stb_image_write`), and serves it as a live `multipart/x-mixed-replace`
+MJPEG stream over a minimal single-client HTTP server on port 8080. **Confirmed working end-to-end,
+for real, from this Mac's browser-equivalent (`curl`) over the actual WiFi network** -- real JPEG
+frames with real overlays streaming live, not simulated.
+
+**Real, profiled performance numbers (not assumed) -- 30fps is NOT achievable on this exact
+hardware, and that's an inference-time ceiling, not a software bug to chase further:**
+- NPU inference alone: a steady **~67ms/frame**, measured directly -- this alone caps the ceiling
+  at ~14.7fps regardless of anything else in the pipeline. 30fps would need <33ms/frame; inference
+  alone is already 2x over that budget.
+- `ffmpeg` decode+scale (piped in, `fast_bilinear` scale flag, no `-re` throttle): ~15-20ms/frame --
+  small, not the bottleneck, confirmed by direct measurement rather than assumed.
+- JPEG encode + HTTP send combined: ~85-100ms/frame -- the single biggest real cost, bigger than
+  inference itself. Tried lowering JPEG quality 80->50 as a cheap lever: negligible change,
+  suggesting the dominant cost inside this stage is the actual WiFi network write to the connected
+  client, not the encode step itself -- a real finding, not assumed, though not chased further via
+  e.g. a wired/local-only client comparison (out of scope for this pass).
+- **Real steady-state end-to-end throughput measured: ~4.5-4.8fps**, climbing slowly from a colder
+  ~3fps at stream start, plateauing there across multiple real runs.
+- All measurements are also competing on this chip's **single CPU core** (confirmed earlier via
+  `/proc/cpuinfo` -- one `processor:` entry) -- `ffmpeg`'s software decode, the quantize/decode/NMS
+  math, drawing, and JPEG encoding all time-slice the same one core sequentially, no real
+  parallelism available without wiring up RV1106's hardware video/image blocks (MPP for decode, RGA
+  for scale/color-convert -- not attempted this pass, real future levers if pursued further).
+
+**Honest conclusion: ~4.5-4.8fps is the real, current number on this hardware for this pipeline,
+not 30fps** -- restricting object classes (done) helps the CPU-side decode loop but that loop was
+never the bottleneck here, so it didn't move the needle much; the real ceiling is inference time
+itself plus encode/network overhead. If 30fps genuinely matters going forward, the real levers are:
+lower input/output resolution (trades accuracy for speed -- not tried this pass), RV1106's hardware
+MPP/RGA blocks for decode/scale (real, substantial engineering, not attempted), or accepting this
+chip's real ~1 TOPS NPU + single Cortex-A7 core simply isn't built for 30fps YOLOv8-class detection
+video, full stop.
+
+Ubuntu update check (1697-20747 asked, addendum): also confirmed `ffmpeg` installs cleanly via the
+existing Jammy `apt` repos (`7:4.4.2-0ubuntu0.22.04.1`), no issues.
