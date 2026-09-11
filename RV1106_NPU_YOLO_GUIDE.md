@@ -1,0 +1,195 @@
+# RV1106 NPU & YOLO, From First Principles
+
+> Also served as a live doc site off the board itself: http://192.168.1.180:1313/docs/rv1106-npu-yolo-guide/ (or http://192.168.1.196:1313/ over WiFi). This file is the same content, kept here for plain git/GitHub reading.
+
+## Why this exists
+
+This board (a Luckfox Pico Ultra, Rockchip RV1106G3) started as a question: can a ~$15 SBC with a ~1 TOPS NPU run modern YOLO detection fast enough to be a real offload target for a Raspberry Pi 5 that's too slow on plain CPU? The short answer is "yes, but not the model you were hoping for, and not without understanding the memory model." This doc is the "why" behind that answer — the hardware, the toolchain, and the actual mechanics of getting a detector running on the NPU. Real numbers throughout, measured on this exact board, not vendor marketing figures.
+
+If you just want to reproduce the working pipeline, see [Software Install, Step by Step](#software-install-step-by-step) and `README.md` in the repo root. This page is the "how does it actually work" layer underneath that.
+
+## Hardware overview
+
+The Pico Ultra is built around Rockchip's **RV1106G3**, a chip aimed squarely at smart-camera / IPC (IP camera) applications — that lineage matters, because it explains almost every design decision below.
+
+| Component | Spec | Why it matters |
+|---|---|---|
+| CPU | Single-core ARMv7 Cortex-A7 | Everything CPU-side (decode, NMS, JPEG encode, network I/O) time-slices on **one core**. No real parallelism without offloading to the dedicated hardware blocks below. |
+| NPU | ~1 TOPS, int8 | Runs quantized models only. This is a fraction of a Raspberry Pi 5's already-modest CPU inference throughput in raw compute, but it's *dedicated* silicon, so it doesn't compete with the CPU for cycles. |
+| RAM | ~256MB total, ~150-200MB usable | Tight. Rules out anything that wants a large working set — this is not a chip you run a full desktop Linux distro's worth of background services on. |
+| Video blocks | MPP (encode/decode), RGA (scale/color-convert), ISP/CIF (camera pipeline) | Dedicated hardware for exactly the operations a camera application needs. Using them means those operations don't cost CPU cycles — but nothing in this project's pipeline currently uses them (see [What we didn't use yet](#what-we-didnt-use-yet)). |
+| Storage | eMMC, partitioned (env/idblock/uboot/boot/oem/userdata/rootfs) | The `boot` partition (`/dev/mmcblk0p4`) holds the raw kernel+dtb FIT image — a normal Linux system, reachable and reflashable entirely over SSH, no maskrom/USB recovery mode needed. |
+| I/O | GPIO header (I2C2), CSI camera connector (I2C4), SDIO (WiFi/BT), UART (BT) | Three **separate** I2C buses in active use — don't assume they share a bus. |
+
+The chip's whole design center is "sit inside a camera, do ISP + encode + a bit of on-device AI, ship the result." The NPU, the RGA, and the MPP encoder existing side-by-side is the tell — this is meant to run an object detector on a live ISP feed and squirt out an annotated H.264 stream, not to be a general-purpose ML accelerator. Trying to use it as one (as this project does) works, but you're swimming a little against the current of what the silicon was optimized for.
+
+## The NPU and its runtime: the part everyone gets wrong first
+
+Rockchip's NPU story has a trap in it that catches almost everyone coming from RK3588-class boards (Orange Pi 5, etc.): **RV1103/RV1106 uses a completely different runtime family from every other Rockchip NPU chip.**
+
+- RK3588-class chips (and most of what you'll find tutorials for): `librknnrt.so`, the standard "full" RKNN runtime.
+- RV1103/RV1106 (this board): `librknnmrt.so` — the **"mini runtime."** Different library, different C API behavior in one critical respect (below), different constraints.
+
+This isn't a naming quirk. It reflects real hardware differences:
+
+- **RK3588-class NPUs have full DRAM access.** The runtime can hand you a normal heap pointer for input/output tensors and the NPU just reads/writes it like any other DMA-capable peripheral.
+- **RV1106's NPU has a small, DMA-mapped SRAM region instead.** It cannot arbitrarily read your process's heap. This is why RV1106's driver **only supports the zero-copy memory API** (`rknn_create_mem()` / `rknn_set_io_mem()`, using `RKNN_QUERY_NATIVE_INPUT_ATTR` / `RKNN_QUERY_NATIVE_NHWC_OUTPUT_ATTR` to discover the NPU's *native* tensor layout) rather than the standard `rknn_inputs_set()` / `rknn_outputs_get()` buffer-copy API most RKNN sample code and documentation defaults to. Using the standard API on this chip fails immediately with `"context config invalid!"` — not a bug, just the wrong API for this hardware. Rockchip's own `rknn_model_zoo` reference code confirms it in a source comment: *"1106 npu only support NHWC in zero copy mode."*
+
+### Toolkit and runtime versions have to match — literally
+
+The on-device runtime is versioned (`librknnmrt version: 1.6.0`, built 2024-08-20, confirmed via SSH), and that version has to match the `rknn-toolkit2` version used to **export** the model, or the model fails to even load (`E RKNN: incompatible model version`). This is a real, load-bearing constraint, not a "use the latest version to be safe" situation:
+
+- The current `rknn-toolkit2` (2.3.2 as of this writing) produces a newer model-format version than this board's runtime understands.
+- There is **no newer official runtime to upgrade the device to** — Rockchip's own public `rknpu2` runtime repo's RV1106 build is actually *older* (1.5.2) than what's already on this board. Luckfox's vendor SDK build is ahead of the generic public tree.
+- The fix is exporting with a **matching, older toolkit** (1.6.0 for this board) — pinned by checking `rknn-toolkit2`'s own changelog, which explicitly ties that version to RV1106-specific improvements.
+- Toolkit 1.6.0 predates PyPI installability (added in 2.2.0), so it's pulled directly from its GitHub release tag, and it's an **x86_64-only wheel** (ARM64 host support wasn't added until 2.3.0) — meaning on Apple Silicon this step needs x86_64 Docker emulation, not a native arm64 container.
+
+The practical takeaway: before exporting a model for *any* RV1103/RV1106 board, check `strings /usr/lib/librknnmrt.so | grep version` on the actual device and match your toolkit to it. Don't assume "newest is best" — on this chip family it actively breaks things.
+
+## Software install, step by step
+
+The full working recipe (see `docker/convert.Dockerfile` and `scripts/` in this repo), with the reasoning for each non-obvious step:
+
+1. **Build an x86_64 Docker image** (`--platform linux/amd64` on Apple Silicon) with Python 3.10 and `rknn-toolkit2==1.6.0` installed from the GitHub release wheel (not PyPI — see above).
+2. **Two environment bugs to expect, neither related to the actual conversion:**
+   - `onnxruntime`'s native `.so` refuses to load under QEMU x86_64 emulation on Apple Silicon Docker Desktop (`"cannot enable executable stack as shared object requires"`). The standard fix (`execstack -c`) isn't packaged for current or EOL Debian. Fixed by patching the ELF `PT_GNU_STACK` header's executable flag directly in Python instead (`scripts/clear_execstack.py`).
+   - The downloaded wheel's **exact original filename must be preserved** — renaming it breaks pip's metadata parsing (`"is not a valid wheel filename"`).
+3. **Export the model**: PyTorch/Ultralytics `.pt` → ONNX (opset 12) → RKNN int8, targeting `rv1106`, using toolkit 1.6.0 (`scripts/export_yolo_rknn_1.6.0.py`). The simulator will happily pass at this stage even for models that later fail on real hardware — more on why below.
+4. **Test on real hardware, not just the simulator.** This project's own history is the cautionary tale: a model that builds cleanly and passes the toolkit's built-in simulator can still fail to even *load* on the physical NPU. The simulator models the compute graph; it doesn't perfectly model every op-support edge case of the real driver+silicon stack. Always follow up a successful export with a real on-device `rknn_init()` call before trusting it.
+5. **On-device compilation needs no cross-toolchain.** This board's Ubuntu image ships `gcc`/`g++` natively (glibc, not the Buildroot/uClibc SDK image some documentation assumes), so C programs against the RKNN API compile directly on the board over SSH.
+
+## How YOLO actually runs on this chip
+
+This is the part that took real, on-hardware trial and error to map out, because the honest picture is more nuanced than "RV1106 runs YOLO." It runs **some** YOLO.
+
+### The architectural line: attention blocks are the wall
+
+Cross-checking against Rockchip's own official "Current Support Platform" matrix, and confirmed independently by real on-device failures, there's a clean pattern:
+
+| Model | Has a self-attention block? | Officially supported on RV1103/RV1106? |
+|---|---|---|
+| YOLOv5 | No | **Yes** |
+| YOLOv8 | No | No (but works anyway — see below) |
+| YOLOv10 | No | No |
+| YOLO11 (C2PSA attention block) | **Yes** | No |
+| YOLO26 (same C2PSA block, inherited from YOLO11) | **Yes** | No official example exists yet |
+
+Only YOLOv5 is officially listed. Real on-device testing confirms exactly why for the newer, attention-based generations: YOLO26's C2PSA self-attention block (inherited from YOLO11) uses a `MatMul` op **inside the backbone itself**, not in postprocessing — and this op has no NPU support *and no CPU fallback* on this specific chip/driver stack:
+
+```
+E RKNN: unsupport cpu MatMul op, op name: MatMul:/model.10/m/m.0/attn/MatMul_1
+E RKNN: rknn fallback cpu failed
+RESULT: INIT_FAIL ret=-1
+```
+
+This fails at `rknn_init()` — model *load* time, before any inference is even attempted. It's not a speed problem, a quantization problem, or a config flag away from working: it's the physical NPU + driver stack genuinely lacking support for that operation, with the usual "fall back to the CPU" escape hatch also unavailable. The only real paths around it would be Rockchip/Ultralytics landing upstream operator support for this chip family (not tracked publicly, no movement as of this writing), or manually excising and retraining around the attention block — real model surgery, not a config change.
+
+One counter-intuitive corollary: YOLO26/YOLOv10-class architectures are marketed as *faster* than YOLOv8 because they drop the NMS postprocessing step (a "one-to-one" head). That speedup is real — but only where NMS was the bottleneck (many-candidate-box scenarios on GPUs or larger NPUs). On this board, a real test against Rockchip's reference `bus.jpg` produced only 31 raw candidate boxes after the confidence threshold — sorting 31 boxes by IoU costs microseconds on any CPU. The actual measured bottleneck here is backbone convolution throughput on the NPU (below), and YOLO26's attention block is architecturally *more* NPU compute than YOLOv8's plain CSP backbone, not less. So even setting the load failure aside, there's no real reason to expect a win from switching — on this specific ~1 TOPS chip, the "NMS-free" pitch doesn't transfer.
+
+### What actually works: YOLOv8, with two fixes
+
+`yolov8n` — no attention block — loads and runs. Getting there took two separate, genuinely different fixes:
+
+**Fix 1 — the zero-copy memory API** (covered above). Non-negotiable for this chip; the standard buffer API simply doesn't work here.
+
+**Fix 2 — the DFL softmax head.** With zero-copy I/O working, `rknn_init()` succeeds, but `rknn_run()` then fails:
+
+```
+E RKNN: Meet unsupported input layout 3 for softmax
+E RKNN: op: exSoftmax13, name: exSoftmax13:/model.22/dfl/Softmax, fallback cpu failed
+```
+
+This is YOLOv8's **DFL (Distribution Focal Loss)** box-regression head — a *postprocessing* op this time, not a backbone one, and it fails at `rknn_run()` (inference time) rather than `rknn_init()` (load time). That distinction matters: it's a much more tractable category of problem. Rockchip's own `rknn_model_zoo` confirms the fix: their reference `yolov8n.onnx` isn't the stock Ultralytics export — it comes from a customized fork (`airockchip/ultralytics_yolov8`) with the DFL head's output graph **restructured** specifically to avoid this op (splitting it into separate box-coordinate, class-score, and a reduce-sum+clip confidence-sum output instead of one softmax). Swapping in that pre-optimized ONNX export and re-running the same toolkit-1.6.0 conversion fixes it — confirmed by the output tensor names changing to match that restructured graph (`318` / `onnx::ReduceSum_326` / `331` per scale), and by real, correct detections on hardware afterward.
+
+Worth being precise about what kind of fix this is: it's a **graph restructuring of the postprocessing head**, with zero effect on the trained weights. That's very different from what would be needed to unblock YOLO26 (removing/replacing a backbone attention block), which *would* touch trained weights and need retraining or fine-tuning. Not all "make an unsupported op go away" fixes are the same difficulty.
+
+### The actual math: decode and NMS, by hand
+
+The RKNN runtime gives you back raw int8 tensors — 9 of them for `yolov8n` (3 detection scales × [box coords, class scores, confidence sum]), shapes like `[1,80,80,64]` / `[1,80,80,80]` / `[1,80,80,1]` for the largest scale, with 40×40 and 20×20 equivalents for the other two. Turning that into actual boxes needs code, not a library call:
+
+1. **Per-scale extraction**: for each of the 3 output scales, walk the grid, apply the confidence threshold, and decode the DFL box-regression distribution (`compute_dfl`) into `(x1, y1, x2, y2)` coordinates in that scale's coordinate space.
+2. **Greedy per-class NMS**: sort surviving candidates by score, suppress overlapping lower-scoring boxes of the same class by IoU threshold.
+3. **Rescale to display resolution**: if inference ran on a downscaled copy of the frame (see below), boxes decoded in that small copy's coordinate space get rescaled (`scale_x` / `scale_y`) before drawing on the full-resolution frame.
+
+This project's implementation (`scripts/luckfox_yolov8_detect.c`, and the persistent-process video version `scripts/luckfox_video_hud_stream.c`) adapts this decode math directly from Rockchip's own `rknn_model_zoo` `postprocess.cc` (`process_i8_rv1106`) — real, vendor-provided reference math, not reverse-engineered from scratch. Real test against Rockchip's own reference `bus.jpg`:
+
+```
+Raw candidate boxes before NMS: 31
+RESULT: 4 detection(s) after NMS
+  person: score=0.847
+  person: score=0.708
+  person: score=0.681
+  truck:  score=0.391
+RESULT: DETECTION_PIPELINE_COMPLETE
+```
+
+Three people correctly localized, the vehicle correctly boxed (classified `truck` instead of `bus` — a plausible minor int8-quantization mix-up between two visually similar COCO classes; the box geometry itself, which is what this decode math is actually responsible for, is correct).
+
+### The real performance ceiling, measured not assumed
+
+Running this as a live, persistent video pipeline (`luckfox_video_hud_stream.c`: load the model once, set up zero-copy I/O once, loop over decoded frames — re-doing setup per frame the way the single-shot detector does would be far too slow for video) surfaces the chip's real limits:
+
+| Stage | Cost (640×640 stream) | Cost (1280×720 native stream) |
+|---|---|---|
+| NPU inference alone | ~67ms/frame | ~85-93ms/frame (includes an added in-process downscale-to-640 step) |
+| `ffmpeg` decode + scale | ~15-20ms/frame | ~26-34ms/frame |
+| JPEG encode + network send | ~90-100ms/frame | ~150-160ms/frame |
+| **Real steady-state end-to-end** | **~4.5-4.8 fps** | **~3.0-3.1 fps** |
+
+A few honest conclusions from these numbers, not assumptions:
+
+- **NPU inference alone caps the ceiling at ~14.7fps**, full stop — 30fps would need <33ms/frame, and inference alone is already 2× over that budget before anything else runs.
+- **JPEG encode + network send is the single biggest cost in the pipeline — bigger than inference itself.** Dropping JPEG quality 80→50 barely moved the number, which points at the actual WiFi network write as the dominant cost inside that stage, not the encode step.
+- **Everything competes for one CPU core.** `ffmpeg`'s software decode, the decode/NMS math, drawing, and JPEG encoding all time-slice the same single Cortex-A7 core. This board has dedicated hardware for decode (MPP) and scale/color-convert (RGA) that this pipeline doesn't use yet — see below.
+- Restricting detected classes (`ALLOWED_CLASSES = {person, bicycle, car, motorcycle, bus, truck}`, COCO ids 0/1/2/3/5/7) helps the CPU-side decode loop, but that loop was never the bottleneck, so it didn't move the needle much.
+
+**~4.5-4.8fps is the real number for this pipeline on this hardware — not 30fps**, and that's an honest hardware/architecture ceiling, not a bug to keep chasing. If 30fps genuinely mattered, the real levers are lower input/output resolution (now measured, see below), or wiring up the MPP/RGA hardware blocks so decode and scale stop competing with inference and encode for the one CPU core.
+
+### Does the class list matter for speed? No — measured, not assumed
+
+Easy to assume restricting the class list (fewer objects to detect) would speed up inference. It doesn't, and this is worth being precise about rather than just asserting it: `OBJ_CLASS_NUM` is hardcoded to `80` in the decode code, and `ALLOWED_CLASSES` is a **post-decode filter** — it runs after the model has already scored all 80 COCO classes for every candidate box:
+
+```c
+#define OBJ_CLASS_NUM 80
+...
+if (!ALLOWED_CLASSES.empty() && ALLOWED_CLASSES.find(c) == ALLOWED_CLASSES.end()) continue;
+```
+
+The real, measured 67ms/frame NPU inference cost is almost entirely backbone convolution compute — fixed by input resolution and network depth — not the classification head. The head's output channel count (80 vs. 6 vs. 1) is a tiny fraction of total FLOPs for this architecture. Full 80-class COCO already runs at the same speed a 1-class model would. If you want faster, the class list isn't the lever — input resolution is (next section).
+
+### Input resolution: the real lever, now measured
+
+512×512 vs. the 640×640 default, same `yolov8n` architecture, same toolkit-1.6.0/RV1106 pipeline, same test video (`bikes.mp4`), same 640×640 **display** resolution in both runs so only the inference-resolution variable changes (JPEG-encode/network-send cost tracks display pixels, not inference pixels, so holding display constant isolates the effect cleanly):
+
+| | 640×640 inference (baseline) | 512×512 inference |
+|---|---|---|
+| NPU inference | ~67ms/frame | **~50ms/frame** |
+| Steady-state end-to-end fps | ~4.5-4.8 fps | **~5.2-5.3 fps** |
+
+Two honest takeaways from this, not the naive ones:
+
+- **Inference time itself drops a real ~25%** — roughly in line with the ~36% fewer pixels (512²/640² ≈ 0.64), sub-linear because of fixed per-invocation NPU overhead that doesn't shrink with input size.
+- **End-to-end fps only improves ~10-15%, well under the inference-time improvement**, because JPEG-encode+network-send (~90-100ms, unchanged here since display resolution didn't change) is still the single biggest cost in the pipeline and swamps the inference saving. This directly confirms the earlier finding above: NPU inference is not, by itself, the pipeline's dominant cost — encode/network is. Shrinking inference resolution helps, but wiring up hardware MPP/RGA (still untried, see below) is the bigger remaining lever for real fps gains.
+
+### What we didn't use yet
+
+Real, substantial headroom exists that this project hasn't touched: RV1106's dedicated **MPP** (video encode/decode) and **RGA** (scale/color-convert) hardware blocks currently sit idle while `ffmpeg` does everything in software on the one CPU core. Wiring the pipeline through them instead is the obvious next lever if more throughput is ever needed — this is exactly the kind of work the chip's silicon was designed to make cheap, and exactly what a "real" IP-camera firmware built on this SoC would already be doing.
+
+## Beyond vision: what else shares this board
+
+Two more pieces of real, working hardware bring-up worth knowing about if you're extending this project, because they hit the same "read the real source, don't trust the first assumption" pattern as the NPU work above:
+
+- **Accelerometer (MPU-6050, GPIO header, I2C2)**: the vendor image's kernel shipped with zero I2C adapter drivers bound to *any* bus — the framework was present, the board-specific glue wasn't. Fixed with a real device-tree patch (`&i2c2 { status = "okay"; ... mpu6050@68 {...}; }`) plus a one-line kernel Kconfig change and a small driver patch to skip IRQ-based triggered-buffer mode (this board has no INT line wired), falling back to polled reads. Real measured sample rate ended up bottlenecked by the video loop's own ~3.5fps, not the sensor or I2C bus.
+- **WiFi (AIC8800DC combo chip, SDIO)**: a similar "the pieces are all there but not wired together" story — the vendor driver's Rockchip power-on path was a silent no-op without a `wlan-platdata` device-tree node providing the chip's real reset GPIO to the kernel's `rfkill-wlan` subsystem. Once wired up correctly, WiFi came up cleanly and now survives reboots via a small systemd unit. A follow-up real bug surfaced after that: the driver's SDIO sleep/wake power-management handshake (`aicwf_sdio_sleep_allow`, gated by `CONFIG_SDIO_PWRCTRL`) never actually completes on this chip/firmware combination — it busy-polls 100× at 500µs per attempt, every time, forever, burning a dedicated kernel thread's worth of CPU (confirmed via `ps`: a persistent `aicwf_pwrctl` thread, plus dmesg flooded with `warning: read cnt N` down to 0). WiFi data-path was unaffected — this is pure power-save negotiation, not connectivity — but it's real wasted CPU on a single-core board. Fixed by disabling `CONFIG_SDIO_PWRCTRL` for this driver entirely (rebuilt just the driver module, no kernel/DTB rebuild needed) rather than trying to fix an undocumented firmware handshake. Confirmed clean afterward: zero `sleep_allow` messages, no `aicwf_pwrctl` thread, WiFi still connects and holds its static IP fine.
+
+Both are further evidence of the same underlying lesson this whole project keeps re-teaching: **this board's peripheral support is "the silicon can do it, the specific image/kernel you're holding may not have wired it up yet."** Checking `dmesg`, the real device tree, and the real running kernel config before assuming a hardware limitation saved real time, repeatedly.
+
+## Glossary, for anyone new to this stack
+
+- **NPU** — Neural Processing Unit, dedicated matrix-multiply silicon for running (quantized) neural networks, separate from the CPU.
+- **RKNN** — Rockchip's model format + toolchain for their NPU family. `rknn-toolkit2` converts models (usually via ONNX) into a `.rknn` file; a matching on-device runtime library executes it.
+- **int8 quantization** — representing model weights/activations as 8-bit integers instead of 32-bit floats. Smaller, faster on int8-native hardware like this NPU, at a small, usually-acceptable accuracy cost. All RKNN models on this chip are quantized this way.
+- **Zero-copy (DMA) memory API** — instead of copying tensor data into a buffer the runtime manages, you allocate DMA-mapped memory the NPU can read/write directly. Required, not optional, on RV1106.
+- **DFL (Distribution Focal Loss) head** — the part of modern YOLO models that predicts box edges as a probability distribution over discrete offsets rather than a single regressed number, decoded via a softmax + weighted sum (`compute_dfl`).
+- **NMS (Non-Maximum Suppression)** — the postprocessing step that removes duplicate/overlapping detections of the same object, keeping the highest-confidence box.
+- **C2PSA** — the self-attention block introduced in YOLO11's backbone (and inherited by YOLO26), using `MatMul` ops that this chip's NPU can't execute and can't fall back to CPU for.

@@ -5,6 +5,12 @@ RKNN — a possible offload target for detection/positional processing that's be
 Raspberry Pi 5 CPU. See `PROJECT_MEMORY.md` for the full real, dated history of what's actually
 been tried and found — this README is just the current entry point.
 
+**Want the "how does this actually work" explainer instead of the session-by-session log?** See
+[`RV1106_NPU_YOLO_GUIDE.md`](RV1106_NPU_YOLO_GUIDE.md) — hardware, the RKNN toolchain, and why some
+YOLO generations run on this chip and others don't. Also served live, straight off the board, at
+`http://<board-ip>:1313/docs/rv1106-npu-yolo-guide/` (a small Hugo site running on-device — see
+[`docs-site/`](docs-site/)).
+
 **Status as of 2026-09-08: yolov8n detection is fully working end-to-end on real hardware; YOLO26
 itself remains blocked.** YOLO26 fails to even load on this board's NPU (an unsupported `MatMul` op
 in its attention block) — likely an architectural limitation of this specific chip, corroborated by

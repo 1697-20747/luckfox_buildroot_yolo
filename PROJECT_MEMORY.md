@@ -644,3 +644,188 @@ not required for the current polled/EMA-smoothed HUD readout to work correctly.
 
 **Pin 40 (`GPIO1_A1`) documented in the README as the optional INT wiring target** -- adjacent to
 the already-used 32/33 (SCL/SDA) and 41 (GND), forming a clean 4-wire cluster on the header.
+
+## WiFi broken by the accelerometer kernel rebuild, root-caused, and fixed for real -- plus a docs
+## site and a real 512x512 vs 640x640 inference benchmark (2026-09-11)
+
+**Discovery: WiFi over WiFi (not just LAN) had never actually been retested since the accelerometer
+kernel rebuild two sessions ago, and it was broken.** Asked to connect over wireless -- the last
+known WiFi IP timed out. SSH via the known-good static LAN IP (`192.168.1.180`) found `wlan0` didn't
+exist at all: `/sys/class/net/` only showed `eth0`/`usb0`/`lo`, `lsmod` had zero WiFi-related
+modules, `dmesg` showed no WiFi chip driver probe attempt at all. The `EE-597TSN` NetworkManager
+profile was still saved from the earlier working session, just nothing to attach it to.
+
+**Real chip ID, not assumed:** `/sys/bus/sdio/devices/*/uevent` gave `SDIO_ID=C8A1:C08D` (function 1)
+and `C8A1:C18D` (function 2) -- vendor `0xc8a1` is AICSemi. Cross-checked against this SDK's own
+`sysdrv/drv_ko/wifi/aic8800dc/insmod_wifi.sh` and `BoardConfig-EMMC-Buildroot-RV1106_Luckfox_Pico_Ultra-IPC.mk`
+(`RK_ENABLE_WIFI_CHIP=AIC8800DC`) -- confirmed AIC8800DC, matching the `.ko` files already sitting
+unused on the rootfs at `/oem/usr/ko/` (`aic8800_bsp.ko`/`aic8800_fdrv.ko`/`aic8800_btlpm.ko`).
+
+**First real attempt at reusing those existing `.ko` files hung the board -- twice, reproducibly,
+needing a physical power cycle both times.** `insmod aic8800_bsp.ko` succeeded cleanly; `insmod
+aic8800_fdrv.ko` (the netdev/firmware driver) is what actually froze it -- SSH and all userspace
+stopped responding while the kernel's own ICMP/TCP-handshake layer kept replying, the signature of
+a kernel-level lockup, not a clean process crash. Confirmed twice, byte-for-byte the same failure
+point both times, before accepting it wasn't a fluke.
+
+**Root cause, once actually investigated instead of just reflashing and hoping: NOT a vermagic
+mismatch.** `modinfo` on every module in the chain (including the already-working `sc3336.ko`)
+showed an *identical* vermagic string (`5.10.160 mod_unload ARMv7 thumb2 p2v8`) -- no
+`CONFIG_MODVERSIONS`, so the plain vermagic string is the kernel's entire ABI compatibility check,
+and it matched. The stale `.ko` files were binary-compatible with the rebuilt kernel by that check,
+yet still hung on load. This ruled out the obvious first theory and meant the real problem was
+something deeper than "kernel got rebuilt, modules didn't."
+
+**Real fix: rebuilt the wifi driver from source against the exact currently-running kernel,
+re-cloned the same SDK (same HEAD commit, `824b817f88...`, unchanged since 2026-03-22 -- confirmed
+upstream genuinely hasn't moved), re-applied the same i2c2/mpu6050 DT and Kconfig patches from the
+earlier accelerometer session so the rebuilt kernel matches what's already flashed, then additionally
+built the AIC8800DC driver (`sysdrv/drv_ko/wifi/aic8800dc/`) from that same tree via `./build.sh
+driver`.** Deployed the fresh `.ko` set (bsp/fdrv/btlpm + cfg80211/libarc4/ctr/ccm/aes_generic) to
+`/oem/usr/ko/`, backed up the current boot partition first (same `dd`+md5-verify discipline as the
+earlier accelerometer flash), and tested loading one module at a time with a liveness check after
+each -- `aic8800_bsp.ko` loaded clean, `aic8800_fdrv.ko` now also loaded clean (`RC=0`, no hang).
+`libaes.ko` fails to load (`exports duplicate symbol aes_decrypt (owned by kernel)`) -- harmless,
+the new kernel already provides that symbol built-in, and nothing in the chain actually needs the
+standalone module.
+
+**But `aic8800_fdrv.ko` loading clean wasn't the same as WiFi actually working -- a second, real,
+separate bug followed immediately.** `wlan0` never appeared; dmesg showed `aicbsp_platform_power_on`
+attempting a real power-on/rescan sequence and failing: `aicbsp_dummy_sdmmc: probe of mmc1:e9ea:1
+failed with error -110` (timeout). Read the actual driver source
+(`aic8800_bsp/aicsdio.c`) rather than guessing: `aicbsp_platform_power_on()` only has real GPIO
+power-toggle logic under `CONFIG_PLATFORM_ROCKCHIP2` (`rockchip_wifi_power()`/
+`rockchip_wifi_set_carddetect()`, from the kernel's own `net/rfkill/rfkill-wlan.c`) -- the plain
+`CONFIG_PLATFORM_ROCKCHIP` (no "2") this SDK's Makefile actually builds with is a near no-op for
+power sequencing, relying entirely on the generic `mmc-pwrseq-simple` reset node already in this
+board's DTS, which is enough for the SDIO bus to *detect* the chip at boot (that's how the vendor
+ID was read above) but not enough to bring it into a state where the bus can *enable* its I/O
+function. Confirmed by checking a real, official Rockchip reference board's DTS
+(`rv1106g-evb1-v10.dts` in the same SDK) which has a `wireless-wlan { compatible = "wlan-platdata";
+... }` node this board's DTS was simply missing.
+
+**Real, targeted two-part fix, not a guess:** (1) added a `wireless_wlan: wireless-wlan {
+compatible = "wlan-platdata"; wifi_chip_type = "aic8800dc"; WIFI,reset_gpio = <&gpio1 RK_PA2
+GPIO_ACTIVE_LOW>; status = "okay"; }` node to `rv1106g-luckfox-pico-ultra.dts`, reusing the exact
+same physical reset line already wired to the generic `sdio_pwrseq` node; (2) enabled
+`CONFIG_PLATFORM_ROCKCHIP2` -- carefully, *inside* the existing correct RV1106 build block in
+`aic8800dc/aic8800_bsp/Makefile`, not by flipping the top-level `CONFIG_PLATFORM_ROCKCHIP2 = y` in
+the parent Makefile, which would have silently redirected `ARCH`/`KDIR`/`CROSS_COMPILE` to some
+other developer's hardcoded RK3566/Android/aarch64 paths and broken the whole build. Rebuilt kernel
++ DTB + driver together (same source tree, so guaranteed ABI-consistent), backed up the current
+boot partition again, flashed the new one, redeployed the modules. **Result, real and confirmed:**
+`wlan0` came up (`state UP`, real MAC), NetworkManager auto-connected to the already-saved
+`EE-597TSN` profile with zero manual intervention, survived a full physical-adjacent reboot cleanly.
+
+**Made both LAN and WiFi IPs permanently static, per request, confirmed not just applied:**
+`nmcli connection modify 'EE-597TSN' ipv4.method manual ipv4.addresses 192.168.1.196/24
+ipv4.gateway 192.168.1.254 ipv4.dns 192.168.1.254` -- landed on `.196` deliberately, the same
+address the WiFi interface had already been leasing via DHCP, avoiding a new address. Verified
+`valid_lft forever` (no more DHCP renewal) and reachable via `ssh pico@192.168.1.196` directly, not
+riding on `eth0`'s route. `eth0` was already static from the earlier session (`192.168.1.180`).
+Persistence confirmed via multiple real full reboots during this same session, not asserted once.
+
+**Set the WiFi driver to load automatically at boot** -- `insmod_wifi.sh`'s own chip-detection logic
+doesn't actually match this board (its SDIO-ID grep looks for a literal "8800" substring, which
+`C8A1:C08D` doesn't contain, and its device-tree-model fallback check greps for a trailing "W" this
+board's `model = "Luckfox Pico Ultra"` string doesn't have) -- so instead of fighting that script,
+added a small dedicated systemd unit (`aic8800-wifi.service` -> `/usr/local/sbin/aic8800-wifi.sh`,
+`WantedBy=multi-user.target`, `Before=NetworkManager.service`) that loads the known-working module
+sequence directly. Confirmed across a full cold reboot: WiFi and the static IP both come up with
+zero manual steps.
+
+**A real, separate bug found afterward, not from guessing but from noticing degraded SSH
+responsiveness during later testing: the WiFi driver's SDIO sleep/wake power-management handshake
+never actually completes on this chip, and busy-polls forever.** `uptime` showed `load average:
+12+` on this single-core board with no obvious cause; `ps aux --sort=-%cpu` showed a persistent
+kernel thread, `[aicwf_pwrctl]`, with double-digit minutes of accumulated CPU time; `dmesg` was
+flooded with repeating `sdio_err:<aicwf_sdio_sleep_allow,1455>: val:2` / `warning: read cnt N`
+pairs, counting down to 0 every time. Read the actual driver source
+(`aic8800_fdrv/aicwf_sdio.c` around the wakeup-register poll loop): on `PRODUCT_ID_AIC8800DC`, the
+sleep-transition path writes `0x02` to a wakeup register then polls up to 100 times at 500us
+apiece (~50ms) waiting for an acknowledgement bit to clear -- and on this chip/firmware, it never
+does, so every attempt burns the full 50ms doing nothing, repeated continuously by a dedicated
+kernel thread (`aicwf_pwrctl`) for as long as the interface is up. This is pure power-save
+negotiation, not the data path -- WiFi connectivity itself was unaffected throughout -- but it's
+real, continuous, wasted CPU on a board that has exactly one core to spare.
+
+**Fix: disabled the feature outright rather than debugging an undocumented firmware handshake.**
+`CONFIG_SDIO_PWRCTRL` (default `?= y` in `aic8800_fdrv/Makefile`) gates the entire power-control
+timer/thread mechanism, confirmed by tracing every one of its `#if defined(CONFIG_SDIO_PWRCTRL)`
+call sites including the exact `kthread_run(..., "aicwf_pwrctl")` call that creates the thread.
+Flipped it to `n`, rebuilt just the driver module (no kernel/DTB change needed this time -- lower
+risk, and correctly so: this was a driver bug, not a kernel one), redeployed, rebooted. **Confirmed
+clean afterward:** zero `sleep_allow` messages in dmesg, no `aicwf_pwrctl` thread in `ps aux`, WiFi
+still connects and holds its static IP exactly as before. The elevated load-average figure took a
+few real minutes to decay back down on its own after the fix landed -- `vmstat 1` showing genuine
+100% idle in real time confirmed the system was actually healthy well before the lagging 1-minute
+average caught up, a reminder not to over-read a smoothed historical metric against a live check.
+
+**Real 512x512 vs 640x640 inference-resolution benchmark, requested to test whether input
+resolution is actually the speed lever the architecture doc claims it is.** Re-exported `yolov8n`
+at `imgsz=512` using `airockchip/ultralytics_yolov8`'s own RKNN-optimized exporter (same DFL-head
+restructuring as the working 640 model), converted through the same toolkit-1.6.0 Docker pipeline.
+**One real environment trap hit and fixed along the way:** the locally cached `rknn-convert` Docker
+image (5 months old) turned out to actually have `rknn-toolkit2 2.3.2` installed, not the `1.6.0`
+its own Dockerfile specifies -- a stale image built before the version-pinning fix was worked out.
+Using it would have silently produced a model this board's runtime can't load. Rebuilt the image
+fresh from the current `docker/convert.Dockerfile` before trusting any output from it -- confirmed
+`rknn-toolkit2-1.6.0+81f21f4d` this time. Also hit and fixed a second real, separate export bug:
+the installed torch's default (dynamo-based) ONNX exporter silently upgraded the requested opset 12
+to opset 18 (a `Resize` op version-conversion failure it couldn't recover from) and split model
+weights into an external `.onnx.data` sidecar file -- both real risks for the old toolkit. Fixed by
+forcing `dynamo=False` in the vendor exporter's `torch.onnx.export()` call, producing a clean,
+single-file, real opset-12 ONNX whose output tensor names (`318`/`onnx::ReduceSum_326`/`331` per
+scale) matched the known-working reference structure exactly.
+
+**Real, controlled measurement, not a guess:** same `yolov8n` architecture, same pipeline, same
+`bikes.mp4` test video, same 640x640 *display* resolution held constant in both runs so only the
+inference-resolution variable changes (JPEG-encode/network-send tracks display pixels, not
+inference pixels, so this isolates the comparison cleanly). Result:
+
+```
+                         640x640 inference (baseline)   512x512 inference
+NPU inference                   ~67ms/frame                 ~50ms/frame
+Steady-state end-to-end fps     ~4.5-4.8 fps                ~5.2-5.3 fps
+```
+
+Inference time itself drops a real ~25% (roughly tracking the ~36% pixel-count reduction, sub-linear
+because of fixed per-invocation NPU overhead). End-to-end fps improves only ~10-15%, well under the
+inference-time gain, because JPEG-encode+network-send -- unchanged here since display resolution
+didn't change -- remains the single biggest cost in the pipeline and swamps the inference saving.
+This is a real, direct confirmation of the earlier finding that encode/network, not NPU inference,
+dominates this pipeline's real-world cost.
+
+**Also confirmed, precisely, something that had only been asserted before: restricting the detected
+class list does not speed up inference.** `OBJ_CLASS_NUM` is hardcoded to `80` in the decode code;
+`ALLOWED_CLASSES` is applied strictly as a post-decode filter, after the model has already scored
+all 80 COCO classes for every candidate box. The full 80-class model already runs at the same speed
+a 1-class model would, because the classification head is a tiny fraction of this architecture's
+total FLOPs next to the backbone. Restricting classes is a HUD-decluttering choice, not a
+performance lever -- confirmed by reading the actual `#define OBJ_CLASS_NUM 80` and filter call site
+on the board, not by re-deriving it from theory.
+
+**Built a small documentation site, running live on the board itself.** Wrote
+`RV1106_NPU_YOLO_GUIDE.md` (repo root, also mirrored as Hugo content under `docs-site/`) --
+hardware overview, the RKNN toolkit/runtime version-pairing constraint, the zero-copy memory model,
+why YOLOv8 runs and YOLO26/11 don't, the DFL-head fix, the decode/NMS math, and the real measured
+performance numbers above. `docs-site/` is a Hugo site using the same PaperMod theme as 1697-20747's own
+blog (copied locally, not re-cloned, to skip the earlier-documented flaky-mirror problem), dark mode
+default, with a custom CSS override (`assets/css/extended/floating-toc.css`) turning the normally
+collapsible inline PaperMod TOC into a fixed floating left sidebar on wide viewports, falling back
+to the normal inline TOC below ~1300px so it never overlaps content on narrow screens. Deployed a
+real `hugo` binary (the plain `linux-arm` release, not `extended` -- no `extended` armv7 build
+exists, and PaperMod's CSS concat/minify pipeline doesn't actually need it) to the board, running as
+a persistent `luckfox-docs.service` systemd unit (`hugo server --watch=false` to avoid unnecessary
+inotify overhead on a board that doesn't edit its own docs live), confirmed serving on both the LAN
+and WiFi static IPs and surviving a full reboot, ~38MB RSS.
+
+**One real methodological note for whoever runs this benchmark again:** the Docker rebuild for the
+`rknn-convert` image hit a real, separate networking issue mid-session -- `archive.ubuntu.com`
+(both HTTP and HTTPS, IPv4-forced) hung completely from inside Docker containers on this Mac while
+the exact same host worked fine from the host shell and from a fresh container hitting
+`github.com`/`mirrors.edge.kernel.org` -- looked like a bad anycast/CDN edge for that one host from
+this specific network path at this specific time, not a general Docker or Mac networking problem.
+Fixed by pointing `/etc/apt/sources.list` at `mirrors.edge.kernel.org/ubuntu` instead. Not
+investigated further since it resolved cleanly; worth trying a different mirror first if
+`archive.ubuntu.com` hangs again rather than assuming Docker networking itself is broken.
