@@ -23,6 +23,23 @@ pipeline bug). Plan going forward, per 1697-20747: get this fully solid on YOLOv
 processing next, live camera later), then port the same approach to YOLO26 once/if the attention-
 block blocker is addressed. See `PROJECT_MEMORY.md` for the full details.
 
+**Re-checked 2026-09-11, after the live camera + V4L2 pipeline was fully working: still blocked,
+same exact failure, confirming this is unrelated to the pipeline itself.** `yolo26n` still fails at
+`rknn_init()` — before any camera/HUD/streaming code even runs — with the identical error as the
+original investigation: `unsupport cpu MatMul op, op name: MatMul:/model.10/m/m.0/attn/MatMul_1`,
+`rknn fallback cpu failed`. **Is this solvable at all?** Not a hard law-of-physics wall, but not
+worth pursuing on this board: (1) waiting for Rockchip/Ultralytics to add the op — the tracked
+upstream issue has had zero activity in 8+ months; (2) graph-surgery YOLO26's C2PSA attention block
+into NPU-compatible ops yourself (the same kind of surgery Rockchip already did for YOLOv8's DFL
+head) — genuinely possible, but the pretrained weights stop applying once the computation changes,
+so it needs real fine-tuning/retraining afterward, a standalone ML project, not a patch; (3)
+different, more capable Rockchip silicon (RK3566/RK3588-class already has official YOLO11 support).
+**Even solving it likely wouldn't help:** YOLO26/YOLOv10+'s speed advantage is mostly about dropping
+NMS postprocessing overhead, but on this exact chip NMS was never the bottleneck (~31 candidate boxes
+survive threshold on the real test image — microseconds of work); the real cost is backbone
+convolution (NPU MAC throughput), and C2PSA's attention block adds *more* of that, not less.
+`yolov8n` remains the right choice for this board, not a placeholder waiting to be replaced.
+
 ## Live HUD video stream over WiFi
 
 `scripts/luckfox_video_hud_stream.c` runs a persistent detection pipeline against a video file and

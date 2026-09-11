@@ -1517,3 +1517,51 @@ path after all of this -- identical numbers to the pre-flash baseline (fps 4.3, 
 infer_ms 74.4-74.6ms), zero regression from the kernel/DTB change. Both real backups (original 32MB
 boot partition, original 32KB env partition) remain on the Mac, md5-verified, as the recovery path if
 ever needed.
+
+## 2026-09-11 (same session, later still) -- YOLO26 re-checked now that the pipeline actually works; still blocked, and an honest answer on whether it's solvable at all
+
+1697-20747 asked to try switching the now-fully-working pipeline (live camera, V4L2, everything built this
+session) from `yolov8n` to `yolo26n`, then asked directly whether the blocker is solvable at all.
+
+**Re-verified fresh on today's actual board state rather than citing the 2026-09-08 investigation
+from memory -- real, current, not stale.** Ran `yolo26n-rv1106-toolkit1.6.0.rknn` (still sitting on
+the board from the original conversion) directly against the current `luckfox_video_hud_stream`
+binary with the live camera. **Identical failure, same exact error as three sessions ago:**
+
+```
+E RKNN: unsupport cpu MatMul op, op name: MatMul:/model.10/m/m.0/attn/MatMul_1
+E RKNN: rknn fallback cpu failed
+RESULT: INIT_FAIL ret=-1
+```
+
+Real, useful confirmation from this specific re-test: the failure happens at `rknn_init()`, before
+any of this session's camera/HUD/streaming/SIGPIPE work even runs -- none of that work could have
+changed this outcome, since nothing this session touched `librknnmrt.so` or the RKNN driver/runtime
+at all (only the kernel/DTB's CMA memory sizing changed, an unrelated subsystem). "Now that the
+pipeline runs" was never actually a relevant variable here -- worth having said explicitly, since it
+wasn't obvious without checking.
+
+**Answered "is this solvable at all" honestly, synthesizing the three real paths already found back
+on 2026-09-08 (see above) rather than re-deriving them, plus why solving it likely wouldn't even
+help:**
+
+1. **Wait for upstream.** `airockchip/rknn-toolkit2#498` (the tracked YOLO26-support issue) -- zero
+   activity in 8+ months, out of this project's control.
+2. **Graph-surgery the C2PSA attention block into NPU-compatible ops**, the same kind of surgery
+   Rockchip already did for YOLOv8's DFL head. Genuinely possible in principle -- but changes the
+   actual computation, so the pretrained weights stop applying correctly; would need real
+   fine-tuning/retraining afterward to recover accuracy. A standalone ML engineering project on its
+   own, disproportionate to this board-bringup task, not attempted.
+3. **Different, more capable Rockchip silicon** (RK3566/RK3588-class) -- already has official YOLO11
+   support (same C2PSA attention family as YOLO26). Sidesteps the problem entirely, but means new
+   hardware, not a fix for this board.
+
+**Even if solved, it likely wouldn't help on this specific chip -- the real reason not to chase any
+of the above.** YOLO26/YOLOv10+'s speed claim is specifically about dropping NMS postprocessing
+overhead (the "one-to-one" NMS-free head). Already measured on this exact board (2026-09-08 entry):
+NMS was never the bottleneck here -- only ~31 real candidate boxes survive threshold on the reference
+test image, microseconds of work regardless. The real, measured cost is backbone convolution (NPU MAC
+throughput), and C2PSA's attention block adds MORE compute on top of a similar backbone, not less --
+so even setting the load-failure aside, YOLO26 would likely be slower than the already-working
+`yolov8n` pipeline on this ~1 TOPS chip, not faster. `yolov8n` remains the right, real choice for this
+board -- not a placeholder waiting on a fix.
