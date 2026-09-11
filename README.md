@@ -30,9 +30,24 @@ serves it as a live MJPEG stream with an always-visible HUD overlay (boxes, labe
 time readout — apex_hud-inspired, not a literal port). Display resolution is decoupled from
 inference resolution: the NPU always sees a 640x640 downscaled copy (inference cost stays
 constant), while the stream/HUD renders at the source video's own native resolution by default —
-real, measured tradeoff: full native res looks better but costs real fps (JPEG-encode+network-send
-scale with pixel count). See `PROJECT_MEMORY.md` for the full profiled breakdown at both
-resolutions; 30fps is not achievable at either.
+real, measured tradeoff: full native res looks better but costs real fps (JPEG encode scales with
+pixel count — see below, network send itself turns out to be negligible). See `PROJECT_MEMORY.md`
+for the full profiled breakdown at both resolutions; 30fps is not achievable at either.
+
+**JPEG encode vs. network send, split for real (2026-09-11):** the combined "encode+send" figure
+above had been an open question for several sessions — instrumenting the two separately (and
+testing over a real WiFi client, not just loopback) shows JPEG encode (`stb_image_write`, software)
+is essentially the entire cost, ~146-165ms/frame at 1280x720; network send is ~0.4-1.5ms, negligible
+even over real WiFi. This makes RV1106's hardware JPEG encoder (part of its MPP video block) the
+highest-value real offload target in this pipeline — see `RV1106_NPU_YOLO_GUIDE.md`'s "Real hardware
+offload: RGA and MPP" section for the full real investigation. **RGA downscale offload:** implemented,
+correct, but a measured net loss on this hardware (off by default, `USE_RGA_DOWNSCALE=1` opts in).
+**MPP hardware JPEG encode:** real userspace-only library gap found, the public `rockchip-linux/mpp`
+source was built natively on-device and two real integration gaps (missing SoC table entry, missing
+per-HAL soc whitelist) fixed using real hardware-ID cross-referencing — but the first real submitted
+job crashed the kernel's `mpp_vcodec.ko` module (oops in `rkvenc_run`, board survived, no reboot
+needed). Stopped there deliberately rather than keep probing a module that had just oopsed. **JPEG
+encode in this pipeline is still software (`stb_image_write`)** — not integrated, per the above.
 
 ```
 sudo ./luckfox_video_hud_stream <model.rknn> <video.mp4> [labels.txt] [port] [display_w] [display_h]

@@ -67,6 +67,9 @@
 #include <math.h>
 #include <time.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -78,10 +81,14 @@ extern "C" {
 #include "utils/image_drawing.h"
 }
 
+#include <drm/drm.h>
+#include <drm/drm_mode.h>
+
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 
 #include "rknn_api.h"
+#include "im2d.h"
 
 #define OBJ_CLASS_NUM 80
 #define NUM_SCALES 3
@@ -327,6 +334,119 @@ static void downscale_for_inference(unsigned char* src, int src_w, int src_h, un
     }
 }
 
+/* --- DRM "dumb buffer" allocator: real, physically-contiguous DMA
+ * memory for the RGA hardware path.
+ *
+ * Real, on-device finding: RV1106's RGA (rga2, hw_version 3.3.87975 per
+ * dmesg) has NO IOMMU (kernel logs this literally: "rga_mm: Current
+ * NONE_MMU[0] cannot support physically discontinuous virtual
+ * address!"), confirmed by a real failed submit when this pipeline
+ * first tried handing it a plain malloc()'d buffer -- ordinary heap
+ * memory is virtually contiguous but not physically contiguous, so the
+ * driver rejected it outright (job_commit failed, not a crash, but no
+ * frames could be produced). The real fix, not a workaround: allocate
+ * frame_full/frame_small as DRM "dumb buffers" instead of malloc() --
+ * these ARE physically contiguous by construction. Uses raw DRM ioctls
+ * directly against /dev/dri/card0 (present and confirmed working on
+ * this board) rather than linking/dlopen-ing libdrm.so, matching the
+ * exact real ioctl sequence Rockchip's own librga sample allocator
+ * (samples/utils/allocator/drm_alloc.cpp, fetched from
+ * github.com/airockchip/librga for reference) uses, since this Ubuntu
+ * image ships only libdrm's runtime .so (no dev symlink/headers) --
+ * this board's own /usr/include/drm/{drm,drm_mode}.h (kernel uapi
+ * headers, already present) are enough for the raw ioctl calls, no
+ * libdrm dependency needed at all. */
+static int g_drm_fd = -1;
+
+static bool drm_init() {
+    g_drm_fd = open("/dev/dri/card0", O_RDWR);
+    if (g_drm_fd < 0) { perror("open /dev/dri/card0"); return false; }
+    return true;
+}
+
+/* Returns the mmap'd virtual address of a new contiguous buffer, and
+ * reports the driver's real byte pitch (out_stride_px, converted to
+ * pixels for the given bytes-per-pixel) -- NOT assumed to equal width,
+ * since DRM dumb-buffer allocators are free to pad each row for
+ * alignment; RGA needs the real stride or a padded buffer would decode
+ * as a skewed/torn image. */
+static void* drm_alloc_contig(int w, int h, int bytes_per_px, int* out_stride_px) {
+    if (g_drm_fd < 0) return NULL;
+    struct drm_mode_create_dumb create_arg;
+    memset(&create_arg, 0, sizeof(create_arg));
+    create_arg.width = (uint32_t)w;
+    create_arg.height = (uint32_t)h;
+    create_arg.bpp = (uint32_t)(bytes_per_px * 8);
+    if (ioctl(g_drm_fd, DRM_IOCTL_MODE_CREATE_DUMB, &create_arg) < 0) {
+        perror("DRM_IOCTL_MODE_CREATE_DUMB"); return NULL;
+    }
+    struct drm_mode_map_dumb map_arg;
+    memset(&map_arg, 0, sizeof(map_arg));
+    map_arg.handle = create_arg.handle;
+    if (ioctl(g_drm_fd, DRM_IOCTL_MODE_MAP_DUMB, &map_arg) < 0) {
+        perror("DRM_IOCTL_MODE_MAP_DUMB"); return NULL;
+    }
+    void* addr = mmap(0, create_arg.size, PROT_READ | PROT_WRITE, MAP_SHARED, g_drm_fd, map_arg.offset);
+    if (addr == MAP_FAILED) { perror("mmap drm dumb buffer"); return NULL; }
+    *out_stride_px = (int)(create_arg.pitch / bytes_per_px);
+    printf("RESULT: DRM_BUF_ALLOC %dx%d pitch=%u stride_px=%d size=%llu\n",
+           w, h, create_arg.pitch, *out_stride_px, (unsigned long long)create_arg.size);
+    return addr;
+}
+
+static int g_src_stride_px = 0, g_dst_stride_px = 0;
+static unsigned char* g_drm_src = NULL;   /* display_w x display_h x 3, DRM-backed, RGA src only */
+static unsigned char* g_drm_dst = NULL;   /* MODEL_SIZE x MODEL_SIZE x 3, DRM-backed, RGA dst only */
+
+/* Same contract as downscale_for_inference() above, but offloaded to
+ * RV1106's real 2D Graphics Engine (RGA, "rga2" per dmesg hw_version
+ * 3.3.87975) instead of a CPU nearest-neighbor loop -- confirmed via
+ * real device discovery (ldconfig -p) that a glibc-built librga.so.2
+ * (the modern im2d API, rga_api version 1.10.1) is present in /usr/lib
+ * on this board's Ubuntu image, unlike MPP (only a uClibc build exists,
+ * see RV1106_NPU_YOLO_GUIDE.md).
+ *
+ * Real, measured, non-obvious finding that shaped this function's
+ * design: RV1106's DRM driver maps "dumb buffer" memory (required for
+ * RGA -- see drm_alloc_contig's comment for the no-IOMMU root cause)
+ * as CPU-uncached. Fine for RGA's own hardware DMA access, genuinely
+ * bad for CPU access: a first attempt that made frame_full/frame_small
+ * themselves DRM-backed (so RGA could touch them with zero copies) cut
+ * downscale_ms from ~20ms to ~2.5ms as expected, but every OTHER
+ * CPU-heavy stage that touches those same buffers (the quantization
+ * loop, HUD drawing, JPEG encode) got dramatically slower reading
+ * through uncached memory -- infer_ms 85ms->323ms, jpeg_ms 145ms->
+ * 548ms, a large NET LOSS (fps dropped 3.3->1.0), a real result kept
+ * here rather than quietly discarded. Fix: keep frame_full/frame_small
+ * as ordinary cached malloc() buffers (fast for CPU work, as before),
+ * and bounce through two small persistent DRM buffers ONLY around the
+ * RGA call itself -- memcpy in (cached read, WC/uncached write --
+ * write-combining hardware coalesces sequential writes cheaply even
+ * uncached).
+ *
+ * A SECOND real attempt tried removing the memcpy-out too -- having
+ * the caller's quantization loop read g_drm_dst directly instead of a
+ * copy into frame_small, since that loop already touches every dst
+ * byte once anyway. Measured result: much WORSE (infer_ms 85ms->
+ * ~325ms), not better -- a scalar per-byte cast loop against uncached
+ * memory pays the full uncached-access penalty on every single byte
+ * access, where a bulk memcpy() apparently doesn't (likely a
+ * vectorized/wide-load libc implementation issuing far fewer, wider
+ * bus transactions). Real, somewhat counter-intuitive lesson: on
+ * uncached memory, "one fewer pass" is not automatically faster than
+ * "one extra memcpy" -- ACCESS PATTERN matters as much as pass count.
+ * Kept the memcpy-out below because of this real measurement, not
+ * removed for being "obviously" redundant. */
+static bool downscale_for_inference_rga(unsigned char* src, int src_w, int src_h, unsigned char* dst, int dst_w, int dst_h) {
+    memcpy(g_drm_src, src, (size_t)src_w * src_h * 3);
+    rga_buffer_t src_buf = wrapbuffer_virtualaddr_t(g_drm_src, src_w, src_h, g_src_stride_px, src_h, RK_FORMAT_RGB_888);
+    rga_buffer_t dst_buf = wrapbuffer_virtualaddr_t(g_drm_dst, dst_w, dst_h, g_dst_stride_px, dst_h, RK_FORMAT_RGB_888);
+    IM_STATUS ret = imresize(src_buf, dst_buf);
+    if (ret != IM_STATUS_SUCCESS) return false;
+    memcpy(dst, g_drm_dst, (size_t)dst_w * dst_h * 3);
+    return true;
+}
+
 /* image_drawing.c's draw_rectangle only draws outlines -- a small
  * solid-fill helper for the HUD readout panel's background. */
 static void fill_rect(unsigned char* rgb, int img_w, int img_h, int x, int y, int w, int h, unsigned char r, unsigned char g, unsigned char b) {
@@ -384,17 +504,32 @@ static void jpeg_write_cb(void* context, void* data, int size) {
     buf->insert(buf->end(), (unsigned char*)data, (unsigned char*)data + size);
 }
 
-static int http_send_frame(unsigned char* rgb, int w, int h) {
+/* Splits the combined "send_ms" this file used to report into its two
+ * real, separate costs -- JPEG encode (CPU-bound, stb_image_write) and
+ * network write (send() to the connected client) -- an open question
+ * this project had left unanswered across several sessions (only the
+ * combined figure existed). out_jpeg_ms/out_net_ms report each alone. */
+static int http_send_frame(unsigned char* rgb, int w, int h, double* out_jpeg_ms, double* out_net_ms) {
+    struct timespec t0, t1, t2;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
     std::vector<unsigned char> jpeg_buf;
     stbi_write_jpg_to_func(jpeg_write_cb, &jpeg_buf, w, h, 3, rgb, 50);
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
 
     char part_header[128];
     int hlen = snprintf(part_header, sizeof(part_header),
                          "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %zu\r\n\r\n", jpeg_buf.size());
-    if (send(client_fd, part_header, hlen, 0) < 0) return -1;
-    if (send(client_fd, jpeg_buf.data(), jpeg_buf.size(), 0) < 0) return -1;
-    if (send(client_fd, "\r\n", 2, 0) < 0) return -1;
-    return 0;
+    int ret = 0;
+    if (send(client_fd, part_header, hlen, 0) < 0) ret = -1;
+    if (ret == 0 && send(client_fd, jpeg_buf.data(), jpeg_buf.size(), 0) < 0) ret = -1;
+    if (ret == 0 && send(client_fd, "\r\n", 2, 0) < 0) ret = -1;
+
+    clock_gettime(CLOCK_MONOTONIC, &t2);
+    *out_jpeg_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    *out_net_ms = (t2.tv_sec - t1.tv_sec) * 1000.0 + (t2.tv_nsec - t1.tv_nsec) / 1e6;
+    return ret;
 }
 
 int main(int argc, char** argv) {
@@ -467,10 +602,35 @@ int main(int argc, char** argv) {
     AccelState accel;
     accel_discover(&accel);
 
+    /* env-controlled, not a new CLI arg. Defaults OFF: real, measured
+     * result this session is that RGA-offloaded downscale, even in its
+     * best (memcpy-bounce) working form, is SLOWER than the original
+     * CPU nearest-neighbor loop on this exact hardware (~46-57ms vs.
+     * ~18-26ms) -- the mandatory copy-through-contiguous-DMA-memory tax
+     * (this chip's RGA has no IOMMU, needs physically-contiguous
+     * buffers, which this driver maps CPU-uncached -- see
+     * downscale_for_inference_rga's comment for the full real
+     * investigation) outweighs what the hardware resize itself saves,
+     * for an operation this cheap on the CPU to begin with. Kept
+     * available via USE_RGA_DOWNSCALE=1 for anyone who wants to
+     * re-verify or build on this finding, not deleted -- a real,
+     * working, just not currently worthwhile code path. */
+    bool use_rga_downscale = (getenv("USE_RGA_DOWNSCALE") != NULL);
     unsigned char* frame_full = (unsigned char*)malloc(display_w * display_h * 3);
     unsigned char* frame_small = (unsigned char*)malloc(MODEL_SIZE * MODEL_SIZE * 3);
+    if (use_rga_downscale) {
+        if (drm_init()) {
+            g_drm_src = (unsigned char*)drm_alloc_contig(display_w, display_h, 3, &g_src_stride_px);
+            g_drm_dst = (unsigned char*)drm_alloc_contig(MODEL_SIZE, MODEL_SIZE, 3, &g_dst_stride_px);
+        }
+        if (!g_drm_src || !g_drm_dst) {
+            printf("RESULT: DRM_ALLOC_FAILED, falling back to CPU downscale\n");
+            use_rga_downscale = false;
+        }
+    }
     float scale_x = (float)display_w / MODEL_SIZE;
     float scale_y = (float)display_h / MODEL_SIZE;
+    printf("RESULT: DOWNSCALE_MODE %s\n", use_rga_downscale ? "RGA" : "CPU");
 
     while (1) {
         http_wait_for_client();
@@ -504,7 +664,20 @@ int main(int argc, char** argv) {
             struct timespec t_infer_start, t_infer_end;
             clock_gettime(CLOCK_MONOTONIC, &t_infer_start);
 
-            downscale_for_inference(frame_full, display_w, display_h, frame_small, MODEL_SIZE, MODEL_SIZE);
+            struct timespec t_ds_start, t_ds_end;
+            clock_gettime(CLOCK_MONOTONIC, &t_ds_start);
+            if (use_rga_downscale) {
+                if (!downscale_for_inference_rga(frame_full, display_w, display_h, frame_small, MODEL_SIZE, MODEL_SIZE)) {
+                    fprintf(stderr, "RESULT: RGA_DOWNSCALE_FAILED, falling back to CPU downscale for this and all future frames\n");
+                    use_rga_downscale = false;
+                    downscale_for_inference(frame_full, display_w, display_h, frame_small, MODEL_SIZE, MODEL_SIZE);
+                }
+            } else {
+                downscale_for_inference(frame_full, display_w, display_h, frame_small, MODEL_SIZE, MODEL_SIZE);
+            }
+            clock_gettime(CLOCK_MONOTONIC, &t_ds_end);
+            double downscale_ms = (t_ds_end.tv_sec - t_ds_start.tv_sec) * 1000.0 +
+                                   (t_ds_end.tv_nsec - t_ds_start.tv_nsec) / 1e6;
             for (int i = 0; i < MODEL_SIZE * MODEL_SIZE * 3; i++) in_buf[i] = (int8_t)((int)frame_small[i] - 128);
             ret = rknn_run(ctx, NULL);
             if (ret != RKNN_SUCC) { printf("RESULT: RUN_FAIL ret=%d\n", ret); break; }
@@ -580,19 +753,15 @@ int main(int argc, char** argv) {
                 draw_text(&img, msg, 8, 64, 0xFF808080, 12); /* grey, matching apex_hud's no-data convention */
             }
 
-            struct timespec t_send_start, t_send_end;
-            clock_gettime(CLOCK_MONOTONIC, &t_send_start);
-            if (http_send_frame(frame_full, display_w, display_h) < 0) {
+            double jpeg_ms = 0, net_ms = 0;
+            if (http_send_frame(frame_full, display_w, display_h, &jpeg_ms, &net_ms) < 0) {
                 printf("RESULT: CLIENT_DISCONNECTED after %d frames\n", frame_count);
                 client_alive = 0;
             }
-            clock_gettime(CLOCK_MONOTONIC, &t_send_end);
-            double send_ms = (t_send_end.tv_sec - t_send_start.tv_sec) * 1000.0 +
-                              (t_send_end.tv_nsec - t_send_start.tv_nsec) / 1e6;
 
             if (frame_count % 10 == 0) {
-                printf("frame=%d fps=%.1f read_ms=%.1f infer_ms=%.1f send_ms=%.1f dets=%zu\n",
-                       frame_count, fps, read_ms, infer_ms, send_ms, dets.size());
+                printf("frame=%d fps=%.1f read_ms=%.1f downscale_ms=%.1f infer_ms=%.1f jpeg_ms=%.1f net_ms=%.1f dets=%zu\n",
+                       frame_count, fps, read_ms, downscale_ms, infer_ms, jpeg_ms, net_ms, dets.size());
                 fflush(stdout);
             }
         }

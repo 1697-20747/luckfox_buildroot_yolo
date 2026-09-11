@@ -829,3 +829,202 @@ this specific network path at this specific time, not a general Docker or Mac ne
 Fixed by pointing `/etc/apt/sources.list` at `mirrors.edge.kernel.org/ubuntu` instead. Not
 investigated further since it resolved cleanly; worth trying a different mirror first if
 `archive.ubuntu.com` hangs again rather than assuming Docker networking itself is broken.
+
+## Real hardware offload attempt: RGA and MPP -- one real (if negative) win, one real wall found and stopped at cleanly (2026-09-11, later session)
+
+1697-20747 asked to move as much of the video-processing pipeline as possible off the single CPU core and
+onto RV1106's real hardware blocks, since JPEG-encode+network-send was documented (last session) as
+the pipeline's single biggest cost, still 100% software. Explicitly scoped narrow: only the existing
+single-client `luckfox_video_hud_stream.c` pipeline's CPU-bound stages, not live camera (separate,
+blocked) or multi-client fan-out (separate, paused). Two real targets: MPP's hardware JPEG encoder
+(primary, bigger expected win) and RGA's 2D scale/color-convert (secondary, for
+`downscale_for_inference()`).
+
+**Real discovery first, not assumed.** SSH'd in fresh and checked `ldconfig -p`, `lsmod`, and
+`/dev`: **RGA has a real, ready-to-use glibc userspace library already on this board** --
+`librga.so.2` (`rga_api version 1.10.1`) sits in `/usr/lib`, in `ldconfig`'s cache, no build needed.
+**MPP does not** -- `librockchip_mpp.so` only exists under `/oem/usr/lib` (Luckfox's vendor
+Buildroot/uClibc tree), linked against `libc.so.0` (uClibc), and this Ubuntu image has no
+`ld-uClibc.so.0` interpreter to run it at all (`/oem/usr/bin/rgaImDemo`/`mpp_info_test` both fail
+with a bare "No such file or directory" -- the classic missing-interpreter symptom, not a literally
+missing file). Kernel side for both is real and active either way: `mpp_vcodec`/`rga3` both show up
+in `lsmod`, `/dev/mpp_service` and `/dev/rga` both exist -- confirms this is a genuine
+userspace-only gap for MPP, not a deeper hardware/driver one. Neither library is available via
+`apt` (checked `dpkg -S`/`apt-cache search` -- `librga.so.2` isn't from a Debian package at all, it
+was placed there by whoever built this third-party image).
+
+**Closed a real, several-sessions-old open question: JPEG encode vs. network send, split for real.**
+Instrumented `http_send_frame()` in `luckfox_video_hud_stream.c` to time `stbi_write_jpg_to_func`
+(encode) and `send()` (network write) separately (previously only their combined total existed).
+Tested both over loopback AND from a real WiFi client on a separate machine (the Mac), not just
+loopback, to rule out a loopback-specific artifact:
+
+```
+                            combined (old)   JPEG encode alone   network send alone
+1280x720, real WiFi client      ~150-165ms        ~146-165ms           ~0.4-1.5ms
+```
+
+**JPEG encode (pure software, `stb_image_write`) is essentially the entire cost; network send is
+negligible, even over real WiFi to a separate machine.** This directly corrects a real, specific
+guess made two sessions ago (dropping JPEG quality 80->50 barely moved the number, which was read as
+"the network write must be the real cost") -- that guess was wrong: `send()` just hands bytes to the
+kernel's TCP buffer and returns almost immediately; the real WiFi transmission happens asynchronously
+off the pipeline's hot path, with plenty of time to drain between frames at this frame rate. This
+makes MPP's hardware JPEG encoder unambiguously the single highest-value real target in this
+pipeline, bigger than NPU inference itself.
+
+### RGA downscale offload: implemented, correct, real -- and a real, measured net loss
+
+Rewrote `downscale_for_inference()` to call RGA's `imresize()` instead of a CPU nearest-neighbor
+loop. Fetched real headers to match the installed `.so` (`airockchip/librga` on GitHub -- the actual
+upstream for this API, found by probing candidate repo names since `rockchip-linux/linux-rga` and
+`airockchip/linux-rga` both 404; `airockchip/librga` is real, `rga_api version 1.10.6` on that repo's
+HEAD vs. `1.10.1` installed on the board -- close enough that the library's own built-in
+version-compatibility warning stayed silent, a small, acceptable version skew, not blindly assumed
+safe).
+
+**First real wall, hit immediately: this chip's RGA has no IOMMU.** A first attempt handed
+`imresize()` plain `malloc()`'d buffers (the existing `frame_full`/`frame_small`) -- failed for real,
+not silently: `dmesg` showed `rga_mm: Current NONE_MMU[0] cannot support physically discontinuous
+virtual address!` / `job_commit failed`. Real, concrete, not a guess: RGA needs genuinely
+physically-contiguous DMA memory; ordinary heap memory is virtually contiguous but not physically
+so. **Real fix, not a workaround:** wrote a DRM "dumb buffer" allocator (`drm_alloc_contig()` in
+`luckfox_video_hud_stream.c`) using raw ioctls against `/dev/dri/card0` (confirmed present and
+usable) -- deliberately NOT linking/dlopen-ing `libdrm.so` (this image ships only the runtime `.so`,
+no dev symlink) since this board's own `/usr/include/drm/{drm,drm_mode}.h` kernel-uapi headers are
+enough for the raw `DRM_IOCTL_MODE_CREATE_DUMB`/`MAP_DUMB` ioctl sequence, matching the same real
+pattern Rockchip's own `librga` sample allocator (`samples/utils/allocator/drm_alloc.cpp`, fetched
+for reference, not built directly) uses.
+
+**Second real wall: that memory is CPU-uncached, and this pipeline's frame buffers are NOT
+CPU-light.** A first working version made `frame_full`/`frame_small` themselves DRM-backed so RGA
+could touch them with zero extra copies -- `downscale_ms` dropped to a real ~2.5ms as hoped, but
+every OTHER stage that also touches those buffers (the quantization loop, HUD drawing, JPEG encode)
+got dramatically slower reading through uncached memory: `infer_ms` 85ms->323ms, `jpeg_ms`
+145ms->548ms -- a large, real NET LOSS (fps 3.3->1.0), kept and reported rather than discarded as a
+false start. **Third real attempt, the actual fix for the regression (if not for the original
+goal):** bounce through two small persistent DRM buffers ONLY around the RGA call itself (`g_drm_src`/
+`g_drm_dst`), keeping `frame_full`/`frame_small` as ordinary cached `malloc()` buffers used
+everywhere else. This fixed the regression elsewhere (`jpeg_ms` back to ~146-153ms, matching
+baseline) but left the downscale step itself **slower than the CPU loop it replaced** (~51.6-60.5ms
+vs. the CPU loop's real ~8.7-9.2ms, a more precise number than the ~18-26ms estimated last session
+from an indirect before/after `infer_ms` comparison -- this session's direct per-stage timing split
+gives the real, accurate figure).
+
+**A fourth real attempt tried removing the memcpy-out too** (having the quantization loop read the
+uncached `g_drm_dst` directly, since it already touches every dst byte once) -- reasoned as "one
+fewer pass should be faster." **Measured result: much WORSE** (`infer_ms` back up to ~321-332ms), not
+better -- real, somewhat counter-intuitive finding: a scalar per-byte cast loop against uncached
+memory pays the full uncached-access penalty on every single byte access, while a bulk `memcpy()`
+apparently doesn't (likely a vectorized/wide-load libc implementation issuing far fewer, wider bus
+transactions). Reverted to the memcpy-out version -- "one fewer pass" is not automatically faster
+than "one extra memcpy" on uncached memory; access pattern matters as much as pass count.
+
+**Real, final numbers, clean (MPP's background build paused during measurement to avoid CPU
+contention skewing results -- confirmed this mattered: an earlier run measured with the build still
+running showed `jpeg_ms` inflated to 337-348ms, a real, caught mistake, not reported as a genuine
+result):**
+
+```
+                              CPU nearest-neighbor (default)   RGA (USE_RGA_DOWNSCALE=1)
+downscale step alone                    ~8.7-9.2ms                    ~51.6-60.5ms
+real steady-state end-to-end fps         ~3.3-3.4 fps                  ~2.9-3.0 fps
+```
+
+**Honest conclusion: RGA downscale offload works, is correct, and is a real, measured net loss on
+this exact hardware** -- the mandatory copy-through-contiguous-DMA-memory tax this no-IOMMU chip
+imposes outweighs what the hardware resize itself saves, for an operation (640x640 nearest-neighbor)
+that was already cheap on the CPU. Four different real implementations were tried, each one fixing
+the specific problem the previous measurement revealed -- not a single attempt given up on early.
+Flipped the default back to CPU (`use_rga_downscale = (getenv("USE_RGA_DOWNSCALE") != NULL)`) rather
+than ship a regression as the new default; the RGA path is kept available and working, not deleted,
+since it's real correct code that could matter on a future task with a larger/different resize.
+
+### MPP hardware JPEG encode: real build success, two real integration gaps fixed, then a genuine kernel-level wall
+
+**Built the public `rockchip-linux/mpp` source natively on-device.** Confirmed `cmake`/`git`/`make`/
+`gcc`/`g++` all present -- no cross-toolchain needed. Shallow-cloned (`develop` branch, the only
+current branch; the `1.0.x`/`1.1.x` tags are old release snapshots predating RV1106). `cmake`
+configured cleanly first try. The actual `make -j1` build (single core, ~200MB RAM) was real,
+substantial work -- compiles codec HALs for essentially every Rockchip chip family by default (no
+compile-time "just this chip" option exists; MPP is designed for runtime hardware detection instead,
+so trimming would mean real surgery on the CMake/source tree, not a flag) -- paused/resumed several
+times across the session (once by accident: a `pgrep -f "[c]c1$"` pattern typo meant to resume the
+build only matched the parent `make` process, not the actual `cc1` child, silently stalling the
+build at 15% for a long stretch until caught by noticing zero log progress and checking real process
+state, not assumed successful from the resume command not erroring). **Completed for real, 100%,
+producing a real working `librockchip_mpp.so.0`/`.1`** -- confirmed via `mpi_enc_test`/`mpp_info_test`
+actually running against it.
+
+**Real integration gap #1: this exact SoC isn't in the upstream repo's chip table at all.** First run:
+`mpp_platform: can not found match soc name` + `mpp_rt: can NOT found any allocator` (the second one
+turned out to be a red herring -- unprivileged `pico` lacks `video`/`render` group membership for
+`/dev/dri/card0`; running with `sudo` fixed it, unrelated to the SoC-match problem). Checked
+`osal/mpp_soc.c` directly: zero matches for "rv1106" anywhere, confirmed by grep, not assumed from
+the error message alone. Checked whether Luckfox's own SDK (`LuckfoxTECH/luckfox-pico`, already used
+this project for the accelerometer/WiFi kernel work) has real MPP source with the missing entry --
+it does NOT: `media/mpp/` in that repo ships only prebuilt uClibc release binaries
+(`release_mpp_rv1106_arm-rockchip830-linux-uclibcgnueabihf/`), no buildable source, so there's no
+"real" reference entry to copy verbatim. **First fix, wrong:** modeled a new RV1106 table entry on
+the neighboring `rv1109`/`rv1126` chips (same IPC-camera family, plausible-looking). Got past the
+name-match step, but every subsequent real hardware test logged `client 1/9/18 driver is not ready!`
+-- the runtime compares my claimed capabilities against what the REAL kernel driver reports via
+`check_mpp_service_cap()`, and disagreed on 3 of them.
+
+**Real integration gap #1, corrected using real hardware data instead of a sibling-chip guess.**
+`cat /proc/mpp_service/supports-device` on the actual board -- ground truth, not inferred -- reports
+exactly one real device: `DEVICE[16]:RKVENC HW_ID:0x50603313`. Grepped the same source tree for that
+literal hex value: `0x50603313` is `HWID_VEPU540C` (`mpp/hal/inc/hal_hw_id.h`) -- a different, newer
+encoder IP block than rv1109/rv1126's vepu2/vepu541, shared instead with RK3528/RK3562's real table
+entries (confirmed by finding their entries also reference `vepu540c`). No decode device is listed
+at all -- consistent with this chip's own datasheet (no hardware decode on RV1106) and with client
+1 (VDPU2) / 9 (RKVDEC) being exactly the ones reported "not ready" against the wrong first guess.
+Rewrote the table entry: `HAVE_RKVENC` only (no decode flags at all), HAL `vepu540c_no_hevc`
+(AVC+MJPEG, no HEVC -- matches real RV1106 capability, more precise than the plain `vepu540c` which
+also claims HEVC). Rebuilt -- the "client not ready" warnings and the "can not found match soc name"
+warning both disappeared, a real, confirmed fix, not assumed from the code change alone.
+
+**Real integration gap #2, found immediately after: `mpp_enc_hal_init could not found coding type 8`
+(JPEG) despite the SoC table now being correct.** Read `mpp_enc_hal_api_register()` in
+`mpp/hal/mpp_enc_hal.c`: each individual HAL API implementation carries its OWN separate per-chip
+whitelist (`api->soc_type[]`), checked independently of the SoC capability table just fixed above --
+a second, genuinely separate registration mechanism, not the same gap re-surfacing. Found the real
+JPEG-via-RKVENC implementation, `mpp/hal/rkenc/jpege/hal_jpege_vepu540c.c`'s `hal_jpege_vepu540c` --
+its `soc_type[]` list only had `ROCKCHIP_SOC_RK3528`/`ROCKCHIP_SOC_RK3562`. Added
+`ROCKCHIP_SOC_RV1106` to that list too, justified by the same real `HWID_VEPU540C` hardware-ID match
+from gap #1, not a second blind guess. Rebuilt -- got past HAL registration for real, confirmed by
+the error message changing to a different, later-stage failure (below), not the same one recurring.
+
+**Where it genuinely, seriously stopped: a real kernel-level crash on the first actual submitted
+job, not a software config problem.** With both integration gaps fixed, ran a real JPEG-encode
+attempt (`mpi_enc_test`, a synthetic 640x640 NV12 test frame generated via `ffmpeg`) against the
+actual hardware. It got all the way to real register submission -- `hal_jpege_v540c:
+hal_jpege_vepu540c_status_check jpeg enc not done hw_status: 0x00000000`, then `dmesg` showed the
+kernel's own `mpp_vcodec.ko` module crash for real inside `rkvenc_run` (`Process queue_work0`, full
+register dump and stack trace, `mpp_rkvenc_worker` -> `kthread_worker_fn`), followed by
+`rk_vcodec: mpp_wait_result_default: timeout`. **Checked the board survived before concluding
+anything, not assumed:** `uptime`/SSH stayed responsive, `lsmod` still showed `mpp_vcodec` loaded, no
+crash-loop in `ps aux --sort=-%cpu`, and a fresh run of the real, existing
+`luckfox_video_hud_stream` detection pipeline immediately afterward produced completely normal
+numbers (fps ~3.0, infer_ms ~86-101ms, jpeg_ms ~154-165ms) -- confirming this kernel oops was
+contained to the one crashed kthread, not a wider system problem, and didn't need a reboot/reflash to
+recover from. **Deliberately stopped here rather than keep experimenting against a kernel module
+that had just oopsed** -- real, serious risk of an unrecoverable hang on a further wrong guess (this
+project's own WiFi-driver history earlier this session/project already has two real instances of a
+wrong kernel-adjacent guess needing a physical power cycle to recover from). Honest read: matching
+`HWID_VEPU540C` got real software far enough to reach actual hardware and submit a real job -- further
+than either RGA wall required -- but was not sufficient for full register-level compatibility between
+RK3528/RK3562's exact VEPU540C integration and RV1106's. That's a genuinely deeper vendor-integration
+detail (exact register offsets/sequencing, clock/power domain setup) not discoverable from public
+sources alone; Luckfox's own uClibc build almost certainly gets this right (real, working hardware
+JPEG encode clearly exists on this exact chip per its datasheet and per their vendor firmware), just
+not source-available to compare against.
+
+**Net result of this session's offload work, both targets reported honestly rather than forced to a
+single tidy outcome:** RGA downscale -- real, working, measured net loss, not adopted as default.
+MPP JPEG encode -- real, substantial forward progress (a working native build, two real and correctly
+diagnosed integration gaps fixed using genuine hardware-ID cross-referencing rather than guesses) but
+NOT completed -- stopped at a real kernel-level wall rather than pushed through it. `luckfox_video_hud_stream.c`'s
+JPEG encode remains 100% software (`stb_image_write`) as a result; software JPEG encode (~146-165ms)
+remains, confirmed and unchanged, the pipeline's single biggest real cost, bigger than NPU inference
+itself.
