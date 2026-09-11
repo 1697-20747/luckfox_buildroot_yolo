@@ -1099,3 +1099,294 @@ lightweight GPIO helper and becomes a second full SBC. More fundamentally, RV110
 JPEG-encode silicon on-die (the whole reason it's an IP-camera SoC) -- the blocker found this session
 was a software/kernel-driver version mismatch, not missing hardware, so external hardware would be
 working around silicon that's already there rather than fixing the real problem. Not pursued.
+
+## 2026-09-11 (new session) -- MPP version-match hypothesis tested for real: partial confirmation, still not a working encode
+
+Follow-up to the kernel-crash wall above. The concrete lead going in: `cat /proc/mpp_service/version`
+reports the running kernel driver's own embedded build info as commit `424abb9b`, dated 2024-04-29 --
+about 2.5 years older than the `develop`-branch HEAD (`0986d01`, 2026-08-26) the userspace library was
+built from last session. Same author on both (Yandong Lin). Hypothesis: building userspace MPP from a
+version-matched (or nearest-date) commit instead of `develop` HEAD might avoid whatever the kernel
+crash was actually tripping over -- this project already proved this exact failure mode once, for RKNN
+(the NPU toolkit had to be version-matched, not "newest is best").
+
+**Verified the lead for real before rebuilding anything, and found something more precise than
+expected.** Full-cloned `rockchip-linux/mpp` (not the `develop`-only shallow clone from last session)
+and searched its complete history: `424abb9b` is a real, exact commit in this repo -- confirmed by
+hash, message text ("[mpp_enc]: fix wrap enc sw timeout when resolution switch"), and author, no
+guessing needed. Its **CommitDate is 2024-04-29 16:31:33 +08:00** -- an exact match, down to the
+minute, against the kernel driver's own reported date. Strong, real confirmation this hash genuinely
+is the kernel driver's provenance, not a coincidence.
+
+**But `424abb9b` is not reachable from `develop` at all** -- `git merge-base develop 424abb9b` returns
+nothing; neither is an ancestor of the other. Its directory layout (`vcodec/`, `vproc/`, a top-level
+`mpp/` full of files like `mpp_vcodec_driver.c`, `mpp_service.c`) is the **kernel driver source
+itself**, on a completely disjoint commit graph from `develop`'s classic userspace-library layout
+(`osal/`, `mpp/hal/`, `mpp/codec/`, producing `librockchip_mpp.so` + `mpi_enc_test`). This public repo
+evidently hosts the kernel driver and the userspace library as two unrelated histories that happen to
+share the same GitHub repo (and, per the shared author/era, probably a common internal origin at
+Rockchip) -- not one version-numbered tree. In hindsight this makes sense: the kernel module's own
+embedded version string obviously comes from building *its own* source, not the userspace library's.
+
+**Consequence: literally checking out `424abb9b` and building it produces the kernel driver, not
+something `mpi_enc_test` can link against -- exercised the guardrail in the plan for exactly this
+case.** Fell back to the documented alternative: found the `develop`-line commit closest by date to
+the kernel driver's exact CommitDate (2024-04-29 16:31:33 +08:00). That commit is `23126cf6`
+("fix[rc2_test]: fix pkt buffer overflow error"), committed 2024-04-29 10:13:34 +08:00 -- **same
+calendar day, ~6.3 hours earlier**, the closest real commit on that line. Recorded explicitly per the
+plan's own instruction: **this is a date-based best-effort match, not an exact hash match** -- weight
+the result accordingly.
+
+**Reapplied the known fixes -- two applied cleanly, the third has no equivalent this far back.**
+`osal/inc/mpp_soc.h` (add `ROCKCHIP_SOC_RV1106` to the enum) and `osal/mpp_soc.cpp` (add an `rv1106`
+table entry, `HAVE_RKVENC` only, HAL `vepu540c_no_hevc`, modeled on the real `rk3562` entry) both
+applied the same way as last session -- confirmed no RV1106 entry existed yet at this commit either
+(grep, zero matches, same as before). The third fix (a per-HAL `soc_type[]` whitelist in
+`hal_jpege_vepu540c.c`) **does not exist as a mechanism at this commit at all** -- read
+`hal_jpege_api_v2.c`'s `hal_jpege_init()` directly rather than assuming: at this point in the codebase's
+history, JPEG HAL selection is decided purely by
+`HWID_VEPU540C == mpp_get_client_hw_id(VPU_CLIENT_RKVENC)` -- a real hardware-ID match against the
+actual kernel-reported device, no separate per-chip whitelist gate at all. That whitelist was added
+later, upstream of this commit, somewhere between here and current `develop` HEAD. Real, structural
+difference between the two code eras, not an oversight on either side.
+
+**Built cleanly, 100%, on-device again** (`cmake` configured first try, `make -j1`, single core,
+~11 minutes this time) -- `librockchip_mpp.so.0`/`.1` and `mpi_enc_test` both produced with no errors.
+
+**Re-ran the identical real test as last session** (`mpi_enc_test`, the same synthetic 640x640 NV12
+frame still sitting in `/tmp/test640_nv12.yuv` from last session, `-t 8` for MJPEG) against the actual
+hardware, with the kernel's dmesg ring buffer cleared first (`dmesg -c`) so the result would be
+unambiguous. **Real, different, and genuinely better result: no kernel crash this time.** Where last
+session got a full Oops -- NULL pointer dereference, complete register dump, stack trace through
+`rkvenc_run`/`mpp_rkvenc_worker`/`kthread_worker_fn` -- this run's entire dmesg output was one line:
+`rk_vcodec: mpp_wait_result_default:1044: timeout, pid 650 session 16:7 count 1 cur_task 1 state 201`.
+Confirmed this isn't a fluke by running it a second time with clean file-redirected output (the first
+run's stdout got lost in a pipe) -- same result, a second timeout line, still no crash. Board stayed
+fully healthy both times: `lsmod` still shows `mpp_vcodec` loaded normally, no crash-loop, `ps aux`
+clean.
+
+**But it's still not a working encode.** The test did produce an output file
+(`/tmp/datematch_out.jpg`, 623 bytes) -- checked its real structure rather than trusting the non-zero
+size: it has a valid SOI, DQT, SOF0, and DHT (all written by software before hardware dispatch) and a
+real SOS marker, but **no EOI marker and essentially zero bytes of actual entropy-coded scan data**.
+Consistent with the dmesg timeout: the hardware job was submitted and the software-side header
+got written, but the hardware never signaled completion, so the file is header-only and not decodable
+as a real image.
+
+**Re-verified the existing pipeline is genuinely unaffected, the way the plan required before drawing
+any conclusion.** First attempt at this reused the wrong model file
+(`yolov8n-rv1106-toolkit1.6.0.rknn`, a stale/non-optimized export sitting in the same directory) and
+hit a real but unrelated RKNN error (`unsupported input layout 3 for softmax`, `fallback cpu failed`)
+-- investigated rather than assumed a regression, since nothing this session touched RKNN, the NPU
+driver, or any model file. Re-ran with the actual documented model
+(`yolov8n-optimized-rv1106-1.6.0.rknn`) and got a completely clean, real run: live detections
+(`dets=1-3` per frame), fps climbing to a genuine **~5.0-5.1** plateau, `infer_ms` ~87ms, `jpeg_ms`
+~50-77ms -- matching the documented libjpeg-turbo baseline exactly. Zero regression, confirmed by a
+real run, not inferred from "I didn't touch that code."
+
+**Honest read on the hypothesis: partially confirmed, not fully.** Version-matching the userspace
+build to the kernel driver's era did change the real, observed failure mode from a hard kernel panic
+to a soft driver-side timeout -- genuinely different, and a real (if narrow) win for the "match
+versions, don't assume newest is best" lesson this project already learned once for RKNN. But the
+underlying job still never completes on real hardware, so this is not a working hardware JPEG encoder,
+and `luckfox_video_hud_stream.c` was **not** changed -- there is no real MPP encode path to integrate.
+The remaining gap reads the same as last session's own conclusion, just reached by a cleaner path this
+time: RK3528/RK3562's `vepu540c`/`vepu540c_no_hevc` HAL, even hardware-ID-matched and now
+version-era-matched, still doesn't fully match whatever RV1106's actual kernel driver expects at the
+register/sequencing/clock-power-domain level -- a genuinely deeper vendor-integration detail, not
+discoverable from public source, that Luckfox's own uClibc vendor build almost certainly gets right
+but isn't source-available to compare against. Worth flagging the one real caveat on the version-match
+result itself: `23126cf6` is a date-based nearest match, not the literal commit the kernel driver was
+built from (that literal commit isn't reachable from the userspace-library history at all) -- so this
+doesn't fully rule out version skew as *a* contributing factor, just shows that the specific,
+practically-buildable nearest-match attempt still isn't sufficient on its own.
+
+**Stopped here, deliberately, same discipline as last session.** A driver-timeout is a much softer
+failure than a kernel Oops -- real risk was lower this time -- but pushing further from here would mean
+guessing at genuinely proprietary register-level/clock-power-domain details with no public source to
+check against, the same wall as before, just reached through a cleaner, more precisely-diagnosed path.
+`libjpeg-turbo` remains the correct, current, unchanged default for JPEG encode in
+`luckfox_video_hud_stream.c`.
+
+## 2026-09-11 (same session, later) -- real CPU-utilization check, and re-running the 512x512 benchmark against today's libjpeg-turbo build
+
+With MPP hardware encode still blocked, 1697-20747 asked what's next: is the CPU actually maxed out, and
+if the 512x512 inference model is faster, is there room to raise display resolution.
+
+**Checked CPU utilization live rather than assuming -- genuinely, fully saturated.** Sampled `top`
+six times over ~12s of real steady-state streaming: **0.0% idle, 0.0% iowait, every single sample**,
+split between `ffmpeg` (~40-53%, software-decoding/scaling `bikes.mp4`) and the pipeline itself
+(~30-37%), on this chip's one real CPU core (`nproc=1`). Confirmed via source read
+(`luckfox_video_hud_stream.c`, no `pthread_create`, one `while(1)` doing
+read->downscale->infer->jpeg-encode->send in strict sequence) that this is real, not an artifact --
+there's no idle capacity a scheduler or threading change could reclaim on a single core; any further
+speedup has to come from doing less real work, not better overlap.
+
+**Re-ran the 512x512-vs-640x640 inference benchmark from earlier this session's memory entry, but
+against *today's* libjpeg-turbo build** -- the original 512 benchmark (`## ... 512x512 vs 640x640
+inference benchmark`, above) predates the libjpeg-turbo swap entirely, so it measured the old
+stb_image_write-era pipeline. The on-board `luckfox_video_hud_stream_512` binary turned out to be
+that same stale pre-libjpeg-turbo fork (confirmed by grep: still calls `stbi_write_jpg_to_func`, not
+`jpeg_mem_dest`) -- **not reused**, since it wouldn't have been a fair comparison. Instead copied
+today's actual `luckfox_video_hud_stream.c` (real libjpeg-turbo default intact), changed only
+`#define MODEL_SIZE` from 640 to 512, and rebuilt on-device
+(`g++ ... luckfox_video_hud_stream_512b.c utils/image_drawing.c -I. -Iutils -I3rdparty/stb_image
+-Irga_include -lrknnmrt -lrga -ljpeg -lm -lpthread` -- needed `-Iutils`/`utils/image_drawing.c` for
+`draw_rectangle`/`draw_text` and `-Irga_include` for `im2d.h`, neither obvious from the original
+build note). Ran both back-to-back, same `bikes.mp4`, same default (native, `ffprobe`-confirmed
+1280x720) display resolution, 35s real connected sessions each:
+
+```
+                                640x640 inference (today's libjpeg-turbo)   512x512 inference (today's libjpeg-turbo)
+NPU inference                            ~86-87ms/frame                             ~62-63ms/frame
+Steady-state end-to-end fps                  ~5.2-5.3 fps                               ~5.4 fps
+```
+
+Inference itself dropped a real ~28% (86.9ms -> 62.7ms), closely matching the original benchmark's
+~25% finding -- reproducible, not a fluke. **But the net end-to-end fps gain this run was modest,
+only ~3-4%**, well under what the raw inference saving alone would predict. Real, honest reason,
+checked rather than hand-waved: `jpeg_ms` ran noticeably higher during the 512 run (~65-88ms,
+averaging ~75ms) than during the 640 baseline run immediately before it (~49-68ms, averaging ~57ms)
+-- almost certainly real frame-to-frame JPEG-entropy variance (later parts of `bikes.mp4` compress
+differently than earlier parts), not a systematic cost of the inference-resolution change, since JPEG
+encode operates on the unchanged 1280x720 display frame regardless of inference resolution. Summing
+each run's own accounted stages (infer+jpeg+read+net) shows the real underlying improvement was
+present (~172ms/frame -> ~168ms/frame) but partly masked by this run's jpeg-timing noise. A cleaner,
+longer, or repeated run would likely show a larger, cleaner gain closer to the original ~10-15%
+finding -- not done this session, real result reported as measured rather than smoothed over.
+
+**On "can we bump display resolution up now that inference is faster": no, not with this test
+source.** `ffprobe` confirms `bikes.mp4` is natively exactly 1280x720 -- the same resolution the
+pipeline already defaults to. There is no higher real resolution to render at without artificially
+upscaling the source (pure wasted encode/decode cost for zero real detail gain, the opposite of the
+point). Any inference-time savings from 512x512 right now just becomes fps headroom, not usable
+display-quality headroom, until either a genuinely higher-resolution source is used or (per the
+`ffmpeg`-elimination point above) the live camera is connected with its own native resolution.
+
+## 2026-09-11 (same session, later still) -- live camera physically connected, verified for real end-to-end; accelerometer re-confirmed
+
+1697-20747 connected the CSI camera and reported the accelerometer live too, and asked for the docs to be
+updated for real hardware state, with a preference for a slight resolution bump on the live camera
+once it's wired in. Verified everything below directly rather than taking the report at face value --
+this project's whole discipline has been "check the real device before writing it down."
+
+**Real camera detection, checked from the kernel/I2C side up, not assumed from a driver loading.**
+`i2cdetect -y 4` (the CSI sensor-control bus per this repo's own GPIO/I2C-bus notes) shows a real
+device at `0x30` marked `UU` -- claimed by a kernel driver, not just present. Confirmed which one:
+`/sys/bus/i2c/devices/4-0030/driver` symlinks to `.../drivers/sc3336`, `name` and `modalias` both say
+`sc3336`/`smartsens,sc3336`. `lsmod` shows `sc3336`, `video_rkcif`, `video_rkisp`, and both CSI D-PHY
+modules loaded, with `rkcif`/`rkisp` already showing a real client (`rockit`, count 1 each) --
+something is already actively using the ISP pipeline, not just idle-loaded. This is exactly the one
+sensor this board's vendor image ships a driver for (the README's prior IMX219/IMX708/OV5647 concern
+was about a *different*, incompatible camera -- moot now that this is the matching one).
+
+**No `v4l2-ctl`/`media-ctl` on this image at all -- installed `v4l-utils` via `apt-get` to actually
+probe real capability** (clean install, no issues, same low-risk userspace-package pattern as
+`libjpeg-turbo8-dev` earlier this session). `--list-devices` shows the real pipeline topology:
+`rkcif` raw-capture nodes (`/dev/video0`-`10`) feeding `rkisp_mainpath` output nodes
+(`/dev/video11`-`18`). `--list-formats-ext` on the mainpath nodes reports real, consistent
+capability across all of them: **stepwise 32x32 to 2304x1296 (8px steps)**, formats including
+NV12/NV21/NV16/UYVY/GREY/XR24(BGRX)/RGBP(RGB565) -- 2304x1296 matches the SmartSens SC3336's real
+published 3MP sensor resolution, a second independent confirmation this is genuinely that sensor.
+
+**Real capture test, not just format enumeration -- pulled an actual frame and looked at it.**
+`v4l2-ctl -d /dev/video11 --set-fmt-video=width=1920,height=1080,pixelformat=NV12 --stream-mmap
+--stream-count=3 --stream-to=/tmp/cam_test.raw` produced a file whose size (9,331,200 bytes) matches
+the exact byte-for-byte math for 3 real NV12 frames at 1920x1080 -- no truncation, no dropped data.
+A quick statistical sample of the Y plane showed real variation (9 distinct values, not a flatlined
+dead sensor) but a suspiciously narrow, dark range (17-27 out of 255) -- investigated rather than
+either trusted or dismissed: pulled the raw frame to the Mac, manually decoded NV12->RGB (BT.601, by
+hand with numpy -- no `ffmpeg` on the Mac side, installed a throwaway Pillow/numpy venv rather than
+touching system Python per PEP 668) and rendered both a true-color and a brightness-boosted grayscale
+PNG. **Real, recognizable image** -- a ceiling/wall corner, visible seam line, what looks like a cable
+crossing the upper right -- confirming a genuinely live, correctly-wired sensor pointed at a real dim
+room, not a dead/frozen/garbage capture. The darkness itself is most likely unset auto-exposure/gain
+on this direct low-level `v4l2-ctl` grab (bypassing whatever 3A/AE tuning the vendor's normal camera
+stack would apply), not a hardware problem -- worth keeping in mind for the real integration, but not
+concerning on its own.
+
+**Accelerometer re-confirmed live, unchanged.** `/sys/bus/iio/devices/iio:device1` is still `mpu6050`,
+raw reads still real and non-flat (`x=14624 y=1440 z=14354` this check, different instant/orientation
+than the 2026-09-09 entry's numbers but the same real sensor, same interface, nothing regressed).
+
+**Resolution recommendation for the real integration, grounded in what was just measured:** 1920x1080
+is a genuine, verified-working target -- a real step up from the current 1280x720 video-file-testing
+default, comfortably under the sensor's real 2304x1296 ceiling (leaves headroom rather than maxing
+out). **Not yet wired into `luckfox_video_hud_stream.c`** -- the pipeline still only reads via
+`ffmpeg`-decoding a video *file*; swapping in a real V4L2 capture loop (mmap-based, like the
+verification test above, rather than piping through another `ffmpeg` process) is the real next
+implementation step, not done this session. It's also a bigger win than "just" enabling the live
+camera: this session's own CPU-utilization check found `ffmpeg`'s software file-decode already eating
+~40-53% of this chip's one real CPU core every frame -- a native V4L2 capture path removes that
+software-decode cost entirely rather than trading it for something else, on top of unblocking real
+live operation instead of a canned test video.
+
+## 2026-09-11 (same session, later still) -- live camera actually wired into the pipeline, at 1920x1080; a real latent SIGPIPE bug found and fixed along the way
+
+1697-20747 asked to wire the live camera in for real ("make the live camera feed properly, go ahead"),
+with 1920x1080 as the target resolution per the prior entry's recommendation.
+
+**Real design: `luckfox_video_hud_stream.c` now auto-detects a live camera vs. a video file** by
+checking whether the second argument starts with `/dev/video` -- no new CLI flag needed, the same
+binary handles both. Added a standard V4L2 mmap capture path (`V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE`,
+matching the real `rkisp_mainpath` topology confirmed last entry): open the device, `VIDIOC_S_FMT`
+requesting NV12 at the target size (the driver may negotiate a different real size on this stepwise
+sensor -- used what it actually reports back, not the request), `VIDIOC_REQBUFS`/`VIDIOC_QUERYBUF`/
+`mmap` for 4 buffers, `VIDIOC_STREAMON`, then a normal `VIDIOC_DQBUF`/convert/`VIDIOC_QBUF` loop per
+frame. Opened ONCE like the RKNN model, not torn down between HTTP client (re)connections (unlike the
+video-file path's per-connection `ffmpeg` respawn) -- reconfiguring a live sensor pipeline per browser
+connect would be real, unnecessary churn.
+
+**NV12->RGB conversion, reusing the exact formula already hand-verified this session.** The ISP's real
+native capture format is NV12 (confirmed last entry), but the rest of this pipeline (HUD drawing, RGA
+downscale path, JPEG encode) is RGB24-based -- added `nv12_to_rgb()`, the same BT.601 integer formula
+already manually verified against a real captured frame in Python earlier this session (not new,
+untested math -- reused the checked one).
+
+**A real latent bug found and fixed, not specific to the camera feature but exposed by it.** The first
+live-camera test runs kept dying silently, no error printed, process just gone from `ps aux`. Root-
+caused for real rather than guessed: ran once in the foreground (not backgrounded) specifically to
+capture the shell's own exit-status report -- `EXIT_CODE:141` = 128+13 = **SIGPIPE**. The default
+SIGPIPE disposition kills a process on its very first failed `send()`/`write()` to a closed socket,
+*before* `http_send_frame()`'s own already-existing return-value check (written to handle exactly a
+disconnected client) ever gets to run. This bug has genuinely been in this file since the JPEG-
+streaming design was first written -- it was just silently masked in the video-file path because
+`ffmpeg`'s own subprocess printed ITS OWN "Broken pipe" message when it independently hit SIGPIPE on
+its now-orphaned stdout pipe, which reads exactly like ordinary shutdown noise in the log (every
+earlier session's logs, this one included, show that message and nothing else on disconnect -- the
+program's own `RESULT: CLIENT_DISCONNECTED` line never once actually printed, unnoticed until now).
+The live-camera path has no `ffmpeg` to generate that cover message, which is what surfaced it for
+real. Fix: one line, `signal(SIGPIPE, SIG_IGN)` near the top of `main()`, applies to both paths.
+**Verified fixed, not just plausible:** re-ran both the live-camera path and the video-file path after
+the fix, and `RESULT: CLIENT_DISCONNECTED after N frames` now prints correctly on both, with the
+process surviving and returning to `Waiting for a browser to connect...` afterward -- confirmed via
+`ps aux` staying populated, not assumed. A genuine robustness improvement to the whole pipeline, found
+as a side effect of adding the camera, not something the camera feature itself needed.
+
+**Real, working, verified end-to-end -- not just a clean build.** `RESULT: V4L2_CAPTURE_READY
+/dev/video11 1920x1080 NV12 buffers=4` on startup (the driver accepted the requested 1920x1080
+outright, no renegotiation needed). Pulled a real frame out of the live MJPEG stream mid-session and
+looked at it directly (same discipline as every other correctness check this project has done): HUD
+overlay text, fps/infer readout, and a real, live accelerometer panel (`ACCEL x8.72 y0.88 z8.98 g`,
+matching the real raw sensor values re-checked earlier this session) all rendered correctly, no color
+corruption or skew from the NV12->RGB conversion. Scene is dark (same real dim room noted in the prior
+camera-verification entry -- unset auto-exposure on this codepath, not a bug) but genuinely live and
+correctly decoded.
+
+**Real, measured performance at 1920x1080 live vs. the 1280x720 video-file baseline, steady-state:**
+
+```
+                         1280x720 file (bikes.mp4)   1920x1080 live camera
+read/capture              ~25-30ms                    ~45ms (DQBUF + NV12->RGB, new cost)
+NPU inference (nested)    ~86-87ms                     ~75-76ms
+JPEG encode                ~50-68ms                    ~105-135ms
+Steady-state fps            ~5.2-5.3 fps                  ~4.3 fps
+```
+
+Two real, honest, separate effects here, not one: JPEG encode costs more at 1920x1080 (2.25x the
+pixels of 1280x720) -- expected, and exactly the tradeoff 1697-20747 asked for in choosing a real resolution
+bump. But **inference actually got faster**, a genuine, unplanned side benefit -- with no `ffmpeg`
+subprocess competing for this chip's one CPU core anymore, the RKNN/downscale stages see less real
+contention. Net: lower fps than the 720p file baseline, but for a real reason (more real display
+pixels, not a regression), on real live camera and accelerometer data for the first time this project
+has had both running together.

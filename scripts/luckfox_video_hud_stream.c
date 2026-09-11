@@ -35,10 +35,26 @@
  * whatever the real measured number is, don't assume this trade is
  * free.
  *
- * Usage: sudo ./luckfox_video_hud_stream <model.rknn> <video-file> <labels.txt> [http-port] [display_w] [display_h]
+ * Usage: sudo ./luckfox_video_hud_stream <model.rknn> <video-file-or-/dev/videoN> <labels.txt> [http-port] [display_w] [display_h]
  * display_w/display_h default to the source video's own resolution
- * (probed via ffprobe) if omitted.
+ * (probed via ffprobe) if omitted, or to 1920x1080 for a live camera.
  * Then open http://<board-ip>:<port>/ in a browser on the same WiFi.
+ *
+ * Live camera (2026-09-11): if the second argument starts with
+ * "/dev/video" it's treated as a real V4L2 capture device (the
+ * `rkisp_mainpath` node, e.g. /dev/video11) instead of a video file --
+ * real, on-device verified sensor is a SmartSens sc3336 (3MP, real max
+ * 2304x1296), see PROJECT_MEMORY.md for the full bring-up. Captured as
+ * NV12 (the sensor/ISP's real native output format, confirmed via
+ * `v4l2-ctl --list-formats-ext`) via a standard mmap capture loop, then
+ * converted to RGB24 in-process (same BT.601 integer formula manually
+ * verified against a real captured frame this session) to feed the rest
+ * of this already-RGB24-based pipeline unchanged. Opened/configured
+ * ONCE like the RKNN model -- unlike the video-file path, the V4L2
+ * stream is NOT torn down between client (re)connections, since
+ * reconfiguring a live sensor pipeline per HTTP client would be real,
+ * unnecessary churn; frames simply go undrained (real, ordinary V4L2
+ * driver behavior, not a crash risk) while no client is connected.
  *
  * Accelerometer HUD readout (MPU-6050, real device-tree/kernel fix
  * written and build-in-progress as of this addition -- NOT yet
@@ -68,11 +84,13 @@
 #include <time.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <linux/videodev2.h>
 #include <vector>
 #include <algorithm>
 #include <set>
@@ -471,6 +489,124 @@ static void fill_rect(unsigned char* rgb, int img_w, int img_h, int x, int y, in
     }
 }
 
+/* --- live V4L2 camera capture: rkisp_mainpath, NV12, standard mmap
+ * capture loop --- real, on-device confirmed pipeline this session
+ * (see PROJECT_MEMORY.md's 2026-09-11 camera-bring-up entry): the
+ * sensor is a real sc3336 bound to its own kernel driver, `rkcif`/
+ * `rkisp` are loaded and active, and `/dev/video11`-`18` (the
+ * `rkisp_mainpath` capture nodes) report real, working
+ * V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE capture (confirmed via
+ * `v4l2-ctl --list-formats-ext` and a real `--stream-mmap` grab whose
+ * exact byte count and pixel content were checked, not just a clean
+ * ioctl exit code). */
+#define V4L2_NUM_BUFFERS 4
+
+typedef struct {
+    int fd;
+    int width, height;   /* real negotiated size -- may differ from what was requested */
+    struct { void* start; size_t length; } buffers[V4L2_NUM_BUFFERS];
+    int n_buffers;
+} V4L2Capture;
+
+static bool v4l2_open_and_configure(V4L2Capture* cap, const char* dev_path, int want_w, int want_h) {
+    memset(cap, 0, sizeof(*cap));
+    cap->fd = open(dev_path, O_RDWR);
+    if (cap->fd < 0) { perror("open v4l2 device"); return false; }
+
+    struct v4l2_format fmt;
+    memset(&fmt, 0, sizeof(fmt));
+    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    fmt.fmt.pix_mp.width = want_w;
+    fmt.fmt.pix_mp.height = want_h;
+    fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV12;
+    fmt.fmt.pix_mp.field = V4L2_FIELD_NONE;
+    if (ioctl(cap->fd, VIDIOC_S_FMT, &fmt) < 0) { perror("VIDIOC_S_FMT"); return false; }
+    /* driver may adjust to the nearest supported stepwise size -- use
+     * what it actually negotiated, not what was requested */
+    cap->width = fmt.fmt.pix_mp.width;
+    cap->height = fmt.fmt.pix_mp.height;
+
+    struct v4l2_requestbuffers req;
+    memset(&req, 0, sizeof(req));
+    req.count = V4L2_NUM_BUFFERS;
+    req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    req.memory = V4L2_MEMORY_MMAP;
+    if (ioctl(cap->fd, VIDIOC_REQBUFS, &req) < 0) { perror("VIDIOC_REQBUFS"); return false; }
+    cap->n_buffers = (int)req.count;
+
+    for (int i = 0; i < cap->n_buffers; i++) {
+        struct v4l2_buffer buf;
+        struct v4l2_plane plane;
+        memset(&buf, 0, sizeof(buf));
+        memset(&plane, 0, sizeof(plane));
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+        buf.memory = V4L2_MEMORY_MMAP;
+        buf.index = i;
+        buf.m.planes = &plane;
+        buf.length = 1;
+        if (ioctl(cap->fd, VIDIOC_QUERYBUF, &buf) < 0) { perror("VIDIOC_QUERYBUF"); return false; }
+        cap->buffers[i].length = plane.length;
+        cap->buffers[i].start = mmap(NULL, plane.length, PROT_READ | PROT_WRITE, MAP_SHARED, cap->fd, plane.m.mem_offset);
+        if (cap->buffers[i].start == MAP_FAILED) { perror("mmap v4l2 buffer"); return false; }
+        if (ioctl(cap->fd, VIDIOC_QBUF, &buf) < 0) { perror("VIDIOC_QBUF initial"); return false; }
+    }
+
+    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    if (ioctl(cap->fd, VIDIOC_STREAMON, &type) < 0) { perror("VIDIOC_STREAMON"); return false; }
+
+    printf("RESULT: V4L2_CAPTURE_READY %s %dx%d NV12 buffers=%d\n", dev_path, cap->width, cap->height, cap->n_buffers);
+    return true;
+}
+
+/* NV12 -> RGB888, BT.601 integer conversion -- same formula manually
+ * verified this session against a real captured frame (decoded by hand
+ * in Python, checked visually) before trusting it here. Standard NV12
+ * layout: full-res Y plane, followed by a half-res/half-res interleaved
+ * U/V plane. */
+static void nv12_to_rgb(const unsigned char* nv12, int w, int h, unsigned char* rgb) {
+    const unsigned char* y_plane = nv12;
+    const unsigned char* uv_plane = nv12 + (size_t)w * h;
+    for (int row = 0; row < h; row++) {
+        const unsigned char* y_row = y_plane + (size_t)row * w;
+        const unsigned char* uv_row = uv_plane + (size_t)(row / 2) * w;
+        unsigned char* out_row = rgb + (size_t)row * w * 3;
+        for (int col = 0; col < w; col++) {
+            int c = y_row[col] - 16;
+            int uv_col = (col / 2) * 2;
+            int u = uv_row[uv_col] - 128;
+            int v = uv_row[uv_col + 1] - 128;
+            int r = (298 * c + 409 * v + 128) >> 8;
+            int g = (298 * c - 100 * u - 208 * v + 128) >> 8;
+            int b = (298 * c + 516 * u + 128) >> 8;
+            if (r < 0) r = 0; else if (r > 255) r = 255;
+            if (g < 0) g = 0; else if (g > 255) g = 255;
+            if (b < 0) b = 0; else if (b > 255) b = 255;
+            out_row[col * 3 + 0] = (unsigned char)r;
+            out_row[col * 3 + 1] = (unsigned char)g;
+            out_row[col * 3 + 2] = (unsigned char)b;
+        }
+    }
+}
+
+/* Dequeue one real captured frame, convert it in place into out_rgb
+ * (must be cap->width x cap->height x 3), and requeue the buffer for
+ * the driver to fill again. Returns false on a real V4L2 error only --
+ * unlike the video-file path, there's no "end of stream" case here. */
+static bool v4l2_capture_frame(V4L2Capture* cap, unsigned char* out_rgb) {
+    struct v4l2_buffer buf;
+    struct v4l2_plane plane;
+    memset(&buf, 0, sizeof(buf));
+    memset(&plane, 0, sizeof(plane));
+    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    buf.memory = V4L2_MEMORY_MMAP;
+    buf.m.planes = &plane;
+    buf.length = 1;
+    if (ioctl(cap->fd, VIDIOC_DQBUF, &buf) < 0) { perror("VIDIOC_DQBUF"); return false; }
+    nv12_to_rgb((const unsigned char*)cap->buffers[buf.index].start, cap->width, cap->height, out_rgb);
+    if (ioctl(cap->fd, VIDIOC_QBUF, &buf) < 0) { perror("VIDIOC_QBUF requeue"); return false; }
+    return true;
+}
+
 /* --- minimal single-client blocking MJPEG-over-HTTP server --- */
 static int server_fd = -1;
 static int client_fd = -1;
@@ -584,8 +720,21 @@ static int http_send_frame(unsigned char* rgb, int w, int h, double* out_jpeg_ms
 }
 
 int main(int argc, char** argv) {
+    /* Real bug found and fixed 2026-09-11 (live-camera integration
+     * session): default SIGPIPE disposition kills the process on the
+     * very FIRST failed send() to a disconnected client, before
+     * http_send_frame()'s own return-value check (which already existed
+     * to handle exactly this) ever runs -- confirmed via a foreground
+     * run's real exit code (141 = 128+SIGPIPE), not guessed. Silently
+     * masked in the video-file path until now because `ffmpeg`'s own
+     * subprocess printed ITS OWN "Broken pipe" message when it hit
+     * SIGPIPE on its now-orphaned stdout pipe, which looked like normal
+     * shutdown noise; the live-camera path has no ffmpeg to mask it,
+     * which is how this got caught for real. */
+    signal(SIGPIPE, SIG_IGN);
+
     if (argc < 3) {
-        fprintf(stderr, "usage: %s model.rknn video.mp4 [labels.txt] [http-port] [display_w] [display_h]\n", argv[0]);
+        fprintf(stderr, "usage: %s model.rknn video.mp4-or-/dev/videoN [labels.txt] [http-port] [display_w] [display_h]\n", argv[0]);
         return 1;
     }
     const char* model_path = argv[1];
@@ -595,24 +744,47 @@ int main(int argc, char** argv) {
     setvbuf(stdout, NULL, _IOLBF, 0); /* line-buffer even when redirected to a file/log */
     load_labels(labels_path);
 
+    bool live_camera = (strncmp(video_path, "/dev/video", 10) == 0);
+
     int display_w = argc > 5 ? atoi(argv[5]) : 0;
     int display_h = argc > 6 ? atoi(argv[6]) : 0;
     if (display_w <= 0 || display_h <= 0) {
-        /* probe the source's own resolution via ffprobe rather than
-         * guessing/hardcoding one */
-        char probe_cmd[1024];
-        snprintf(probe_cmd, sizeof(probe_cmd),
-                 "ffprobe -v error -select_streams v:0 -show_entries stream=width,height "
-                 "-of csv=p=0 '%s'", video_path);
-        FILE* probe = popen(probe_cmd, "r");
-        if (probe) {
-            if (fscanf(probe, "%d,%d", &display_w, &display_h) != 2) { display_w = 0; display_h = 0; }
-            pclose(probe);
+        if (live_camera) {
+            /* real, verified-working resolution this session (see
+             * PROJECT_MEMORY.md) -- comfortably under the sc3336's real
+             * 2304x1296 ceiling; ffprobe doesn't apply to a device node
+             * so there's no source to auto-probe here */
+            display_w = 1920; display_h = 1080;
+        } else {
+            /* probe the source's own resolution via ffprobe rather than
+             * guessing/hardcoding one */
+            char probe_cmd[1024];
+            snprintf(probe_cmd, sizeof(probe_cmd),
+                     "ffprobe -v error -select_streams v:0 -show_entries stream=width,height "
+                     "-of csv=p=0 '%s'", video_path);
+            FILE* probe = popen(probe_cmd, "r");
+            if (probe) {
+                if (fscanf(probe, "%d,%d", &display_w, &display_h) != 2) { display_w = 0; display_h = 0; }
+                pclose(probe);
+            }
+            if (display_w <= 0 || display_h <= 0) {
+                fprintf(stderr, "RESULT: FFPROBE_FAIL, falling back to %dx%d\n", MODEL_SIZE, MODEL_SIZE);
+                display_w = MODEL_SIZE; display_h = MODEL_SIZE;
+            }
         }
-        if (display_w <= 0 || display_h <= 0) {
-            fprintf(stderr, "RESULT: FFPROBE_FAIL, falling back to %dx%d\n", MODEL_SIZE, MODEL_SIZE);
-            display_w = MODEL_SIZE; display_h = MODEL_SIZE;
+    }
+
+    V4L2Capture v4l2_cap;
+    if (live_camera) {
+        if (!v4l2_open_and_configure(&v4l2_cap, video_path, display_w, display_h)) {
+            printf("RESULT: V4L2_INIT_FAIL\n");
+            return 1;
         }
+        /* the driver may have negotiated a different real size than
+         * requested (stepwise 32x32, 8px steps on this sensor) -- use
+         * what it actually reports from here on, not the request */
+        display_w = v4l2_cap.width;
+        display_h = v4l2_cap.height;
     }
     printf("RESULT: DISPLAY_RES %dx%d (inference stays %dx%d)\n", display_w, display_h, MODEL_SIZE, MODEL_SIZE);
 
@@ -686,17 +858,20 @@ int main(int argc, char** argv) {
     while (1) {
         http_wait_for_client();
 
-        char ffmpeg_cmd[1024];
-        /* Decode/scale to the FULL display resolution -- no -re (don't
-         * throttle to source fps, consume as fast as this pipeline
-         * can go); fast_bilinear (cheap, real CPU saving on this
-         * single-core chip vs the default bicubic). The separate
-         * MODEL_SIZE downscale for inference happens in-process below. */
-        snprintf(ffmpeg_cmd, sizeof(ffmpeg_cmd),
-                 "ffmpeg -i '%s' -loglevel error -vf scale=%d:%d:flags=fast_bilinear -pix_fmt rgb24 -f rawvideo -",
-                 video_path, display_w, display_h);
-        FILE* ffmpeg_pipe = popen(ffmpeg_cmd, "r");
-        if (!ffmpeg_pipe) { printf("RESULT: FFMPEG_SPAWN_FAIL\n"); break; }
+        FILE* ffmpeg_pipe = NULL;
+        if (!live_camera) {
+            char ffmpeg_cmd[1024];
+            /* Decode/scale to the FULL display resolution -- no -re (don't
+             * throttle to source fps, consume as fast as this pipeline
+             * can go); fast_bilinear (cheap, real CPU saving on this
+             * single-core chip vs the default bicubic). The separate
+             * MODEL_SIZE downscale for inference happens in-process below. */
+            snprintf(ffmpeg_cmd, sizeof(ffmpeg_cmd),
+                     "ffmpeg -i '%s' -loglevel error -vf scale=%d:%d:flags=fast_bilinear -pix_fmt rgb24 -f rawvideo -",
+                     video_path, display_w, display_h);
+            ffmpeg_pipe = popen(ffmpeg_cmd, "r");
+            if (!ffmpeg_pipe) { printf("RESULT: FFMPEG_SPAWN_FAIL\n"); break; }
+        }
 
         int frame_count = 0;
         struct timespec fps_t0, now;
@@ -706,11 +881,20 @@ int main(int argc, char** argv) {
         while (client_alive) {
             struct timespec t_read_start, t_read_end;
             clock_gettime(CLOCK_MONOTONIC, &t_read_start);
-            size_t n = fread(frame_full, 1, display_w * display_h * 3, ffmpeg_pipe);
+            bool got_frame;
+            if (live_camera) {
+                got_frame = v4l2_capture_frame(&v4l2_cap, frame_full);
+            } else {
+                size_t n = fread(frame_full, 1, display_w * display_h * 3, ffmpeg_pipe);
+                got_frame = (n == (size_t)(display_w * display_h * 3));
+            }
             clock_gettime(CLOCK_MONOTONIC, &t_read_end);
             double read_ms = (t_read_end.tv_sec - t_read_start.tv_sec) * 1000.0 +
                               (t_read_end.tv_nsec - t_read_start.tv_nsec) / 1e6;
-            if (n != (size_t)(display_w * display_h * 3)) break; /* video ended */
+            if (!got_frame) {
+                if (live_camera) printf("RESULT: V4L2_CAPTURE_FAIL\n");
+                break; /* video ended, or a real capture error */
+            }
 
             struct timespec t_infer_start, t_infer_end;
             clock_gettime(CLOCK_MONOTONIC, &t_infer_start);
@@ -817,11 +1001,17 @@ int main(int argc, char** argv) {
             }
         }
 
-        pclose(ffmpeg_pipe);
+        if (ffmpeg_pipe) pclose(ffmpeg_pipe);
         close(client_fd);
         client_fd = -1;
     }
 
+    if (live_camera) {
+        enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+        ioctl(v4l2_cap.fd, VIDIOC_STREAMOFF, &type);
+        for (int i = 0; i < v4l2_cap.n_buffers; i++) munmap(v4l2_cap.buffers[i].start, v4l2_cap.buffers[i].length);
+        close(v4l2_cap.fd);
+    }
     free(frame_full);
     free(frame_small);
     for (uint32_t i = 0; i < io_num.n_output; i++) rknn_destroy_mem(ctx, output_mems[i]);

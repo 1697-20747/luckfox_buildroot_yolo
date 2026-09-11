@@ -47,6 +47,15 @@ source was built natively on-device and two real integration gaps (missing SoC t
 per-HAL soc whitelist) fixed using real hardware-ID cross-referencing — but the first real submitted
 job crashed the kernel's `mpp_vcodec.ko` module (oops in `rkvenc_run`, board survived, no reboot
 needed). Stopped there deliberately rather than keep probing a module that had just oopsed.
+**Follow-up (2026-09-11):** tested the obvious next hypothesis — the kernel driver's embedded version
+(`424abb9b`, 2024-04-29) is ~2.5 years older than the `develop`-HEAD userspace build above, the same
+version-mismatch failure mode this project already solved once for RKNN. Real result, partial
+confirmation: rebuilding userspace MPP from the nearest-date `develop`-line commit (`424abb9b` itself
+turned out to live in a disjoint, kernel-driver-only history with no common ancestor with `develop` —
+a real, more precise finding than expected) genuinely changed the failure from a hard kernel panic to
+a soft driver-side timeout, no crash at all. But the encode still doesn't complete — the output JPEG
+has valid headers and no actual image data. Real forward progress, still not a working encoder. See
+`RV1106_NPU_YOLO_GUIDE.md`'s MPP section for the full account. `libjpeg-turbo` remains the default.
 
 **Real, working win instead: libjpeg-turbo replacing stb_image_write, same quality setting.** No
 kernel involved — this board's `libjpeg-turbo8` (the real backing implementation of its installed
@@ -102,11 +111,32 @@ real readings.
 
 ## Live camera
 
-Not connected yet. Real compatibility gap found before physically trying: this board's vendor image
-ships only one camera sensor driver (`sc3336.ko`) — no IMX219/IMX708/OV5647 (Raspberry Pi Camera
-Module) driver exists on it. A Pi Camera on the ribbon connector may not be electrically compatible
-either, separate from the driver question. See `PROJECT_MEMORY.md` for the plan once a module is
-physically connected (check `dmesg`/I2C detection first, before investing in kernel driver work).
+**Connected and verified working as of 2026-09-11.** A real `sc3336` (SmartSens SC3336, 3MP) sensor
+is on the CSI connector — this is exactly the one sensor this board's vendor image already ships a
+driver for, so the earlier IMX219/IMX708/OV5647-compatibility concern below never applied here.
+Confirmed for real, not from config alone: `4-0030` on I2C bus 4 is bound to the real `sc3336` kernel
+driver (`i2cdetect -y 4` shows `UU`, in-use, at `0x30`), `rkcif`/`rkisp` are both loaded and already
+have a client (`rockit`), and a real `v4l2-ctl` capture at 1920x1080 NV12 (installed `v4l-utils` via
+apt — not on the image by default) produced an exact, correctly-sized frame that decodes to a real,
+recognizable scene (checked by pulling it to a PNG and looking at it, not just trusting a clean exit
+code — the raw grab was quite dark, most likely unset auto-exposure/gain on this direct `v4l2-ctl`
+path rather than anything wrong with the sensor). Real max resolution: **2304x1296**, stepwise from
+32x32 in 8px steps, across NV12/NV21/NV16/UYVY/RGB565/BGRX and more (`/dev/video11`-`/dev/video18`,
+the `rkisp_mainpath` capture nodes).
+
+**Wired into `luckfox_video_hud_stream.c` for real as of 2026-09-11.** Passing `/dev/video11` (the
+`rkisp_mainpath` capture node) as the video argument now switches the same binary into a real V4L2
+mmap capture loop at 1920x1080 NV12, converted in-process to RGB24 (same binary still accepts a video
+*file* too, auto-detected by whether the path starts with `/dev/video`). Verified genuinely
+end-to-end, not just a clean build: pulled a real frame out of the live MJPEG stream and looked at it
+— HUD overlay, live fps/infer readout, and a real live accelerometer panel all rendering correctly.
+Real, measured steady-state: **~4.3fps** at 1920x1080 live (vs. ~5.2-5.3fps at 1280x720 from a file) —
+slower, but for a real, expected reason (JPEG encode scales with pixel count, and 1920x1080 is 2.25x
+the pixels of 1280x720), not a regression; NPU inference actually got a real ~13% *faster* with no
+`ffmpeg` subprocess left competing for this chip's one CPU core. See `PROJECT_MEMORY.md` for the full
+account, including a real latent `SIGPIPE` bug in the HTTP server (present since this file's original
+design, previously masked by `ffmpeg`'s own "Broken pipe" message on disconnect) found and fixed along
+the way.
 
 ## Try it yourself
 
