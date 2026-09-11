@@ -139,7 +139,7 @@ Running this as a live, persistent video pipeline (`luckfox_video_hud_stream.c`:
 A few honest conclusions from these numbers, not assumptions:
 
 - **NPU inference alone caps the ceiling at ~14.7fps**, full stop — 30fps would need <33ms/frame, and inference alone is already 2× over that budget before anything else runs.
-- **JPEG encode + network send is the single biggest cost in the pipeline — bigger than inference itself.** This combined figure was an open question across several sessions — see [Real hardware offload: RGA and MPP](#real-hardware-offload-rga-and-mpp) below for the real split (spoiler: it's almost entirely the encode step, not the network write, correcting an earlier guess in this doc).
+- **JPEG encode + network send is the single biggest cost in the pipeline — bigger than inference itself.** This combined figure was an open question across several sessions — see [Real hardware offload: RGA and MPP](#real-hardware-offload-rga-and-mpp) below for the real split (spoiler: it's almost entirely the encode step, not the network write, correcting an earlier guess in this doc) — and for why this is no longer true as of the libjpeg-turbo swap (NPU inference is now the biggest single cost).
 - **Everything competes for one CPU core.** `ffmpeg`'s software decode, the decode/NMS math, drawing, and JPEG encoding all time-slice the same single Cortex-A7 core.
 - Restricting detected classes (`ALLOWED_CLASSES = {person, bicycle, car, motorcycle, bus, truck}`, COCO ids 0/1/2/3/5/7) helps the CPU-side decode loop, but that loop was never the bottleneck, so it didn't move the needle much.
 
@@ -198,6 +198,34 @@ Built the public `rockchip-linux/mpp` source (`develop` branch, the only current
 
 1. **SoC not recognized at all.** First run: `mpp_platform: can not found match soc name` + `mpp_rt: can NOT found any allocator`. The public repo's SoC capability table (`osal/mpp_soc.c`) has no RV1106 entry — confirmed by grep, zero matches. A first fix modeled a new entry on the neighboring `rv1109`/`rv1126` chips (same IPC-camera product family) — **wrong**, caught by real hardware disagreeing once past the name-match step (below).
 2. **Real hardware ID says otherwise.** `cat /proc/mpp_service/supports-device` on this board reports exactly one real device: `DEVICE[16]:RKVENC HW_ID:0x50603313` — and `0x50603313` is literally `HWID_VEPU540C` in this same source tree (`mpp/hal/inc/hal_hw_id.h`), a different, newer encoder IP block than rv1109/rv1126's vepu2/vepu541. No decode device is listed at all, consistent with this chip's datasheet (no hardware decode on RV1106). Rewrote the SoC table entry around `HAVE_RKVENC` + the `vepu540c_no_hevc` HAL (AVC+MJPEG, no HEVC — matching real RV1106 capability) instead. This got past SoC/capability matching, but JPEG encode still failed to even initialize: `mpp_enc_hal_init could not found coding type 8`. Root cause, found by reading `mpp_enc_hal_api_register()`: each individual HAL API implementation carries its OWN separate per-chip whitelist (`soc_type[]`), independent of the SoC capability table — `mpp/hal/rkenc/jpege/hal_jpege_vepu540c.c`'s `hal_jpege_vepu540c` API only lists `ROCKCHIP_SOC_RK3528`/`ROCKCHIP_SOC_RK3562`. Added `ROCKCHIP_SOC_RV1106` to that list too (justified by the same real `HWID_VEPU540C` match, not a blind guess) — got past HAL registration.
+
+### A real, working win: libjpeg-turbo instead of stb_image_write
+
+With hardware JPEG encode blocked by the kernel crash above, 1697-20747 asked what could ease the JPEG
+encode burden without it -- the real, low-risk lever was the software encoder itself. `stb_image_write`'s
+JPEG encoder is a simple single-pass implementation with no SIMD; this board's already-installed
+`libjpeg-turbo8` (confirmed via `dpkg -l` -- it's the real backing implementation of this Ubuntu
+image's `libjpeg.so.8`, not a separate thing to build) has hand-written ARM NEON paths for color
+conversion and DCT. Installed `libjpeg-turbo8-dev` via apt for `jpeglib.h`, swapped
+`http_send_frame()`'s encode call from `stbi_write_jpg_to_func` to the standard `jpeg_mem_dest()` API
+at the same quality setting (50) for a fair comparison. No kernel, no register-level guessing --
+purely a userspace library swap.
+
+**Real, measured result -- this is the actual win this session was looking for:**
+
+| | stb_image_write (software) | libjpeg-turbo (software, NEON) |
+|---|---|---|
+| JPEG encode alone | ~146-165ms/frame | **~50-65ms/frame** |
+| Real steady-state end-to-end fps | ~3.3-3.4 fps | **~5.2 fps** |
+
+A real ~2.5-3x reduction in encode time, and a real ~53% end-to-end fps improvement -- confirmed
+correct by extracting and visually inspecting a real frame from the live stream (HUD overlay, boxes,
+labels all render correctly, no corruption). **This also changes which stage is now the pipeline's
+single biggest cost: NPU inference (~87-97ms) now costs more than JPEG encode (~50-65ms) for the
+first time this whole investigation** -- a real, concrete answer to "what's the bottleneck now,"
+not assumed. This is the current default in `luckfox_video_hud_stream.c`.
+
+### The real kernel-level wall on hardware JPEG encode (MPP)
 
 **Where it genuinely stopped: a kernel-level crash on the first real submitted job.** With both integration gaps fixed, a real JPEG-encode attempt (`mpi_enc_test`, synthetic 640×640 NV12 frame) got all the way to actually submitting hardware registers — and the kernel's own `mpp_vcodec.ko` module crashed inside `rkvenc_run` (a real oops, full register dump and stack trace in `dmesg`, `Process queue_work0`), followed by `rk_vcodec: mpp_wait_result_default: timeout`. The board survived (SSH stayed up, no reboot needed, the existing detection pipeline was re-verified unaffected afterward) but this is a genuine, serious wall, not a config problem: the RK3528/RK3562 register-level HAL implementation, despite matching RV1106's encoder on IP-block ID alone, does not actually submit register-compatible jobs against RV1106's real kernel driver. Matching on `HWID_VEPU540C` got the software far enough to reach real hardware, but was not sufficient for full register-level compatibility — a genuinely deeper vendor-integration detail (exact register offsets/sequencing) not discoverable from public sources. **Stopped here, deliberately, rather than continuing to probe a kernel module that had just oopsed** — real risk of an unrecoverable hang, and Luckfox's own working uClibc build (proof this chip's real hardware JPEG encode does work correctly, just not through this specific userspace/kernel combination) isn't source-available to compare register sequences against.
 

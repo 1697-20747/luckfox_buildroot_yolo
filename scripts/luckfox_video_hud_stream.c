@@ -84,8 +84,19 @@ extern "C" {
 #include <drm/drm.h>
 #include <drm/drm_mode.h>
 
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#include "stb_image_write.h"
+/* libjpeg-turbo (already the real backing implementation of this
+ * board's installed libjpeg.so.8 -- confirmed via `dpkg -l`, apt
+ * package `libjpeg-turbo8`) replaces stb_image_write's JPEG encoder
+ * here. Real, measured motivation: JPEG encode is this pipeline's
+ * single biggest cost (~146-165ms/frame at 1280x720, confirmed by
+ * splitting it from network-send time -- see PROJECT_MEMORY.md), and
+ * stb_image_write's encoder is a simple single-pass implementation
+ * with no SIMD, while libjpeg-turbo has hand-written ARM NEON paths
+ * (this chip's `-mfpu=neon` is real and otherwise unused) for color
+ * conversion and DCT. `libjpeg-turbo8-dev` installed via apt for
+ * jpeglib.h -- not built from source, a real existing package. */
+#include <jpeglib.h>
+#include <jerror.h>
 
 #include "rknn_api.h"
 #include "im2d.h"
@@ -498,32 +509,72 @@ static void http_wait_for_client() {
     send(client_fd, header, strlen(header), 0);
 }
 
-static size_t jpeg_write_ctx_len = 0;
-static void jpeg_write_cb(void* context, void* data, int size) {
-    std::vector<unsigned char>* buf = (std::vector<unsigned char>*)context;
-    buf->insert(buf->end(), (unsigned char*)data, (unsigned char*)data + size);
+/* libjpeg-turbo encode to an in-memory buffer via the standard
+ * jpeg_mem_dest() API (part of libjpeg's public API since v8, real and
+ * portable -- not the simplified TurboJPEG API, since jpeglib.h was
+ * already the header on hand). jpeg_buf/jpeg_buf_size are kept static
+ * and passed back in on every call rather than freed each time --
+ * jpeg_mem_dest() reuses the existing allocation if it's already large
+ * enough (per its own documented contract) and only reallocs when it
+ * needs to grow, avoiding a malloc/free cycle every single frame. */
+static unsigned char* jpeg_buf = NULL;
+static unsigned long jpeg_buf_size = 0;
+
+static unsigned long jpeg_encode_turbo(unsigned char* rgb, int w, int h) {
+    struct jpeg_compress_struct cinfo;
+    struct jpeg_error_mgr jerr;
+    cinfo.err = jpeg_std_error(&jerr);
+    jpeg_create_compress(&cinfo);
+    jpeg_mem_dest(&cinfo, &jpeg_buf, &jpeg_buf_size);
+
+    cinfo.image_width = w;
+    cinfo.image_height = h;
+    cinfo.input_components = 3;
+    cinfo.in_color_space = JCS_RGB;
+    jpeg_set_defaults(&cinfo);
+    jpeg_set_quality(&cinfo, 50, TRUE); /* same quality stb_image_write used, for a fair before/after */
+
+    jpeg_start_compress(&cinfo, TRUE);
+    int row_stride = w * 3;
+    JSAMPROW row_pointer[1];
+    while (cinfo.next_scanline < cinfo.image_height) {
+        row_pointer[0] = &rgb[cinfo.next_scanline * row_stride];
+        jpeg_write_scanlines(&cinfo, row_pointer, 1);
+    }
+    jpeg_finish_compress(&cinfo);
+
+    /* jpeg_mem_dest() may have grown jpeg_buf via realloc() during
+     * compress -- jpeg_destroy_compress() doesn't touch it, real size
+     * actually written is in cinfo.dest's own tracked count, exposed
+     * back to us via jpeg_buf_size (jpeg_mem_dest updates *outsize to
+     * the real compressed length on jpeg_finish_compress -- confirmed
+     * in jpeglib.h's own documented contract for this function). */
+    unsigned long real_size = jpeg_buf_size;
+    jpeg_destroy_compress(&cinfo);
+    return real_size;
 }
 
 /* Splits the combined "send_ms" this file used to report into its two
- * real, separate costs -- JPEG encode (CPU-bound, stb_image_write) and
- * network write (send() to the connected client) -- an open question
- * this project had left unanswered across several sessions (only the
- * combined figure existed). out_jpeg_ms/out_net_ms report each alone. */
+ * real, separate costs -- JPEG encode (CPU-bound, libjpeg-turbo since
+ * 2026-09-11, stb_image_write before that -- see PROJECT_MEMORY.md)
+ * and network write (send() to the connected client) -- an open
+ * question this project had left unanswered across several sessions
+ * (only the combined figure existed). out_jpeg_ms/out_net_ms report
+ * each alone. */
 static int http_send_frame(unsigned char* rgb, int w, int h, double* out_jpeg_ms, double* out_net_ms) {
     struct timespec t0, t1, t2;
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
-    std::vector<unsigned char> jpeg_buf;
-    stbi_write_jpg_to_func(jpeg_write_cb, &jpeg_buf, w, h, 3, rgb, 50);
+    unsigned long jpeg_size = jpeg_encode_turbo(rgb, w, h);
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
 
     char part_header[128];
     int hlen = snprintf(part_header, sizeof(part_header),
-                         "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %zu\r\n\r\n", jpeg_buf.size());
+                         "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %lu\r\n\r\n", jpeg_size);
     int ret = 0;
     if (send(client_fd, part_header, hlen, 0) < 0) ret = -1;
-    if (ret == 0 && send(client_fd, jpeg_buf.data(), jpeg_buf.size(), 0) < 0) ret = -1;
+    if (ret == 0 && send(client_fd, jpeg_buf, jpeg_size, 0) < 0) ret = -1;
     if (ret == 0 && send(client_fd, "\r\n", 2, 0) < 0) ret = -1;
 
     clock_gettime(CLOCK_MONOTONIC, &t2);

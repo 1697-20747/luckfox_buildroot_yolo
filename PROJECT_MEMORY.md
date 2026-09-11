@@ -1028,3 +1028,74 @@ NOT completed -- stopped at a real kernel-level wall rather than pushed through 
 JPEG encode remains 100% software (`stb_image_write`) as a result; software JPEG encode (~146-165ms)
 remains, confirmed and unchanged, the pipeline's single biggest real cost, bigger than NPU inference
 itself.
+
+## Real win found after the MPP wall: libjpeg-turbo replaces stb_image_write, ~2.5-3x faster real encode, ~53% real fps gain (2026-09-11, later same session)
+
+With MPP hardware JPEG encode genuinely blocked (kernel crash, above), 1697-20747 asked directly what
+could ease the JPEG-encode burden without it, pointing out this is core to what the chip is even
+for. Real, low-risk lever, not the RGA/MPP kind of real-hardware-register wrestling: the software
+encoder itself. `stb_image_write`'s JPEG encoder is a simple single-pass implementation with no
+SIMD. Checked what's actually already on this board rather than assuming a build would be needed:
+`dpkg -l | grep jpeg` shows `libjpeg-turbo8` is already installed and IS the real backing
+implementation of this image's `libjpeg.so.8` (confirmed -- not a separate library sitting unused).
+Real ARM NEON SIMD paths for color conversion and DCT exist in libjpeg-turbo; this chip's
+`-mfpu=neon` compile flag (seen throughout this whole session's MPP build) confirms real NEON
+hardware is present and otherwise unused by the current software encode path.
+
+**Real, contained change, no kernel/driver risk at all.** `apt-get install libjpeg-turbo8-dev` for
+`jpeglib.h` (dev headers weren't installed, only the runtime `.so` was) -- installed cleanly, no
+issues. Swapped `http_send_frame()`'s `stbi_write_jpg_to_func()` call for the standard libjpeg
+`jpeg_mem_dest()` in-memory-encode API (part of libjpeg's public API since v8, not the simplified
+TurboJPEG API -- `jpeglib.h` was already the header on hand) at the same quality setting (50) as
+before, for a fair, controlled before/after. Kept the output buffer/size as static variables reused
+across frames (`jpeg_mem_dest()`'s own documented contract: reuses the existing allocation if large
+enough, only reallocs to grow) rather than a fresh malloc/free every frame. Rebuilt with `-ljpeg`
+added to the link line (`g++ ... -lrknnmrt -lrga -ljpeg -lm -lpthread`).
+
+**Real correctness check before trusting any timing number:** grabbed a live sample from the actual
+running stream (`curl` for a few seconds, extracted the first embedded JPEG by its `FFD8`/`FFD9`
+markers), pulled it down and looked at it directly -- a real, correct frame: HUD overlay, fps/infer
+readout, accelerometer panel, detection boxes and labels all rendering correctly, no color
+corruption, no skew, no artifacts. Confirmed real before measuring speed, not assumed from a clean
+build/exit code.
+
+**One real false alarm along the way, caught and resolved, not glossed over:** a first timing
+attempt showed zero frames processed in a 25+ second connected session, looking exactly like a hang
+or a silent crash from the encoder swap. Investigated before assuming the code was broken: root
+cause was a genuinely unrelated Mac-side shell mistake in an unrelated debugging step (`timeout`
+isn't a real command on macOS, no GNU coreutils there by default) that silently no-op'd a client
+connection attempt entirely -- the actual server process was healthy and simply still waiting for a
+client the whole time. Confirmed by checking real process state (`ps aux`) before chasing a bug that
+didn't exist, then re-ran the real test correctly with `curl`'s own `-m` flag instead.
+
+**Real, measured result -- a genuine, substantial win, unlike the RGA/MPP hardware attempts:**
+
+```
+                              stb_image_write (software)   libjpeg-turbo (software, NEON)
+JPEG encode alone                   ~146-165ms/frame             ~50-65ms/frame
+Real steady-state end-to-end fps         ~3.3-3.4 fps                  ~5.2 fps
+```
+
+Confirmed via a full 40-second connected steady-state run (not just an early transient number) --
+fps climbs smoothly from ~3.2 at frame 10 and genuinely plateaus at ~5.2 by frame ~150-210, not still
+rising. A real ~2.5-3x cut in encode time and a real ~53% end-to-end fps improvement, entirely from a
+userspace library swap -- no kernel module, no register-level anything, none of the real risk the
+MPP attempt carried.
+
+**Real, concrete consequence worth recording precisely: this changes which stage is now the
+pipeline's single biggest cost.** Across this whole investigation (multiple sessions), JPEG
+encode+network-send (and then, once split, JPEG encode alone) was always the dominant real cost,
+bigger than NPU inference. **That's no longer true.** With libjpeg-turbo, JPEG encode (~50-65ms) is
+now smaller than NPU inference (~87-97ms) -- inference is the new real bottleneck, for the first
+time this project has measured it. Worth remembering before recommending further JPEG-side work:
+the next real lever, if 5.2fps still isn't enough, is inference time itself (already explored
+earlier -- 512x512 vs 640x640 input resolution), not JPEG encode.
+
+**1697-20747 also asked about adding small companion hardware (a second board on GPIO) to help with the
+encode burden -- answered directly rather than explored, since the real bandwidth math rules it out
+cleanly:** a full 1280x720 RGB frame is ~2.76MB; GPIO-class links (SPI/UART) can't move that fast
+enough to beat software encode itself, and anything fast enough (USB/Ethernet) stops being a
+lightweight GPIO helper and becomes a second full SBC. More fundamentally, RV1106 already has real
+JPEG-encode silicon on-die (the whole reason it's an IP-camera SoC) -- the blocker found this session
+was a software/kernel-driver version mismatch, not missing hardware, so external hardware would be
+working around silicon that's already there rather than fixing the real problem. Not pursued.

@@ -46,8 +46,15 @@ correct, but a measured net loss on this hardware (off by default, `USE_RGA_DOWN
 source was built natively on-device and two real integration gaps (missing SoC table entry, missing
 per-HAL soc whitelist) fixed using real hardware-ID cross-referencing — but the first real submitted
 job crashed the kernel's `mpp_vcodec.ko` module (oops in `rkvenc_run`, board survived, no reboot
-needed). Stopped there deliberately rather than keep probing a module that had just oopsed. **JPEG
-encode in this pipeline is still software (`stb_image_write`)** — not integrated, per the above.
+needed). Stopped there deliberately rather than keep probing a module that had just oopsed.
+
+**Real, working win instead: libjpeg-turbo replacing stb_image_write, same quality setting.** No
+kernel involved — this board's `libjpeg-turbo8` (the real backing implementation of its installed
+`libjpeg.so.8`) has ARM NEON paths `stb_image_write`'s simple, unoptimized encoder doesn't. Real,
+measured result: JPEG encode dropped from ~146-165ms to **~50-65ms/frame**, and real steady-state fps
+rose from ~3.3-3.4 to **~5.2fps**. This also flips which stage is now the pipeline's single biggest
+cost — NPU inference (~87-97ms) is now bigger than JPEG encode, for the first time in this
+investigation. This is the current default.
 
 ```
 sudo ./luckfox_video_hud_stream <model.rknn> <video.mp4> [labels.txt] [port] [display_w] [display_h]
