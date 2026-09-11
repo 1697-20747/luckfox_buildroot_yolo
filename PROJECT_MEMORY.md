@@ -1390,3 +1390,130 @@ subprocess competing for this chip's one CPU core anymore, the RKNN/downscale st
 contention. Net: lower fps than the 720p file baseline, but for a real reason (more real display
 pixels, not a regression), on real live camera and accelerometer data for the first time this project
 has had both running together.
+
+## 2026-09-11 (same session, later still) -- chasing the RGA/live-camera CMA failure to its real root: a hardcoded 10MB DTB region, not the value already fixed
+
+1697-20747 asked to re-test RGA downscale now that the live-camera path had freed real CPU headroom. First
+attempt (documented in the conversation, not repeated here) failed outright -- `DRM_IOCTL_MODE_CREATE_DUMB:
+Cannot allocate memory`, traced to `cma_alloc: linux,cma: alloc failed, req-size: 300 pages` and
+`/proc/meminfo` showing `CmaFree: 0kB` out of a 46MB total pool. Asked to "execute full fix."
+
+**Real, working fix for the first (wrong) target, found by tracing the actual kernel source rather
+than guessing.** `rk_dma_heap_cma=36M` (the boot cmdline token) turned out not to live in the kernel
+DTB at all -- traced via the SDK's own `sysdrv/tools/pc/toolkits/update_dtb_bootargs.sh` +
+`repack_bootimg.sh` tools (found alongside each other, clearly a matched pair) and a real `dumpimage`
+extraction of the board's actual running FIT image: the extracted `fdt`'s own `bootargs` property only
+had `earlycon=... console=... root=... rootwait coherent_pool=0` -- no CMA token, no `blkdevparts`, no
+`androidboot.*`. Those get appended by **U-Boot's own environment** at boot time, confirmed directly by
+`dd`-dumping the tiny (32KB, unsigned, plain-text) env partition (`/dev/mmcblk0p1`) and finding
+`sys_bootargs= root=/dev/mmcblk0p7 rootfstype=ext4 rk_dma_heap_cma=36M` in the raw bytes. This is a
+genuinely safer fix point than the kernel/DTB -- no signing, no repack, trivially small and backed up.
+Backed it up (both to the board's own `/tmp` and pulled to the Mac, md5-verified in both places, same
+as the boot-partition backup taken first). Installed `u-boot-tools` (`fw_printenv`/`fw_setenv`) via
+apt, wrote a correct `/etc/fw_env.config` (`/dev/mmcblk0p1 0x0000 0x8000`, confirmed against the raw
+partition's own CRC32-header + flat env format seen in a hex dump), verified read-only first, then
+`fw_setenv sys_bootargs " root=/dev/mmcblk0p7 rootfstype=ext4 rk_dma_heap_cma=66M"` (66M matching the
+board config's own `RK_BOOTARGS_CMA_SIZE="66M"` default, which -- a real, separate finding -- turns out
+to have never actually been applied to this board's real flashed env; the earlier accelerometer/WiFi
+kernel rebuilds only touched kernel Image + DTB source, never regenerated bootargs from board config).
+**Real, verified reboot:** ~9s to SSH-reachable, same kernel build timestamp (proving no kernel/DTB was
+touched), `/proc/cmdline` confirmed `rk_dma_heap_cma=66M`, `CmaTotal` grew 47MB->78MB exactly as
+predicted, camera/accelerometer/all kernel modules present and healthy.
+
+**But the RGA test still failed afterward, identically -- `CmaAllocated: 29672kB` unchanged from
+before the fix, byte for byte.** This is the real, decisive tell that `rk_dma_heap_cma` was the WRONG
+target all along, not just an insufficient one. Traced further into the kernel source rather than
+assuming "needs more": the failing allocator's own dmesg message says `linux,cma` (a literal region
+name), not `rk_dma_heap_cma`. Grepped the SDK's real board DTS
+(`rv1106-luckfox-pico-ultra-ipc.dtsi`) and found two SEPARATE, independently-sized CMA regions coexist
+on this chip: `rk_dma_heap_cma` (the one just fixed, used by the Rockchip media/MPP/ISP stack via its
+own named heap driver) and a completely different, generic `linux,cma` reserved-memory node --
+**hardcoded to exactly `size = <0xA00000>; //10M`** in the DTB, `reusable`/`linux,cma-default` --
+which is what DRM's dumb-buffer allocator (the RGA path's own memory source) actually draws from. The
+math lines up exactly: 47104kB original total - 36864kB (`rk_dma_heap_cma`) = 10240kB = 10MB; after the
+fix, 77824kB - 67584kB (66M) = 10240kB, unchanged. The RGA path's own two buffers need ~7.4MB
+(6.2MB @ 1920x1080 RGB + 1.2MB @ 640x640) inside that same fixed 10MB pool that the live camera's own
+ISP/CIF pipeline is concurrently drawing from and (very plausibly, real CMA fragmentation from a
+live, actively-streaming producer) can't reliably supply a contiguous 1.2MB chunk of.
+
+**Real, honest status: found the true root cause, but the actual fix (resizing the `linux,cma` DTB
+node) needs a genuine kernel/DTB rebuild and reflash -- a materially higher-risk step than the
+env-only change just made (real FIT/boot.img repack and signing considerations, not just a small
+unsigned env partition write).** Paused here to explicitly re-confirm with 1697-20747 before taking that
+step, rather than stretching the "execute full fix" instruction past the risk level it was actually
+given for. The `rk_dma_heap_cma=66M` env change is left in place -- real, verified, harmless (more
+headroom for the media/MPP heap doesn't cost anything), just not sufficient alone for RGA+live-camera.
+
+## 2026-09-11 (same session, continued) -- the real DTB/kernel fix, done for real, with a clean negative result at the end
+
+1697-20747 confirmed proceeding, twice (once to edit the env, once explicitly for the kernel/DTB step after
+the risk level was flagged as materially higher).
+
+**Resolved the signing-risk question empirically before touching anything, rather than guessing.**
+The FIT `.its` template declares a `signature { algo = "sha256,rsa2048"; key-name-hint = "dev"; ... }`
+node with no `required = "conf"` property, which is suggestive but not proof. Settled it for real:
+decompiled the board's OWN currently-running `boot.img` (already backed up) with `dtc -I dtb -O dts`
+directly on the FIT file itself -- the signature node is present with `algo`/`padding`/`key-name-hint`
+declared, but **no `value` property at all**. The board is right now booting from a genuinely unsigned
+image. That's direct, empirical proof this board's U-Boot does not enforce FIT signature verification
+-- if it did, the currently-running system couldn't exist. No signing key was ever needed (none found
+anywhere in the SDK checkout either, consistent with this).
+
+**Found the real root cause via the SAME `dumpimage`/`dtc` extraction discipline used for the bootargs
+tracing above.** The RGA path's DRM dumb-buffer allocator fails against a region literally named
+`linux,cma` in its own dmesg error -- a completely different, second CMA pool from `rk_dma_heap_cma`.
+Grepped the real board DTS (`rv1106-luckfox-pico-ultra-ipc.dtsi`) and found it: a `reserved-memory`
+node, **hardcoded `size = <0xA00000>; //10M`**, `reusable`/`linux,cma-default`, shared with the live
+camera's own ISP/CIF pipeline. The math confirms it precisely: 47104kB original total -
+36864kB(`rk_dma_heap_cma`) = 10240kB = 10MB, unchanged before and after the env-only fix.
+
+**One-line DTS edit, minimal and verified.** `size = <0xA00000>; //10M` -> `size = <0x2000000>; //32M`
+in `sysdrv/source/kernel/arch/arm/boot/dts/rv1106-luckfox-pico-ultra-ipc.dtsi`. Confirmed via `git
+diff` this was the ONLY new change on top of the already-applied, real mpu6050 i2c2 patch from the
+earlier accelerometer session (still present, untouched, confirming this checkout genuinely matches
+what's flashed).
+
+**Rebuilt with the exact same proven `./build.sh kernel` target the accelerometer/WiFi sessions used
+successfully twice before**, in the SAME still-running `luckfox-sdk` Docker container (found alive
+from earlier today, `/root/sdk`, same commit `824b817f8`, same patches already applied -- reused
+rather than re-cloning ~1GB). Build succeeded clean (`mrproper` + full reconfigure + rebuild, ~a few
+minutes, one pre-existing unrelated DTS warning about an unused touchscreen node). Verified the new
+DTB directly (not just trusted a clean build exit): `dtc`-decompiled the freshly-built
+`rv1106g-luckfox-pico-ultra.dtb` and confirmed `size = <0x2000000>` really is in there, confirmed the
+new FIT is equally unsigned (matching the current running image, not a new risk), and confirmed the
+DTB's own baseline `bootargs` property is byte-identical to before (no accidental duplication with the
+U-Boot-env-level `rk_dma_heap_cma=66M` fix from earlier).
+
+**Flashed with the full, same discipline as every prior kernel-level session in this project.** Backup
+already in place from the env-fix step (`f5c6b18ce6270944a256c62b6bb48ae2`, boot partition, verified in
+two places). New `boot.img` (3,869,184 bytes) md5-verified identical across the container -> Mac -> board
+hop (`d4561fa1e825df75cb1e1b160cd767cd`, all three). `dd if=/tmp/new_boot_cma32m.img
+of=/dev/mmcblk0p4 bs=1M conv=fsync`, `sync`, `reboot`. **Real, verified boot success:** SSH-reachable
+again in ~9s (same fast reboot as the env-only change). `uname -a`'s build timestamp came back
+identical to before this change -- investigated rather than alarmed: benign, since the kernel Image
+(vmlinux) doesn't depend on devicetree source at all, so an unchanged C-source tree legitimately
+produces a bit-identical kernel Image and its own embedded build string, even under a full
+`mrproper` rebuild. The REAL, decisive confirmation the new DTB was live: `CmaTotal` came back at
+exactly `100352kB` = `66M + 32M` = 98MB, precisely matching the intended resize -- a devicetree
+reserved-memory size can only come from the devicetree, so this is unambiguous proof. All hardware
+(camera, accelerometer, every kernel module) confirmed present and healthy afterward.
+
+**The actual RGA test, for real this time: both DRM buffers allocate successfully --
+`RESULT: DOWNSCALE_MODE RGA` confirmed active, the CMA fix genuinely worked.** But the real,
+measured performance result is a clean, honest negative, not a win: RGA's `downscale_ms` is
+**~35-36ms**, vs. the CPU path's **~9.3-9.5ms** on this exact same live-camera setup -- RGA is
+roughly 4x SLOWER, and real steady-state fps is correspondingly worse (3.8-3.9fps RGA vs. 4.2-4.3fps
+CPU). **This settles the original question the CPU-headroom hypothesis was testing: the answer is no,
+freed CPU headroom does not make RGA worthwhile here.** The reason isn't CPU contention at all (which
+is what "headroom" would have fixed) -- it's that RGA's own mandatory copy-through-contiguous-DMA-
+memory overhead is intrinsically slower than the CPU nearest-neighbor loop for an operation this cheap
+(a 1920x1080->640x640 resize), the same fundamental finding from last session's original RGA
+investigation at 720p, now independently re-confirmed at 1080p with the memory blocker genuinely fixed
+and real CPU headroom genuinely available. `USE_RGA_DOWNSCALE` remains off by default, real, working,
+just not the faster choice on this hardware -- now proven twice, under two different real conditions.
+
+**Final regression check, same discipline as always:** re-ran the default CPU-downscale live-camera
+path after all of this -- identical numbers to the pre-flash baseline (fps 4.3, downscale_ms 9.3-9.4,
+infer_ms 74.4-74.6ms), zero regression from the kernel/DTB change. Both real backups (original 32MB
+boot partition, original 32KB env partition) remain on the Mac, md5-verified, as the recovery path if
+ever needed.
