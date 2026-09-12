@@ -1565,3 +1565,15 @@ throughput), and C2PSA's attention block adds MORE compute on top of a similar b
 so even setting the load-failure aside, YOLO26 would likely be slower than the already-working
 `yolov8n` pipeline on this ~1 TOPS chip, not faster. `yolov8n` remains the right, real choice for this
 board -- not a placeholder waiting on a fix.
+
+## 2026-09-11 (same session, later still) -- pointer: full prep plan for camera calibration + distance detection lives in apex_ros
+
+1697-20747 wants to run real camera calibration on this board's own camera next session, for real distance
+detection of objects, building on `apex_ros`'s already-working `apex_camera_calibration` +
+`apex_perception.mono_distance_estimator` (mono distance from known object size) -- both built for the
+Pi Camera V3, not this board's `sc3336`. **The full, real prep plan (what's portable, what needs new
+V4L2-based capture code, a concrete step-by-step plan, and one already-run real check -- this camera's
+capture node exposes no autofocus controls, consistent with fixed focus) is written up as
+`apex_ros/ACTION_ITEMS.md` item #32, not duplicated here.** Check that entry first before starting;
+it also says to re-check THIS file's own current state before trusting anything it assumed about the
+Luckfox side, so read both fresh rather than trusting either in isolation.
