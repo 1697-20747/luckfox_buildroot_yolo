@@ -5,6 +5,18 @@ RKNN — a possible offload target for detection/positional processing that's be
 Raspberry Pi 5 CPU. See `PROJECT_MEMORY.md` for the full real, dated history of what's actually
 been tried and found — this README is just the current entry point.
 
+**Why this whole pipeline is plain C, not Python: a deliberate choice, not a lack of Python.**
+`python3` (3.10.12) is installed on the board, and precompiled armhf Debian packages exist for both
+`python3-opencv` (`apt-cache policy` confirms `4.5.4+dfsg-9ubuntu4` on `ports.ubuntu.com`, no
+from-source build needed) and `python3-numpy` — so Python + OpenCV genuinely *could* run here.
+The reason this project doesn't use them: the board has only **147MB total RAM** and a single real
+CPU core (confirmed live, `free -m`/`nproc`), and the current bare-C pipeline already runs close to
+that ceiling on its own. A Python interpreter plus OpenCV's full native library chain (a dozen-plus
+`libopencv-*.so` dependencies) would add real, measured-nowhere-but-obviously-nontrivial memory and
+per-frame interpreter overhead on top of that, for a board whose entire design center is "small
+embedded footprint" — not a hypothetical concern here, a hardware constraint actually hit multiple
+times this project (see the CMA/memory-sizing entries in `PROJECT_MEMORY.md`).
+
 **Want the "how does this actually work" explainer instead of the session-by-session log?** See
 [`RV1106_NPU_YOLO_GUIDE.md`](RV1106_NPU_YOLO_GUIDE.md) — hardware, the RKNN toolchain, and why some
 YOLO generations run on this chip and others don't. Also served live, straight off the board, at
@@ -89,6 +101,75 @@ sudo ./luckfox_video_hud_stream <model.rknn> <video.mp4> [labels.txt] [port] [di
 pass them explicitly (e.g. `960 540`) to trade quality for fps. Then open
 `http://<board-ip>:<port>/` in a browser on the same WiFi network.
 
+**Real, measured on-device (2026-09-13): dropping display/capture resolution is the biggest
+remaining fps lever, and it costs nothing in detection quality.** Inference always runs on a
+downscaled 640x640 copy regardless of display size (`downscale_for_inference()`), so display
+resolution and detection resolution are already independent — lowering the former doesn't touch the
+latter at all. Live-camera (`luckfox_video_hud_stream_cam`, `/dev/video11`) steady-state, same
+`yolov8n-optimized` model, same board:
+
+| Display res | fps | read_ms | downscale_ms | infer_ms | jpeg_ms |
+|---|---|---|---|---|---|
+| 1920x1080 | 4.2-4.3 | ~46 | ~9.3 | ~75 | ~106-108 |
+| **960x540 (current default)** | **8.4** | ~11.8 | ~8.3 | ~73-74 | ~27 |
+| 640x480 | 9.7 | ~7 | ~8.0 | ~73-74 | ~16 |
+
+`infer_ms` is unchanged across all three (73-75ms, within noise) since the NPU always sees the same
+640x640 input regardless of display size — the fps difference comes entirely from JPEG-encode/read
+cost scaling with display pixel count. **`960x540` is the shipped default as of 2026-09-13**
+(`luckfox_video_hud_stream_cam.c`'s live-camera fallback when no `display_w`/`display_h` args are
+given) — chosen as the fps/HUD-quality middle ground between the 4.3fps 1080p baseline and the
+9.7fps 640x480 extreme; pass explicit `display_w`/`display_h` args to override. The ISP's stepwise
+sensor sizes accept all three resolutions directly via `VIDIOC_S_FMT` with no renegotiation.
+
+**Runs automatically from boot as of 2026-09-13** via `/etc/systemd/system/luckfox-video-stream.service`
+(same convention as `aic8800-wifi.service`/`luckfox-docs.service`) — starts
+`luckfox_video_hud_stream_cam` against `/dev/video11` on port 8080 with no resolution args (so it
+uses the 960x540 default above), `Restart=on-failure`. Verified across a real reboot, not just
+`systemctl start`. `sudo systemctl status luckfox-video-stream.service` / `journalctl -u
+luckfox-video-stream.service -f` to check it; `sudo systemctl stop luckfox-video-stream.service`
+before manually running a different build/resolution for testing, or the service will hold
+`/dev/video11`/`/dev/rknpu` and the manual run will fail.
+
+**HUD overlay ported from `apex_ros`'s `apex_hud` package (2026-09-13), in plain C** —
+`apex_hud_widgets.h`/`.c` reimplements 4 of its 14 widgets (the ones with a real Luckfox data
+source; the rest need concepts this board has no data for at all — orientation/attitude, lidar
+range, a path/session/lap context — and are intentionally not stubbed in, since a fabricated
+placeholder for a concept that doesn't exist here would be worse than omitting it):
+- `apex_hud_draw_crosshair` — static center reticle, direct port of `widgets/crosshair.py`
+- `apex_hud_draw_track_boxes` — real YOLO detections (bbox/class/confidence); no azimuth/distance
+  (needs `apex_core.camera_lens` + #32's mono-distance work, not done on this board yet)
+- `apex_hud_draw_accelerometer` — real port of `widgets/accelerometer.py`'s polar-grid dot, fed by
+  this board's own MPU-6050 reads (replaces the old plain-text accel readout)
+- `apex_hud_draw_radar_map_stub` — `widgets/radar_map.py`'s grid/box always draws, honestly grey
+  with zero objects plotted (no real per-object x/y/z distance exists on this board yet)
+
+Same color language as `apex_hud/style.py` (green instrument color, cyan track boxes, grey
+no-data), same "always draws, grey when no data" contract for the fixed-slot widgets. Real,
+measured zero fps cost — 8.3fps before and after, the added draw calls are noise against the
+73-75ms NPU inference floor. See `PROJECT_MEMORY.md`'s 2026-09-13 "apex_hud port" entries for the
+full real test, including a screenshot-equivalent frame check.
+
+**Full-HUD follow-up pass, same day**: added the remaining orientation/heading widgets 1697-20747 asked
+for by name, all in their real apex_hud "no data" neutral/grey state (this board has no orientation
+source at all — MPU-6050 raw accel only, no fusion/magnetometer):
+- `apex_hud_draw_horizon_stub` — `ArtificialHorizonWidget` port: pitch ladder + fixed chevron
+- `apex_hud_draw_roll_ring_stub` — `RollRingWidget` port: tick arc + pointer at roll=0
+- `apex_hud_draw_compass_tape_stub` — `CompassTapeWidget` port: heading tape at heading=0, "---" readout
+- `apex_hud_draw_attitude_readouts_stub` — `AttitudeReadoutWidget` port: boxed "P--"/"R--"
+
+Plus two things not from `apex_hud` itself: a real `cpu %` line (system-wide, `/proc/stat` delta,
+same technique `top` uses) added to the top-left diagnostic panel, and `apex_hud_font_size()` —
+every text size in this HUD now scales with `display_h` against a 960x540 reference, instead of a
+fixed pixel size tuned for only one resolution. `RolloverMarkerWidget` remains deliberately not
+ported — it has no meaningful neutral default (per its own real contract) and this board has no
+rollover-angle source either. Real, verified: `-O2` rebuild (127236 bytes, a sane +4888 over the prior 122348-byte build — not
+the earlier missing-optimization mistake), fps unchanged at 8.3, and a real frame pulled off the
+live stream confirmed the ladder/ring/tape/readout boxes all render. One known minor legibility
+issue: the roll ring's major-tick labels ("60" etc.) render a bit garbled at their current tiny
+font size on this custom bitmap font — bump `apex_hud_draw_roll_ring_stub`'s label base size
+(currently 8) up a couple points if that's worth fixing.
+
 Also reads the MPU-6050 accelerometer via Linux's standard IIO sysfs interface, auto-discovering
 the right `iio:deviceN`. **Working end-to-end as of 2026-09-09** on a custom-built kernel (see
 `PROJECT_MEMORY.md`) — confirmed live: `RESULT: ACCEL_FOUND /sys/bus/iio/devices/iio:device1
@@ -117,14 +198,15 @@ before wiring anything else up: **I2C2** (this GPIO header, used above for the M
 (the LCD connector's touchscreen), **I2C4** (the CSI camera connector's sensor control — shares
 pins with the CSI camera, so CSI and I2C4 can't both be configured at once by default).
 
-Pin 40 (`GPIO1_A1`) is wired to the MPU-6050's `INT` pin for real interrupt-driven data-ready
-signaling. It's optional, not load-bearing: the mainline `inv_mpu6050` driver hard-requires a real
-IRQ line to set up its triggered-buffer/FIFO mode (`devm_request_irq()` on IRQ 0 fails with
-`-EINVAL` otherwise), so without `INT` wired, the kernel driver patch in this repo's
-`PROJECT_MEMORY.md` skips that setup and falls back to plain polled sysfs reads
-(`in_accel_*_raw`) — which is all `luckfox_video_hud_stream.c` actually uses. Wiring `INT` unlocks
-lower-latency/jitter interrupt-driven sampling as a future improvement, not a requirement to get
-real readings.
+**Physically wired as of 2026-09-13** — pin 40 (`GPIO1_A1`) now has a real jumper to the MPU-6050's
+`INT` pin for interrupt-driven data-ready signaling. **Not yet functionally active**: confirmed on
+the board same-day that `/sys/bus/iio/devices/iio:device1` (the `mpu6050`) still has no trigger
+files, and the kernel driver patch in this repo's `PROJECT_MEMORY.md` still unconditionally skips
+IRQ-based triggered-buffer setup and falls back to plain polled sysfs reads (`in_accel_*_raw`) —
+which is all `luckfox_video_hud_stream.c` actually uses. Wiring the line alone doesn't flip this;
+the kernel/devicetree side still needs the skip-IRQ patch reverted (re-enabling
+`devm_request_irq()`/triggered-buffer mode) before the hardware connection does anything. Real next
+step if lower-latency/jitter sampling is wanted, not done yet.
 
 ## Live camera
 

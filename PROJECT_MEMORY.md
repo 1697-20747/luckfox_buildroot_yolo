@@ -1577,3 +1577,238 @@ capture node exposes no autofocus controls, consistent with fixed focus) is writ
 `apex_ros/ACTION_ITEMS.md` item #32, not duplicated here.** Check that entry first before starting;
 it also says to re-check THIS file's own current state before trusting anything it assumed about the
 Luckfox side, so read both fresh rather than trusting either in isolation.
+
+## 2026-09-13 -- real fps win found: decoupling display/capture resolution from inference resolution; accelerometer INT line physically wired (not yet functionally active)
+
+1697-20747 asked what could raise fps given that detection quality (fixed by inference resolution) matters
+more than HUD video quality (display resolution) -- tested the resulting hypothesis for real on the
+board via SSH rather than just projecting from the 2026-09-11 JPEG-cost-per-pixel numbers.
+
+**Real, measured: dropping display/capture resolution alone, leaving `MODEL_SIZE` (640x640) and
+detection quality completely untouched, more than doubles fps.** Live camera (`/dev/video11`),
+`yolov8n-optimized-rv1106-1.6.0.rknn`, 25s steady-state pulls via `curl`:
+
+```
+                    1920x1080 (baseline)   640x480
+read_ms                  ~46                 ~7
+downscale_ms             ~9.3                ~8.0
+infer_ms                 ~75                 ~73-74   (unchanged, as expected)
+jpeg_ms                  ~106-108             ~16
+fps                      4.2-4.3              9.7
+```
+
+`infer_ms` staying flat confirms the NPU only ever sees the same 640x640 copy regardless of display
+size -- display resolution and detection resolution were already architecturally independent
+(`downscale_for_inference()`), this just measured that decoupling for real rather than assuming it.
+The sensor accepted a direct 640x480 `VIDIOC_S_FMT` request with no renegotiation (stepwise sizing
+confirmed working, not just documented). **This is now the best real fps lever found in this
+project** -- bigger than the 512x512-vs-640x640 inference-resolution test (which only bought ~3-10%
+because JPEG/read cost at high display res was swamping it), and unlike the RGA/MPP hardware-offload
+attempts, a real, clean win with zero tradeoff on detection accuracy.
+
+**Follow-up, same day: 1697-20747 picked 960x540 as the standing benchmark resolution going forward.**
+Tested for real before adopting it: `fps=8.4, read_ms=11.7-12.1, downscale_ms=8.1-8.6,
+infer_ms=73.3-74.0, jpeg_ms=27.0-28.4` -- a real middle ground between the 4.3fps/1080p baseline and
+the 9.7fps/640x480 extreme, with meaningfully more HUD detail than 640x480. **Made the new default**,
+not just benchmarked: patched `luckfox_video_hud_stream_cam.c`'s live-camera fallback (previously
+hardcoded to 1920x1080 when no `display_w`/`display_h` args given) to 960x540, rebuilt on-device
+(`g++ luckfox_video_hud_stream_cam.c utils/image_drawing.c -I. -Iutils -I3rdparty/stb_image
+-Irga_include -o luckfox_video_hud_stream_cam_new -lrknnmrt -lrga -ljpeg -lm -lpthread`, clean build,
+no errors), and verified the rebuilt binary actually defaults to 960x540 with no args before swapping
+it in over the old binary. Explicit `display_w`/`display_h` args still override this default.
+
+**Real bug hit and fixed while rebuilding: the rebuild dropped `-O2`, causing a genuine ~3x
+slowdown that looked like a mysterious runtime regression before the cause was found.** The
+`g++` command used to rebuild after the resolution-default patch omitted any optimization flag
+(unlike whatever built the original binary), producing a *correctly functioning* but much slower
+binary -- confirmed by binary size alone: the original `luckfox_video_hud_stream_cam` was 117440
+bytes, the no-flag rebuild was 202788 bytes (unoptimized code is bigger, less inlining/dead-code
+elimination). Real measured impact, live under the systemd service with a real browser client:
+fps 8.4 (expected) -> 2.9, then degrading further to 1.7 on a second client reconnect -- read_ms,
+downscale_ms, and infer_ms (which includes the CPU-side INT8 quantization loop right before the
+NPU call) all inflated 3-10x. **Fixed by rebuilding with `-O2`** (`g++ -O2
+luckfox_video_hud_stream_cam.c utils/image_drawing.c -I. -Iutils -I3rdparty/stb_image
+-Irga_include -lrknnmrt -lrga -ljpeg -lm -lpthread`) -- confirmed the `-O2` output is byte-identical
+in size to the original (117440 bytes) before deploying it, then re-verified real fps back to 8.3,
+matching the earlier clean benchmark. **Lesson for next time this file is rebuilt: always pass
+`-O2`, and sanity-check the output binary's size against the last known-good build before deploying
+it** -- a silent, no-error-message optimization-flag drop is easy to miss and looks exactly like a
+runtime regression (memory pressure, CPU contention, thermal) rather than a build-flag mistake.
+
+## 2026-09-13 (same day, later) -- apex_hud port: checked Python availability for real, ported 4 of 14 widgets to plain C, verified live
+
+1697-20747 asked to see the Luckfox's HUD match `apex_ros`'s `apex_hud` package format, and directly
+asked whether Python is available on this board at all (given `apex_hud` is Python/OpenCV/ROS 2).
+
+**Checked for real rather than assumed: Python and even a precompiled `python3-opencv` package ARE
+available.** `python3 --version` -> `3.10.12`, `pip3` present. `apt-cache policy python3-opencv
+python3-numpy` shows real candidates on `ports.ubuntu.com/ubuntu-ports jammy` for `armhf`
+(`4.5.4+dfsg-9ubuntu4` / `1:1.21.5-1ubuntu22.04.1`) -- a real precompiled binary package, not a
+from-source build. So "Python isn't available" is not the real constraint here.
+
+**The real constraint, also checked directly: 147MB total RAM, one real CPU core** (`free -m`,
+`nproc` -- both already established this session investigating the fps regression above). The
+existing bare-C pipeline already runs close to that ceiling. Running a Python interpreter plus
+OpenCV's full native `.so` chain (a dozen-plus `libopencv-*` shared libraries per
+`apt-cache show python3-opencv`'s `Depends`) on top of that was judged not worth the real,
+though not individually measured, memory/interpreter-overhead cost on a board this tight --
+documented as a real, deliberate design choice in `README.md`, not "Python isn't available."
+
+**Ported 4 of `apex_hud`'s 14 widgets to plain C** (`apex_hud_widgets.h`/`.c`, new files), the ones
+with a real Luckfox data source -- read every widget file in `apex_ros/src/apex_hud/apex_hud/
+widgets/` and `compose.py`/`style.py` first rather than guessing the format:
+- `CrosshairWidget` -- static reticle, exact geometry port (outer square, 4 corner brackets, tick
+  marks, center box), no data needed.
+- `TrackBoxesWidget` -- real YOLO detections (bbox/class/confidence, already available every
+  frame); azimuth/distance fields omitted, not fabricated -- that needs `apex_core.camera_lens`'s
+  lens model and #32's not-yet-done mono-distance work.
+- `AccelerometerWidget` -- the actual polar-grid-dot widget (spokes, 3 ring circles, F/R/B/L
+  labels, a dot that moves with real lateral/forward acceleration), replacing the old plain-text
+  "ACCEL x.. y.. z.. g" readout -- fed by this board's own already-working `accel_update()` reads
+  (g's converted to m/s^2 by *9.81 to match the widget's `MAX_MS2=8.0` scale).
+- `RadarMapWidget` -- ported as an honest structural stub: the bordered box and range-ring grid
+  always draw (matching the widget's own "always visible" rule), always in grey with zero objects
+  plotted, since this board has no real per-object x_m/y_m/z_m distance yet. Not faked -- ready to
+  feed real objects once #32 lands.
+
+**Intentionally NOT ported** (not "too hard," genuinely no data source on this board for the
+underlying concept at all, unlike RadarMapWidget's "wired but empty" case): `ArtificialHorizonWidget`/
+`RollRingWidget`/`RolloverMarkerWidget`/`AttitudeReadoutWidget`/`CompassTapeWidget` (need real
+orientation/attitude, not just raw accel -- would mean building sensor-fusion from scratch, a new
+engineering project, not a port), `PathMinimapWidget`/`VerticalTapeWidget` (speed/altitude)/
+`RangeReadoutWidget` (no path/odometry/lidar data exists on this board), `SessionTimerWidget`/
+`LapCounterWidget` (no track/lap/session context -- this is a bench-test board, not a lap vehicle),
+`ObstacleHighlightWidget`/`AvoidanceArrowWidget` (no avoidance planner exists here either -- true to
+its own real contract, this widget draws nothing when unwired, same as on the real Pi robot today).
+
+**Same color language as `apex_hud/style.py`**: `COLOR_GREEN` for instrument color (matches
+`INSTRUMENT_COLOR (0,255,0)`), a new `APEX_HUD_TRACK_COLOR` (`0xFF00C8FF` ARGB = RGB `(0,200,255)`,
+the same cyan `TRACK_COLOR`), `APEX_HUD_NO_DATA_COLOR` (`0xFF808080` = grey `(128,128,128)`) for
+the "no live data" fallback -- same always-draws-grey-when-missing contract as the fixed-slot
+Python widgets.
+
+**Real, verified, not just "compiles":**
+1. Standalone compile check (`gcc -O2 -c apex_hud_widgets.c`) before touching the main pipeline --
+   clean, no warnings.
+2. Patched `luckfox_video_hud_stream_cam.c` (include + 3 call sites: crosshair+track_boxes+
+   radar_map replacing the old per-detection drawing loop, accelerometer widget replacing the old
+   text panel) via a Python find/replace script with `assert` guards on each match, not manual
+   `sed` -- every substitution either matched exactly once or the script aborted.
+3. Full rebuild with `-O2` (lesson from earlier this session, see below) -- 122348 bytes vs the
+   pre-port 117440 bytes, a small, sane increase, not the 202788-byte red flag from the earlier
+   no-optimization mistake.
+4. Live-tested on the real board: fps **8.3 before and after** the port (read/downscale/infer/jpeg
+   all unchanged within noise) -- the added draw calls are true noise against the 73-75ms NPU floor.
+5. Pulled a real frame from the live MJPEG stream and looked at it (this project's standing
+   discipline): crosshair renders correctly (green square, brackets, ticks, center box), the
+   accelerometer widget renders correctly and in grey (accurately reflecting "EMA not initialized
+   yet" at frame 1, exactly matching `apex_hud`'s own no-data contract), the radar map stub renders
+   correctly (grey box + 3 grid diamonds, no objects, as designed). No detections in that dark-room
+   test frame, so `TrackBoxesWidget`'s box-drawing path wasn't visually re-confirmed this session,
+   but it reuses the same `draw_rectangle`/`draw_text` calls already proven live for weeks.
+6. Deployed into `luckfox-video-stream.service` (replacing the binary, `systemctl start`) -- running
+   live as the real boot-time default as of this entry.
+
+## 2026-09-13 (same day, later still) -- apex_hud: full HUD pass (horizon/roll ring/compass/attitude readouts), CPU%, resolution-aware fonts, two real display bugs found and fixed
+
+1697-20747 asked to add the remaining orientation widgets (1697-20747's words: "missing artificial horizon
+line, cpu%, roll, compass and other components... match the full HUD, even if no data feed yet (eg
+compass)") -- a deliberate reversal of the earlier session's choice to omit them, clarifying that a
+grey/neutral no-data rendering (matching apex_hud's own real contract) is exactly what he wants,
+not an omission.
+
+**Ported 4 more widgets, all correctly rendering their real apex_hud "no orientation data" neutral
+default** (this board still has no fusion/magnetometer, MPU-6050 raw accel only):
+- `apex_hud_draw_horizon_stub` (`ArtificialHorizonWidget`) -- pitch ladder ticks + fixed chevron
+- `apex_hud_draw_roll_ring_stub` (`RollRingWidget`) -- tick arc + pointer at roll=0
+- `apex_hud_draw_compass_tape_stub` (`CompassTapeWidget`) -- heading tape at heading=0, "---" readout
+- `apex_hud_draw_attitude_readouts_stub` (`AttitudeReadoutWidget`) -- boxed "P--"/"R--"
+
+`RolloverMarkerWidget` again deliberately not ported (no meaningful neutral default per its own
+real contract, and no rollover-angle source on this board either).
+
+**Also added, not from apex_hud**: a real `cpu %` line in the top-left diagnostic panel --
+`read_cpu_percent()`, a `/proc/stat` delta between calls (same technique `top` itself uses), added
+given how much of this session was spent chasing real CPU contention. And
+`apex_hud_font_size(img, base_size_at_540p)`: every text draw in this HUD (was previously a mix of
+fixed pixel sizes) now scales against `img->height` relative to the 960x540 default, so it stays
+legible whether the stream is running at 640x480, 960x540, or 1920x1080.
+
+**Real, verified**: `-O2` rebuild, 127236 bytes (a sane +4888 over the prior 122348-byte build).
+Live fps unchanged, 8.3-8.5 over a **1000+ frame soak run** (the longest continuous real test this
+session, not just a short bench pull) -- a few isolated frames showed transient spikes (e.g.
+frame 1000: infer 92.6ms, jpeg 37.8ms vs the steady 74/27ms baseline) but the pipeline recovered
+immediately each time and fps held at 8.4-8.5 throughout, not a sustained regression. Pulled real
+frames off the live stream and looked at them (this project's standing discipline) to confirm the
+ladder/ring/tape/readout boxes actually render, not just compile.
+
+**Two real display bugs found from that visual check and fixed for real, not just noted:**
+1. 1697-20747 caught the accelerometer widget's F/R/B/L labels rendering embedded inside the polar
+   circle rather than clear of it. Root cause: the label offset was a fixed `radius+7` px
+   regardless of the label's own (now resolution-scaled) font size -- at larger font sizes the
+   glyph height exceeded that 7px gap and drew back into the circle. Fixed by offsetting by
+   `radius + font_size + 4` instead of a fixed constant, and referencing the glyph's own size for
+   vertical centering too -- scales correctly at any resolution instead of only working by
+   coincidence at one.
+2. 1697-20747 found the top-left diagnostic panel's initial font-halving pass (a direct, literal
+   response to "too large, halve font size") left 3 lines at one size and the 4th (the "LUCKFOX
+   RV1106..." line) at a visibly different smaller size -- asked for one uniform size, slightly
+   bigger than the halved result. Fixed: single `diag_fsz = apex_hud_font_size(&img, 7)` for all 4
+   lines, removed the separate `diag_fsz_small`, panel background height recomputed accordingly.
+
+**Known, not yet fixed**: the roll ring's major-tick labels ("60" etc, `apex_hud_draw_roll_ring_stub`,
+base font size 8) still render a bit garbled at their current tiny size on this custom bitmap font --
+flagged to 1697-20747, not fixed this session; bump that specific base size if it needs fixing for real.
+
+## 2026-09-13 (same day, later still) -- real second bug in the F/R/B/L fix: a uniform diagonal centering shift silently broke radial symmetry
+
+1697-20747 sent a real zoomed screenshot showing "F" sitting visibly farther from the accelerometer
+widget's center than "L"/"R"/"B" -- the *first* F-fix (offsetting by `radius+font_size+4` instead
+of a fixed `+7`) had genuinely fixed the "embedded in the circle" problem, but introduced a
+smaller, real, second bug: centering each glyph with a single uniform `(-fsz/2, -fsz/2)` diagonal
+shift, applied identically to all four labels regardless of direction.
+
+**Why that's a real bug, not a rounding nitpick, verified by decomposing it properly**: a
+diagonal shift has a component *along* each label's own radial direction that differs by
+direction. Dot product of `(-1,-1)*fsz/2` against each cardinal's unit direction: F `(0,-1)` ->
+`+fsz/2` (pushed outward), L `(-1,0)` -> `+fsz/2` (also pushed outward), R `(1,0)` -> `-fsz/2`
+(pulled inward), B `(0,1)` -> `-fsz/2` (also pulled inward). A real, reproducible, direction-
+dependent asymmetry -- not visible at the frame's normal small scale, only surfaced by a real
+zoomed-in screenshot.
+
+**Fixed for real by centering on the perpendicular axis only**, never the radial one:
+`tx = lx - fabsf(sin_r) * fsz/2`, `ty = ly - fabsf(cos_r) * fsz/2` -- for F/B (`sin_r=±1,cos_r≈0`)
+only x shifts (correct: center horizontally, don't touch the already-correct radial y); for L/R
+(`cos_r=±1,sin_r≈0`) only y shifts. Since `fabsf(sin_r)`/`fabsf(cos_r)` are exactly 0 or 1 at these
+four axis-aligned angles, the radial coordinate is mathematically untouched by the centering
+correction -- all four labels are now provably equidistant from center, not just close by eye.
+
+**Real deploy hiccup found and fixed along the way**: the local git repo's synced copy of
+`apex_hud_widgets.c` (from the *first* F-fix, a few messages earlier) turned out to still have the
+pre-fix code -- an `scp` in that round silently didn't take. Re-verified this time by `grep`-ing
+the local file for the expected fixed lines right after syncing, not just trusting the copy
+succeeded. The board's actual running binary was correct throughout (rebuilt, size-checked,
+verified via a live frame pull, `git status`/`git diff --stat` clean apart from the intended
+doc/source changes) -- only the local backup copy had briefly drifted.
+
+**`luckfox-video-stream.service` (systemd) created so the stream survives reboot**, matching the
+existing `aic8800-wifi.service`/`luckfox-docs.service` convention in this repo (`/etc/systemd/
+system/luckfox-video-stream.service`, `Type=simple`, `User=root` -- needs root for `/dev/rknpu`
+and camera access same as every other real run in this project, `Restart=on-failure`,
+`WantedBy=multi-user.target`). Runs `luckfox_video_hud_stream_cam` with no `display_w`/`display_h`
+args, so it uses the 960x540 default above. **Verified for real across an actual reboot** (not just
+`systemctl start`): after `sudo reboot`, the service came up on its own and served a real client
+connection with no manual intervention, confirmed via `systemctl status` and a live `curl`/browser
+pull.
+
+**Accelerometer INT line (pin 40, `GPIO1_A1`) physically wired today.** Checked live rather than
+trusting the report at face value: `cat /sys/bus/iio/devices/iio:device1/name` still returns
+`mpu6050` with no trigger-related files in that directory, and `dmesg` shows nothing new for
+`mpu`/`accel`/`i2c2` since boot -- consistent with the kernel driver patch (see 2026-09-08/09 entries)
+still unconditionally skipping IRQ-based triggered-buffer setup regardless of whether the physical
+line is connected. **Wiring the line did not change runtime behavior** -- the sensor still runs
+polled-only, same ~1:1-with-video-loop sample rate as before. To actually use the now-wired
+interrupt, the skip-IRQ patch needs reverting (re-enable `devm_request_irq()`/triggered-buffer mode
+in the driver), which needs a kernel rebuild + reflash, same discipline as every other kernel change
+in this project -- not done this session, real next step if lower-latency/jitter accelerometer
+sampling is ever wanted. `README.md` and `RV1106_NPU_YOLO_GUIDE.md` updated to reflect both findings.
