@@ -38,7 +38,10 @@
  * Usage: sudo ./luckfox_video_hud_stream <model.rknn> <video-file-or-/dev/videoN> <labels.txt> [http-port] [display_w] [display_h]
  * display_w/display_h default to the source video's own resolution
  * (probed via ffprobe) if omitted, or to 1920x1080 for a live camera.
- * Then open http://<board-ip>:<port>/ in a browser on the same WiFi.
+ * Then open http://<board-ip>:<port>/ in a browser on the same WiFi, or
+ * over USB (the board's usb0 gadget-network interface, one cable for
+ * both power and data) -- single-client by design (see README.md's
+ * "Connectivity" note, 2026-09-20): no multi-client fan-out, no router.
  *
  * Live camera (2026-09-11): if the second argument starts with
  * "/dev/video" it's treated as a real V4L2 capture device (the

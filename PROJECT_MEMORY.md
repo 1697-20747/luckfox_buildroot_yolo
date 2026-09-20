@@ -1812,3 +1812,52 @@ interrupt, the skip-IRQ patch needs reverting (re-enable `devm_request_irq()`/tr
 in the driver), which needs a kernel rebuild + reflash, same discipline as every other kernel change
 in this project -- not done this session, real next step if lower-latency/jitter accelerometer
 sampling is ever wanted. `README.md` and `RV1106_NPU_YOLO_GUIDE.md` updated to reflect both findings.
+
+## 2026-09-20 -- connectivity decided for real: single viewer over WiFi or USB, mini router dropped, multi-client fan-out descoped (docs-only, no device session)
+
+1697-20747 asked to remove the assumption of a one-to-many wireless broadcast: this project only ever
+needs to get the stream + HUD to one laptop's browser, over wireless and/or USB, using USB's own
+power delivery to the board where possible, and to treat a dedicated mini travel router as a
+last resort rather than a planned component -- then verify on the real device later, not this
+session (no SSH access this session; this is a docs/decision pass only).
+
+**First checked whether any of this already existed in code rather than assuming a rewrite was
+needed.** Grepped both stream binaries (`luckfox_video_hud_stream.c`/`_cam.c`) for `bind`/`listen`/
+`accept`: both already call `bind(INADDR_ANY, ...)` and `listen(server_fd, 1)`, with a single
+`accept()` before the frame loop -- **this pipeline was already single-client, interface-agnostic
+HTTP, not a one-to-many broadcast.** The only "one-to-many" concept that ever existed in this
+project was a *paused, unimplemented* idea, noted in the 2026-09-11 RGA/MPP entry above as
+"multi-client fan-out (separate, paused)" -- never built, so there was no fan-out code to remove.
+Similarly, no "mini router" was ever referenced anywhere in this repo's code, README, or prior
+`PROJECT_MEMORY.md` entries -- it was a planning assumption for a future multi-viewer setup that
+never got built either. **Decision: drop the multi-client fan-out idea outright (not "defer" --
+there is no plan to revisit it), and treat a mini router as explicitly out of scope** unless a
+real, on-device reason surfaces that neither WiFi nor USB can be made to work.
+
+**USB path: not new, already present on this board, just never used for the video stream.**
+`LUCKFOX_ACCESS.local.md` (gitignored local notes) already records a `usb0` USB-gadget network
+interface at `172.32.0.70/16` that comes up over the same USB cable used to power the board when
+connected to a computer -- exactly the "USB powers the board and carries data over one cable" path
+1697-20747 asked for, already provided by the vendor image's USB gadget config, not something this
+project needs to build. It was last checked 2026-09-09 and noted as down/NO-CARRIER at that time
+(SSH/dev work that session went over LAN/WiFi instead) -- it has never actually been exercised
+*while the video-stream service is running*, so calling it "confirmed" would overstate what's
+known. Because the server already binds `INADDR_ANY`, no source change is needed for the stream to
+serve over `usb0` once that interface is up -- the browser target simply becomes
+`http://172.32.0.70:<port>/` instead of the WiFi IP.
+
+**What changed this session (docs/comments only, verified by rereading the diffs, not by running
+anything on real hardware -- no device access this session):** `README.md` gets a new
+"Connectivity, decided 2026-09-20" callout under the live-stream section spelling out the
+WiFi/USB/router decision above; the top-of-file usage comment in both
+`luckfox_video_hud_stream.c` and `luckfox_video_hud_stream_cam.c` now mentions the USB path and
+the single-client-by-design rationale alongside the existing WiFi instructions; `CHANGELOG.md` gets
+the terse version of this entry.
+
+**Real next step, explicitly not done this session: re-verify `usb0` on the actual board with the
+video-stream service running**, and update `LUCKFOX_ACCESS.local.md`'s "not currently... was
+down/NO-CARRIER" note either way, not just assume the interface behaves the same now as it did on
+2026-09-09. If `usb0` doesn't reliably come up standalone (host laptop must configure its side of
+the USB-gadget link too -- typically automatic on macOS/Linux via a CDC-ECM/RNDIS driver, but not
+yet confirmed against this specific board's gadget descriptor), that's the trigger for falling back
+to WiFi as the default rather than reaching for a mini router.

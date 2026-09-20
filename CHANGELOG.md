@@ -3,6 +3,17 @@
 Terse, dated, factual record of real changes to this project. For the full narrative/discovery log
 (why, what was tried, what failed), see `PROJECT_MEMORY.md` — this file is the short version.
 
+## 2026-09-20
+
+- **Connectivity decision: single viewer, point-to-point, no dedicated router.** Dropped the
+  paused "multi-client fan-out" idea (noted 2026-09-11) instead of leaving it open. Documented
+  (`README.md`, source comments in `luckfox_video_hud_stream.c`/`_cam.c`) that the existing
+  `INADDR_ANY`/`listen(fd, 1)` server already serves either WiFi or the board's existing `usb0`
+  USB-gadget network interface (one cable for power + data) unchanged — no code change required.
+  A mini travel router stays explicitly out of scope unless one of those two paths proves unusable
+  on-device. Re-confirming `usb0` while the stream service is actually running is the next
+  on-device check, not done this session.
+
 ## 2026-09-11
 
 - **Board: U-Boot env `sys_bootargs` changed** — `rk_dma_heap_cma` 36M → 66M (matches the board

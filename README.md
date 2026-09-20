@@ -99,7 +99,27 @@ sudo ./luckfox_video_hud_stream <model.rknn> <video.mp4> [labels.txt] [port] [di
 ```
 `display_w`/`display_h` default to the source video's own resolution (auto-probed via `ffprobe`) —
 pass them explicitly (e.g. `960 540`) to trade quality for fps. Then open
-`http://<board-ip>:<port>/` in a browser on the same WiFi network.
+`http://<board-ip>:<port>/` in a browser on the same WiFi network (or over USB — see below).
+
+**Connectivity, decided 2026-09-20: single viewer, point-to-point, no dedicated router required.**
+This project only ever needs one laptop looking at one stream — there's no plan to fan a single
+stream out to multiple simultaneous viewers (the "multi-client fan-out" idea noted as a paused,
+separate target in `PROJECT_MEMORY.md`'s 2026-09-11 RGA/MPP entry is dropped, not just deferred),
+and the server already reflects that: `listen(server_fd, 1)` and a single `accept()` in both
+`luckfox_video_hud_stream.c` and `luckfox_video_hud_stream_cam.c` were already single-client by
+design, not a limitation to fix. Because both bind `INADDR_ANY` rather than a specific interface,
+the same binary already serves this over whichever link is up, with no code change needed:
+- **WiFi (current default path):** `http://<wifi-ip>:<port>/`, e.g. `http://192.168.1.196:8080/` —
+  works today, as documented above.
+- **USB (preferred going forward — one cable for both power and data, no access point needed):**
+  the board already presents a `usb0` USB-gadget network interface at `172.32.0.70/16` over the
+  same USB cable used to power it (confirmed present in `LUCKFOX_ACCESS.local.md`, though not yet
+  re-confirmed *while the video-stream service is running* — that's the next on-device check).
+  Once confirmed, the browser target is just `http://172.32.0.70:8080/` with the laptop's USB
+  network interface as the only thing that needs to be up — no WiFi, no LAN, no router.
+- **Mini travel router:** intentionally not used unless one of the two paths above turns out to be
+  unusable on-device for a reason not yet known (e.g. `usb0` not surviving reboot, or a laptop's
+  USB-gadget driver not cooperating) — not a planned part of this project's normal path.
 
 **Real, measured on-device (2026-09-13): dropping display/capture resolution is the biggest
 remaining fps lever, and it costs nothing in detection quality.** Inference always runs on a
