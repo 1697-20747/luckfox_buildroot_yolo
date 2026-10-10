@@ -29,8 +29,9 @@ cd /src
 ${TC}-g++ -O2 -Wall -Wno-unused-function -Wno-unused-variable -Wno-comment \
   luckfox_video_hud_stream_cam.c utils/image_drawing.c apex_hud_widgets.c \
   -I. -Iutils -I3rdparty/stb_image -I$M/include/rga -I$M/include -I$A/include/libjpeg9 \
-  -L$M/lib -L$A/lib -Wl,-rpath,/oem/usr/lib -Wl,-rpath,\$ORIGIN/lib \
-  -o luckfox_video_hud_stream_cam -lrknnmrt -lrga -ljpeg -lm -lpthread
+  -L$M/lib -L$A/lib -Wl,-rpath-link,$M/lib -Wl,-rpath,/oem/usr/lib -Wl,-rpath,\$ORIGIN/lib \
+  -DLUCKFOX_HW_JPEG \
+  -o luckfox_video_hud_stream_cam -lrknnmrt -lrga -ljpeg -lrockit -lm -lpthread
 mkdir -p lib && cp -L $A/lib/libjpeg.so.9 lib/
 '
 ls -la "$OUT/luckfox_video_hud_stream_cam"

@@ -3,7 +3,14 @@
 # camera/NPU kernel modules are loaded. Runs Rockchip's 3A server (auto
 # exposure / white balance via the sensor's IQ tuning file) and, if
 # installed, the YOLO HUD stream server. Logs: /var/log/yolo-*.log
+#
+# Boot-loop guard: a marker on /userdata is set before the app starts and
+# cleared once it has run 60s. If a boot finds the marker still there, the
+# previous boot hung (2026-10-10: an experimental hardware-JPEG build froze
+# the board at startup, which with auto-start would repeat every boot), so
+# this boot runs the app with experimental options forced off.
 APP_DIR=/root/rknn_test
+GUARD=/userdata/.yolo-app-starting
 case "$1" in
 	stop)
 		killall luckfox_video_hud_stream_cam rkaiq_3A_server 2>/dev/null
@@ -14,7 +21,18 @@ export PATH=/oem/usr/bin:$PATH LD_LIBRARY_PATH=/oem/usr/lib:$LD_LIBRARY_PATH
 mkdir -p /var/log
 rkaiq_3A_server > /var/log/yolo-3a.log 2>&1 &
 sleep 2
+
+# opt-in settings for the app, e.g. LUCKFOX_HW_JPEG=1
+[ -f $APP_DIR/app.env ] && . $APP_DIR/app.env
+if [ -f $GUARD ]; then
+	echo "$(date) previous boot did not clear $GUARD: safe mode (experimental options off)" >> /var/log/yolo-stream.log
+	unset LUCKFOX_HW_JPEG LUCKFOX_VENC_FMT
+fi
+export LUCKFOX_HW_JPEG LUCKFOX_VENC_FMT
+
 if [ -x $APP_DIR/luckfox_video_hud_stream_cam ]; then
+	touch $GUARD; sync
+	( sleep 60; rm -f $GUARD; sync ) &
 	cd $APP_DIR
 	# restart if it ever exits (like systemd's Restart=on-failure on Ubuntu)
 	while true; do

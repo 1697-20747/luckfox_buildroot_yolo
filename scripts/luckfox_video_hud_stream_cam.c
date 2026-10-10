@@ -127,6 +127,17 @@ extern "C" {
 #include "rknn_api.h"
 #include "im2d.h"
 
+/* Hardware JPEG encode via Rockchip's Rockit media API (RK_MPI_VENC), the
+ * path rkipc and the SDK samples use on RV1106. Only in the Buildroot build
+ * (tools/build_app.sh defines LUCKFOX_HW_JPEG and links librockit); the
+ * Ubuntu build keeps libjpeg-turbo, where the vendor media stack isn't
+ * usable (raw MPP oopsed the kernel driver, see PROJECT_MEMORY.md). */
+#ifdef LUCKFOX_HW_JPEG
+#include "rk_mpi_sys.h"
+#include "rk_mpi_mb.h"
+#include "rk_mpi_venc.h"
+#endif
+
 #define OBJ_CLASS_NUM 80
 #define NUM_SCALES 3
 #define BOX_THRESH 0.25f
@@ -1107,11 +1118,155 @@ static unsigned long jpeg_encode_turbo(unsigned char* rgb, int w, int h) {
  * question this project had left unanswered across several sessions
  * (only the combined figure existed). out_jpeg_ms/out_net_ms report
  * each alone. */
+#ifdef LUCKFOX_HW_JPEG
+/* One DMA buffer the frame is copied into, encoded by VENC channel 0 in
+ * single-picture JPEG mode. The finished JPEG is sent straight from the
+ * encoder's output buffer (no copy). Input format: RGB888 if the encoder
+ * takes it (no conversion at all), otherwise NV12 converted on the CPU --
+ * LUCKFOX_VENC_FMT=nv12 forces the latter.
+ *
+ * OPT-IN (LUCKFOX_HW_JPEG=1), libjpeg otherwise. Real result 2026-10-10:
+ * the first attempt (RGB888 input) froze the whole board within seconds of
+ * startup, before any frame was encoded -- no kernel log survived, needed a
+ * power cycle. Kept off by default until a variant is proven on this board. */
+#define HWJPEG_CHN 0
+#define HWJPEG_QFACTOR 50 /* same quality setting libjpeg/stb used, for a fair comparison */
+static bool g_hwjpeg = false;
+static bool g_hwjpeg_nv12 = false;
+static MB_BLK g_hwjpeg_blk = RK_NULL;
+static VENC_STREAM_S g_hwjpeg_stream;
+
+/* BT.601 limited range, the inverse of the NV12->RGB conversion used for
+ * camera capture. */
+static void rgb_to_nv12(const unsigned char* rgb, int w, int h, unsigned char* out) {
+    unsigned char* y_plane = out;
+    unsigned char* uv_plane = out + w * h;
+    for (int j = 0; j < h; j++) {
+        const unsigned char* p = rgb + j * w * 3;
+        unsigned char* yr = y_plane + j * w;
+        for (int i = 0; i < w; i++, p += 3) {
+            yr[i] = (unsigned char)(((66 * p[0] + 129 * p[1] + 25 * p[2] + 128) >> 8) + 16);
+        }
+    }
+    for (int j = 0; j < h; j += 2) {
+        const unsigned char* p = rgb + j * w * 3;
+        unsigned char* uvr = uv_plane + (j / 2) * w;
+        for (int i = 0; i < w; i += 2, p += 6) {
+            int r = p[0], g = p[1], b = p[2];
+            uvr[i] = (unsigned char)(((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128);
+            uvr[i + 1] = (unsigned char)(((112 * r - 94 * g - 18 * b + 128) >> 8) + 128);
+        }
+    }
+}
+
+static bool hwjpeg_create(int w, int h, PIXEL_FORMAT_E fmt) {
+    VENC_CHN_ATTR_S attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.stVencAttr.enType = RK_VIDEO_ID_JPEG;
+    attr.stVencAttr.enPixelFormat = fmt;
+    attr.stVencAttr.u32PicWidth = w;
+    attr.stVencAttr.u32PicHeight = h;
+    attr.stVencAttr.u32VirWidth = w;
+    attr.stVencAttr.u32VirHeight = h;
+    attr.stVencAttr.u32StreamBufCnt = 2;
+    attr.stVencAttr.u32BufSize = w * h * 3 / 2;
+    attr.stVencAttr.enMirror = MIRROR_NONE;
+    attr.stVencAttr.stAttrJpege.bSupportDCF = RK_FALSE;
+    attr.stVencAttr.stAttrJpege.stMPFCfg.u8LargeThumbNailNum = 0;
+    attr.stVencAttr.stAttrJpege.enReceiveMode = VENC_PIC_RECEIVE_SINGLE;
+    if (RK_MPI_VENC_CreateChn(HWJPEG_CHN, &attr) != RK_SUCCESS) return false;
+    VENC_JPEG_PARAM_S jp;
+    memset(&jp, 0, sizeof(jp));
+    jp.u32Qfactor = HWJPEG_QFACTOR;
+    RK_MPI_VENC_SetJpegParam(HWJPEG_CHN, &jp);
+    VENC_RECV_PIC_PARAM_S recv;
+    memset(&recv, 0, sizeof(recv));
+    recv.s32RecvPicNum = -1; /* keep accepting frames */
+    if (RK_MPI_VENC_StartRecvFrame(HWJPEG_CHN, &recv) != RK_SUCCESS) {
+        RK_MPI_VENC_DestroyChn(HWJPEG_CHN);
+        return false;
+    }
+    return true;
+}
+
+static void hwjpeg_init(int w, int h) {
+    const char* opt = getenv("LUCKFOX_HW_JPEG");
+    if (!opt || strcmp(opt, "1") != 0) { printf("RESULT: JPEG_MODE software (hardware is opt-in: LUCKFOX_HW_JPEG=1)\n"); return; }
+    if (RK_MPI_SYS_Init() != RK_SUCCESS) { printf("RESULT: JPEG_MODE software (RK_MPI_SYS_Init failed)\n"); return; }
+    const char* want = getenv("LUCKFOX_VENC_FMT");
+    bool try_rgb = !(want && !strcmp(want, "nv12"));
+    if (try_rgb && hwjpeg_create(w, h, RK_FMT_RGB888)) {
+        g_hwjpeg_nv12 = false;
+    } else if (hwjpeg_create(w, h, RK_FMT_YUV420SP)) {
+        g_hwjpeg_nv12 = true;
+    } else {
+        printf("RESULT: JPEG_MODE software (VENC channel create failed)\n");
+        RK_MPI_SYS_Exit();
+        return;
+    }
+    if (RK_MPI_SYS_MmzAlloc(&g_hwjpeg_blk, RK_NULL, RK_NULL, w * h * 3) != RK_SUCCESS) {
+        printf("RESULT: JPEG_MODE software (MmzAlloc failed)\n");
+        RK_MPI_VENC_StopRecvFrame(HWJPEG_CHN);
+        RK_MPI_VENC_DestroyChn(HWJPEG_CHN);
+        RK_MPI_SYS_Exit();
+        return;
+    }
+    g_hwjpeg_stream.pstPack = (VENC_PACK_S*)malloc(sizeof(VENC_PACK_S));
+    g_hwjpeg = true;
+    printf("RESULT: JPEG_MODE hardware VENC input=%s q=%d\n", g_hwjpeg_nv12 ? "NV12(cpu-converted)" : "RGB888", HWJPEG_QFACTOR);
+}
+
+/* Encodes one frame; on success *data/*len point into the encoder's output
+ * buffer until hwjpeg_release(). */
+static bool hwjpeg_encode(const unsigned char* rgb, int w, int h, unsigned char** data, unsigned int* len) {
+    unsigned char* dst = (unsigned char*)RK_MPI_MB_Handle2VirAddr(g_hwjpeg_blk);
+    if (g_hwjpeg_nv12) rgb_to_nv12(rgb, w, h, dst);
+    else memcpy(dst, rgb, (size_t)w * h * 3);
+    RK_MPI_SYS_MmzFlushCache(g_hwjpeg_blk, RK_FALSE);
+
+    VIDEO_FRAME_INFO_S frame;
+    memset(&frame, 0, sizeof(frame));
+    frame.stVFrame.pMbBlk = g_hwjpeg_blk;
+    frame.stVFrame.u32Width = w;
+    frame.stVFrame.u32Height = h;
+    frame.stVFrame.u32VirWidth = w;
+    frame.stVFrame.u32VirHeight = h;
+    frame.stVFrame.enPixelFormat = g_hwjpeg_nv12 ? RK_FMT_YUV420SP : RK_FMT_RGB888;
+    if (RK_MPI_VENC_SendFrame(HWJPEG_CHN, &frame, 1000) != RK_SUCCESS) return false;
+    if (RK_MPI_VENC_GetStream(HWJPEG_CHN, &g_hwjpeg_stream, 1000) != RK_SUCCESS) return false;
+    *data = (unsigned char*)RK_MPI_MB_Handle2VirAddr(g_hwjpeg_stream.pstPack->pMbBlk);
+    *len = g_hwjpeg_stream.pstPack->u32Len;
+    return true;
+}
+
+static void hwjpeg_release(void) {
+    RK_MPI_VENC_ReleaseStream(HWJPEG_CHN, &g_hwjpeg_stream);
+}
+#endif
+
 static int http_send_frame(unsigned char* rgb, int w, int h, double* out_jpeg_ms, double* out_net_ms) {
     struct timespec t0, t1, t2;
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
-    unsigned long jpeg_size = jpeg_encode_turbo(rgb, w, h);
+    unsigned char* jpeg_data = NULL;
+    unsigned long jpeg_size = 0;
+    bool hw = false;
+#ifdef LUCKFOX_HW_JPEG
+    if (g_hwjpeg) {
+        unsigned int len = 0;
+        if (hwjpeg_encode(rgb, w, h, &jpeg_data, &len)) {
+            jpeg_size = len;
+            hw = true;
+        } else {
+            printf("RESULT: HW_JPEG_ENCODE_FAILED, switching to software for good\n");
+            g_hwjpeg = false;
+        }
+    }
+#endif
+    if (!hw) {
+        jpeg_size = jpeg_encode_turbo(rgb, w, h);
+        jpeg_data = jpeg_buf;
+    }
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
 
@@ -1120,8 +1275,11 @@ static int http_send_frame(unsigned char* rgb, int w, int h, double* out_jpeg_ms
                          "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %lu\r\n\r\n", jpeg_size);
     int ret = 0;
     if (send_all(client_fd, part_header, hlen) < 0) ret = -1;
-    if (ret == 0 && send_all(client_fd, jpeg_buf, jpeg_size) < 0) ret = -1;
+    if (ret == 0 && send_all(client_fd, jpeg_data, jpeg_size) < 0) ret = -1;
     if (ret == 0 && send_all(client_fd, "\r\n", 2) < 0) ret = -1;
+#ifdef LUCKFOX_HW_JPEG
+    if (hw) hwjpeg_release();
+#endif
 
     clock_gettime(CLOCK_MONOTONIC, &t2);
     *out_jpeg_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
@@ -1202,6 +1360,9 @@ int main(int argc, char** argv) {
     g_status.display_w = display_w;
     g_status.display_h = display_h;
     g_status.source = video_path;
+#ifdef LUCKFOX_HW_JPEG
+    hwjpeg_init(display_w, display_h);
+#endif
 
     /* --- RKNN init, zero-copy I/O, ONCE --- */
     rknn_context ctx = 0;
