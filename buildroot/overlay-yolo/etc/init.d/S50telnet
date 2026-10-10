@@ -1,0 +1,4 @@
+#!/bin/sh
+# luckfox_buildroot_yolo: disabled. Replaces Buildroot's S50telnet; this board is
+# reached by SSH key only (see etc/shadow, root password locked).
+exit 0

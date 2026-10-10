@@ -1,0 +1,24 @@
+#!/bin/sh
+# luckfox_buildroot_yolo: replaces Luckfox's S21appinit. Luckfox's
+# /oem/usr/bin/RkLunch.sh still does all the board bring-up (kernel modules,
+# eth0, ISP/rkipc.ini setup), but its last step -- launching Rockchip's demo
+# camera app rkipc, which would grab the camera and NPU -- is swapped for our
+# own hook, /usr/bin/yolo-app-start, at exactly that point (after the camera
+# modules are loaded). /oem is its own partition, so RkLunch.sh is filtered
+# into /tmp at boot rather than edited.
+[ -f /etc/profile.d/RkEnv.sh ] && source /etc/profile.d/RkEnv.sh
+case $1 in
+	start)
+		sed -e 's#^\([[:space:]]*\)rkipc -a /oem/usr/share/iqfiles &#\1/usr/bin/yolo-app-start \&#' \
+		    -e 's#^\([[:space:]]*\)rkipc &#\1/usr/bin/yolo-app-start \&#' \
+		    /oem/usr/bin/RkLunch.sh > /tmp/RkLunch-yolo.sh
+		sh /tmp/RkLunch-yolo.sh
+		;;
+	stop)
+		/usr/bin/yolo-app-start stop
+		sh /oem/usr/bin/RkLunch-stop.sh
+		;;
+	*)
+		exit 1
+		;;
+esac
