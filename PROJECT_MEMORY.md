@@ -1886,3 +1886,69 @@ WiFi) -> link back; `curl http://172.32.0.70:8080/` -> HTTP 200. Patched script 
 `board/etc/init.d/S50usbdevice`; stock original at `/root/S50usbdevice.rndis.orig` on the board
 (deliberately not in `/etc/init.d/`, where an `S*` file would be executed). LAN `192.168.1.180` did
 not answer this session (cable presumably unplugged); WiFi was still `192.168.1.196`.
+
+## 2026-10-10 (later) -- web UI, then Ubuntu -> Buildroot migration, real auto-exposure, hardware JPEG
+
+**Web UI first (on Ubuntu).** The stream binary now serves its own UI on the same port: `/` (static
+`www/index.html`, self-contained, works with no internet over USB), `/stream` (single viewer; a new
+viewer takes over, the old tab offers "Take over"), `/api/status`, `/api/view` (full apex HUD or
+plain video + YOLO boxes, switched live), `/api/objects` (per-session object log, detections matched
+frame-to-frame by class + IoU so each object is listed once; wiped on disconnect/takeover). Requests
+are answered between frames with a zero-timeout `poll()`. 8.55fps on Ubuntu, unchanged.
+
+**Why the OS changed.** The live camera image on Ubuntu was near-black (mean luma ~24/255): nothing
+ran the ISP's auto-exposure. The board has Rockchip's `rkaiq_3A_server` and the sensor's IQ file
+(`sc3336_CMK-OT2119-PC1_30IRC-F16.json`) in `/oem`, but they're built for Buildroot's uClibc
+(`libc.so.0` not found) -- the same class of "vendor part outside the vendor stack" problem as the
+RKNN version mismatch and the MPP kernel oops. 1697-20747 chose to rebuild on Buildroot, with the hard
+requirement of not losing the working Ubuntu state, and only a Mac to build on (no SD slot).
+
+**Safety net first.** Git commits pushed; `/home/pico` tarball; full eMMC image streamed over SSH
+(`tools/backup_emmc.sh`, 7,650,410,496 bytes, verified); `rkdeveloptool` built for macOS (the CLT
+C++ headers needed `-isystem $(xcrun --show-sdk-path)/usr/include/c++/v1`). Real finding: with the
+SDK's merged `rv1106_download` loader, `rkdeveloptool rl` (read) fails on every sector, and the
+db-ddr + ul-usbplug sequence some guides use is rejected by upstream rkdeveloptool ("Opening loader
+failed"). Writes work: a 1 MiB random pattern written to the unpartitioned eMMC tail (sector
+14900000) read back on the booted board with a matching sha256. That's what `tools/restore_emmc.sh`
+and `tools/flash_buildroot.sh` use.
+
+**Building on the Mac.** Luckfox SDK in an amd64 Ubuntu 22.04 container, SDK in a Docker volume (case-
+sensitive). Three real failures, all "make: write jobserver: Bad file descriptor" (busybox, freetype,
+media samples) -- make 4.3's pipe-fd jobserver under emulation; fixed by GNU make 4.4.1 (FIFO
+jobserver) in the image. The SDK's partition layout is identical to the Ubuntu image's. Then a real
+image bug caught before flashing with `debugfs`: building as uid 1000 made every rootfs file uid 1000
+(`/etc/shadow` also 0755 from the overlays' `rsync --chmod`, setuid busybox lost) -- fixed by
+`buildroot/fix_ownership.py` (hooked into every copy of the SDK's `mkfs_ext4.sh`; owner/mode
+restored from Buildroot's own `rootfs.tar`).
+
+**First boot.** Stock image uses RNDIS (no macOS driver), so the overlay carries this morning's NCM
+change, `172.32.0.70`, and the Mac's SSH key. SSH answered 9s after reboot. 130MB available at idle
+(Ubuntu ~80MB), WiFi (AIC8800) up out of the box, RKNN runtime 1.6.0 (models load unchanged).
+**Auto-exposure confirmed:** `sample_vi` with the IQ file, mean luma 24 (frame 2) -> 127 (frame 90),
+a correctly exposed colour image.
+
+**Lockdown.** Luckfox's `RkLunch.sh` still does bring-up, but its final `rkipc` launch is swapped
+(filtered copy in /tmp, `/oem` is a separate partition) for `/usr/bin/yolo-app-start`. telnetd and
+Samba stubbed out, all passwords locked (key login only), and adbd's always-on TCP 5555 (an
+unauthenticated root shell on WiFi) dropped by iptables. ADB over the USB cable stays as a fallback.
+
+**Stream server on Buildroot.** Cross-built with the SDK's uclibc toolchain. The repo's
+`scripts/apex_hud_widgets.h` turned out older than the board's (the Ubuntu build only worked from the
+board's copy) -- restored. IJG libjpeg 9 (no NEON, not even in the image -- shipped next to the
+binary) made JPEG 83-93ms: 5.4fps.
+
+**Hardware JPEG (Rockit `RK_MPI_VENC`).** Rockchip's own `rk_mpi_venc_test` encoded an NV12 camera
+frame fine, so the driver works. Two real freezes on the way, each needing a power cycle:
+(1) RGB888 VENC input froze the board within seconds of startup, before any frame; (2) `killall` on
+a process mid-encode froze it -- pinned down by streaming `/proc/kmsg` to the Mac (BusyBox `dmesg`
+has no `-w`). Fixes: NV12 input only (RGB888 behind `LUCKFOX_VENC_FMT=rgb`); graceful SIGTERM
+shutdown with quit signals blocked around VENC calls -- 5/5 stop-while-encoding rounds clean.
+NV12 must be full range (JFIF); limited range looked washed out, and full-range chroma needs
+clamping (pure red/blue reach 256). A boot-loop guard in `yolo-app-start` forces safe mode if a boot
+never clears its marker (it fired for real once -- a false alarm from killing the script's timer;
+`stop` now clears it). **Result, measured after a reboot: 8.9fps, JPEG 13ms, infer 76ms, CPU 44%,
+135MB available** -- vs Ubuntu 8.5fps / JPEG 26ms / ~95MB.
+
+**Not ported yet:** MPU-6050 (needs the device-tree fix in the SDK kernel), docs site. Camera is
+mounted rotated 90 degrees (image sideways).
+

@@ -5,6 +5,15 @@ RKNN — a possible offload target for detection/positional processing that's be
 Raspberry Pi 5 CPU. See `PROJECT_MEMORY.md` for the full real, dated history of what's actually
 been tried and found — this README is just the current entry point.
 
+> **2026-10-10: the board now runs Luckfox's Buildroot image, not Ubuntu.** Much of this README
+> describes the Ubuntu era (the `pico` user, systemd units, apt, on-device `g++`). Current setup:
+> `ssh root@172.32.0.70` (key only) over the USB cable; web UI at `http://172.32.0.70:8080/`,
+> started at boot by `/usr/bin/yolo-app-start`; build on the Mac with `tools/build_app.sh`, deploy
+> with `tools/deploy_app.sh`; rebuild/flash the OS with the SDK in Docker (`docker/sdk.Dockerfile`,
+> `buildroot/`, `tools/flash_buildroot.sh`). Back to Ubuntu: `tools/restore_emmc.sh` with the image
+> in `board_backup/`. Live camera now has real auto-exposure, and JPEG is hardware-encoded: 8.9fps.
+> See `CHANGELOG.md` / `PROJECT_MEMORY.md` 2026-10-10.
+
 **Why this whole pipeline is plain C, not Python: a deliberate choice, not a lack of Python.**
 `python3` (3.10.12) is installed on the board, and precompiled armhf Debian packages exist for both
 `python3-opencv` (`apt-cache policy` confirms `4.5.4+dfsg-9ubuntu4` on `ports.ubuntu.com`, no

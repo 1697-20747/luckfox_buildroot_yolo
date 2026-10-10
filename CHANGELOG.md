@@ -5,6 +5,31 @@ Terse, dated, factual record of real changes to this project. For the full narra
 
 ## 2026-10-10
 
+- **Board moved from Ubuntu 22.04 to Luckfox's Buildroot SDK image** (Pico Ultra eMMC config,
+  SDK `824b817`), built on the Mac in Docker (`docker/sdk.Dockerfile`, amd64, SDK in a
+  case-sensitive volume), flashed from the Mac in maskrom with `tools/flash_buildroot.sh`. Reason:
+  on Ubuntu the camera had no auto-exposure (vendor `rkaiq_3A_server` is uClibc-only), raw MPP
+  oopsed the kernel, RAM was tight. Ubuntu is recoverable byte-for-byte: verified full eMMC image
+  in `board_backup/` + `tools/restore_emmc.sh` (write path verified from macOS).
+  Login is now `root@172.32.0.70` by SSH key only (all passwords locked).
+- **Build fixes:** GNU make 4.4.1 in the SDK image (make 4.3's jobserver died with "write
+  jobserver: Bad file descriptor" under emulation, three times); `buildroot/fix_ownership.py`
+  hooked into the SDK's `mkfs_ext4.sh` (building as uid 1000 had made every rootfs file uid 1000,
+  `/etc/shadow` 0755, setuid lost).
+- **Rootfs overlay `buildroot/overlay-yolo`:** USB NCM at `172.32.0.70` (macOS needs it), SSH key,
+  Rockchip's demo `rkipc` replaced by `/usr/bin/yolo-app-start` (3A server + our stream server,
+  restart loop, boot-loop guard), telnetd/Samba disabled, ADB's always-on TCP 5555 firewalled.
+- **Camera exposure fixed:** vendor 3A server with the sensor's IQ file; mean luma 24 -> 127.
+- **Stream server cross-built for Buildroot** (`tools/build_app.sh`, `tools/deploy_app.sh`).
+  Repo's `scripts/apex_hud_widgets.h` was stale vs the board's copy; restored.
+- **Hardware JPEG via Rockit VENC:** 8.9fps at 960x540 (JPEG 13ms, CPU 44%, 135MB free) vs 8.5fps
+  on Ubuntu with libjpeg-turbo. Two board freezes found and fixed on the way: RGB888 VENC input
+  (now off unless `LUCKFOX_VENC_FMT=rgb`) and `killall` mid-encode (now a graceful SIGTERM
+  shutdown, 5/5 stop-while-encoding rounds clean). Full-range NV12 conversion (limited range looked
+  washed out).
+- **Not ported yet:** MPU-6050 accelerometer (device-tree fix), docs site. WiFi (AIC8800) works out
+  of the box on Buildroot.
+
 - **USB from a Mac is now a permanent connection option** (`ssh pico@172.32.0.70`,
   `http://172.32.0.70:8080/`). Root cause it didn't work: stock `/etc/init.d/S50usbdevice` exposes
   the network over RNDIS, which macOS has no driver for. Patched it to CDC-NCM (kernel already has
