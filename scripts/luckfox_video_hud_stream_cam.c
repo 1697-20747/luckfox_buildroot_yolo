@@ -772,6 +772,12 @@ static void draw_plain_overlay(image_buffer_t* img, const std::vector<Detection>
  * served instead, so the stream is never unreachable. */
 static int server_fd = -1;
 static int client_fd = -1;
+/* Set by SIGTERM/SIGINT: the main loops finish the current frame and exit
+ * through the normal cleanup path. Real reason (2026-10-10): `killall` on a
+ * process in the middle of a Rockit VENC call deadlocked the encoder driver
+ * and froze the whole board; the hardware encoder must be shut down cleanly. */
+static volatile sig_atomic_t g_quit = 0;
+static void on_quit_signal(int) { g_quit = 1; }
 static const char* g_web_root = "www";
 
 static struct {
@@ -1056,7 +1062,7 @@ static int http_start_server(int port) {
 static void http_wait_for_client() {
     printf("Waiting for a browser to connect...\n");
     g_status.streaming = 0;
-    while (client_fd < 0) http_accept_one();
+    while (client_fd < 0 && !g_quit) http_accept_one();
     g_status.streaming = 1;
 }
 
@@ -1121,14 +1127,19 @@ static unsigned long jpeg_encode_turbo(unsigned char* rgb, int w, int h) {
 #ifdef LUCKFOX_HW_JPEG
 /* One DMA buffer the frame is copied into, encoded by VENC channel 0 in
  * single-picture JPEG mode. The finished JPEG is sent straight from the
- * encoder's output buffer (no copy). Input format: RGB888 if the encoder
- * takes it (no conversion at all), otherwise NV12 converted on the CPU --
- * LUCKFOX_VENC_FMT=nv12 forces the latter.
+ * encoder's output buffer (no copy). Input: NV12, converted from the HUD's
+ * RGB on the CPU (full range, ~a few ms at 960x540).
  *
- * OPT-IN (LUCKFOX_HW_JPEG=1), libjpeg otherwise. Real result 2026-10-10:
- * the first attempt (RGB888 input) froze the whole board within seconds of
- * startup, before any frame was encoded -- no kernel log survived, needed a
- * power cycle. Kept off by default until a variant is proven on this board. */
+ * OPT-IN (LUCKFOX_HW_JPEG=1, set in /root/rknn_test/app.env), libjpeg
+ * otherwise. Real results 2026-10-10 on this board:
+ *  - RGB888 input (would skip the conversion) froze the whole board within
+ *    seconds of startup, before any frame -- power cycle needed. Only tried
+ *    now if LUCKFOX_VENC_FMT=rgb is set explicitly.
+ *  - NV12 input: 9.0fps (JPEG 12-13.5ms incl. conversion) vs 5.4fps with
+ *    IJG libjpeg and 8.5fps with libjpeg-turbo on Ubuntu.
+ *  - killall mid-encode froze the board too; fixed by the graceful SIGTERM
+ *    shutdown (g_quit, hwjpeg_shutdown) -- 5/5 stop-while-encoding rounds
+ *    clean afterwards. */
 #define HWJPEG_CHN 0
 #define HWJPEG_QFACTOR 50 /* same quality setting libjpeg/stb used, for a fair comparison */
 static bool g_hwjpeg = false;
@@ -1136,8 +1147,11 @@ static bool g_hwjpeg_nv12 = false;
 static MB_BLK g_hwjpeg_blk = RK_NULL;
 static VENC_STREAM_S g_hwjpeg_stream;
 
-/* BT.601 limited range, the inverse of the NV12->RGB conversion used for
- * camera capture. */
+/* Full-range BT.601 (JFIF's YCbCr, 0-255), which is what the JPEG encoder
+ * expects. Real result: limited-range (16-235) input here made the hardware
+ * JPEGs look washed out -- blacks lifted to grey, low contrast. */
+static inline unsigned char clamp_u8(int v) { return (unsigned char)(v < 0 ? 0 : (v > 255 ? 255 : v)); }
+
 static void rgb_to_nv12(const unsigned char* rgb, int w, int h, unsigned char* out) {
     unsigned char* y_plane = out;
     unsigned char* uv_plane = out + w * h;
@@ -1145,7 +1159,7 @@ static void rgb_to_nv12(const unsigned char* rgb, int w, int h, unsigned char* o
         const unsigned char* p = rgb + j * w * 3;
         unsigned char* yr = y_plane + j * w;
         for (int i = 0; i < w; i++, p += 3) {
-            yr[i] = (unsigned char)(((66 * p[0] + 129 * p[1] + 25 * p[2] + 128) >> 8) + 16);
+            yr[i] = (unsigned char)((77 * p[0] + 150 * p[1] + 29 * p[2] + 128) >> 8);
         }
     }
     for (int j = 0; j < h; j += 2) {
@@ -1153,8 +1167,9 @@ static void rgb_to_nv12(const unsigned char* rgb, int w, int h, unsigned char* o
         unsigned char* uvr = uv_plane + (j / 2) * w;
         for (int i = 0; i < w; i += 2, p += 6) {
             int r = p[0], g = p[1], b = p[2];
-            uvr[i] = (unsigned char)(((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128);
-            uvr[i + 1] = (unsigned char)(((112 * r - 94 * g - 18 * b + 128) >> 8) + 128);
+            /* clamp: pure blue/red reach 256 with these coefficients */
+            uvr[i] = clamp_u8(((-43 * r - 85 * g + 128 * b + 128) >> 8) + 128);
+            uvr[i + 1] = clamp_u8(((128 * r - 107 * g - 21 * b + 128) >> 8) + 128);
         }
     }
 }
@@ -1194,7 +1209,7 @@ static void hwjpeg_init(int w, int h) {
     if (!opt || strcmp(opt, "1") != 0) { printf("RESULT: JPEG_MODE software (hardware is opt-in: LUCKFOX_HW_JPEG=1)\n"); return; }
     if (RK_MPI_SYS_Init() != RK_SUCCESS) { printf("RESULT: JPEG_MODE software (RK_MPI_SYS_Init failed)\n"); return; }
     const char* want = getenv("LUCKFOX_VENC_FMT");
-    bool try_rgb = !(want && !strcmp(want, "nv12"));
+    bool try_rgb = want && !strcmp(want, "rgb");
     if (try_rgb && hwjpeg_create(w, h, RK_FMT_RGB888)) {
         g_hwjpeg_nv12 = false;
     } else if (hwjpeg_create(w, h, RK_FMT_YUV420SP)) {
@@ -1242,6 +1257,16 @@ static bool hwjpeg_encode(const unsigned char* rgb, int w, int h, unsigned char*
 static void hwjpeg_release(void) {
     RK_MPI_VENC_ReleaseStream(HWJPEG_CHN, &g_hwjpeg_stream);
 }
+
+static void hwjpeg_shutdown(void) {
+    if (!g_hwjpeg_blk) return;
+    RK_MPI_VENC_StopRecvFrame(HWJPEG_CHN);
+    RK_MPI_VENC_DestroyChn(HWJPEG_CHN);
+    RK_MPI_SYS_MmzFree(g_hwjpeg_blk);
+    g_hwjpeg_blk = RK_NULL;
+    RK_MPI_SYS_Exit();
+    printf("RESULT: HW_JPEG_SHUTDOWN clean\n");
+}
 #endif
 
 static int http_send_frame(unsigned char* rgb, int w, int h, double* out_jpeg_ms, double* out_net_ms) {
@@ -1252,6 +1277,12 @@ static int http_send_frame(unsigned char* rgb, int w, int h, double* out_jpeg_ms
     unsigned long jpeg_size = 0;
     bool hw = false;
 #ifdef LUCKFOX_HW_JPEG
+    sigset_t quit_sigs, old_sigs;
+    sigemptyset(&quit_sigs);
+    sigaddset(&quit_sigs, SIGTERM);
+    sigaddset(&quit_sigs, SIGINT);
+    bool sigs_blocked = g_hwjpeg;
+    if (sigs_blocked) sigprocmask(SIG_BLOCK, &quit_sigs, &old_sigs);
     if (g_hwjpeg) {
         unsigned int len = 0;
         if (hwjpeg_encode(rgb, w, h, &jpeg_data, &len)) {
@@ -1279,6 +1310,7 @@ static int http_send_frame(unsigned char* rgb, int w, int h, double* out_jpeg_ms
     if (ret == 0 && send_all(client_fd, "\r\n", 2) < 0) ret = -1;
 #ifdef LUCKFOX_HW_JPEG
     if (hw) hwjpeg_release();
+    if (sigs_blocked) sigprocmask(SIG_SETMASK, &old_sigs, NULL);
 #endif
 
     clock_gettime(CLOCK_MONOTONIC, &t2);
@@ -1300,6 +1332,15 @@ int main(int argc, char** argv) {
      * shutdown noise; the live-camera path has no ffmpeg to mask it,
      * which is how this got caught for real. */
     signal(SIGPIPE, SIG_IGN);
+    {
+        /* no SA_RESTART: a blocking accept()/capture returns EINTR so the
+         * loops notice g_quit promptly */
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = on_quit_signal;
+        sigaction(SIGTERM, &sa, NULL);
+        sigaction(SIGINT, &sa, NULL);
+    }
 
     if (argc < 3) {
         fprintf(stderr, "usage: %s model.rknn video.mp4-or-/dev/videoN [labels.txt] [http-port] [display_w] [display_h]\n", argv[0]);
@@ -1431,8 +1472,9 @@ int main(int argc, char** argv) {
     float scale_y = (float)display_h / MODEL_SIZE;
     printf("RESULT: DOWNSCALE_MODE %s\n", use_rga_downscale ? "RGA" : "CPU");
 
-    while (1) {
+    while (!g_quit) {
         http_wait_for_client();
+        if (g_quit) break;
 
         FILE* ffmpeg_pipe = NULL;
         if (!live_camera) {
@@ -1454,7 +1496,7 @@ int main(int argc, char** argv) {
         clock_gettime(CLOCK_MONOTONIC, &fps_t0);
         int client_alive = 1;
 
-        while (client_alive) {
+        while (client_alive && !g_quit) {
             struct timespec t_read_start, t_read_end;
             clock_gettime(CLOCK_MONOTONIC, &t_read_start);
             bool got_frame;
@@ -1633,6 +1675,11 @@ int main(int argc, char** argv) {
         session_reset(); /* per-session object log is wiped on disconnect */
     }
 
+    printf("RESULT: SHUTTING_DOWN\n");
+    if (client_fd >= 0) { close(client_fd); client_fd = -1; }
+#ifdef LUCKFOX_HW_JPEG
+    hwjpeg_shutdown();
+#endif
     if (live_camera) {
         enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
         ioctl(v4l2_cap.fd, VIDIOC_STREAMOFF, &type);

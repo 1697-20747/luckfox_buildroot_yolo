@@ -7,7 +7,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BOARD=root@172.32.0.70
 cd "$ROOT/build/app_src"
 # COPYFILE_DISABLE: stop macOS tar adding ._* AppleDouble files
-COPYFILE_DISABLE=1 tar -cf - luckfox_video_hud_stream_cam lib www \
+COPYFILE_DISABLE=1 tar -cf - luckfox_video_hud_stream_cam lib www app.env \
     yolov8n-optimized-rv1106-1.6.0.rknn coco_80_labels_list.txt \
   | ssh "$BOARD" 'mkdir -p /root/rknn_test && cd /root/rknn_test && tar -xf - && chown -R root:root .'
 ssh "$BOARD" 'killall luckfox_video_hud_stream_cam 2>/dev/null; true'

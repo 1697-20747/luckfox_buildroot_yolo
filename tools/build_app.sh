@@ -19,6 +19,7 @@ if [ ! -f "$OUT/utils/image_drawing.c" ]; then
 fi
 cp "$ROOT"/scripts/luckfox_video_hud_stream_cam.c "$ROOT"/scripts/apex_hud_widgets.[ch] "$OUT"/
 rm -rf "$OUT/www" && cp -R "$ROOT/scripts/www" "$OUT/www"
+cp "$ROOT/scripts/app.env" "$OUT/app.env"
 
 docker run --rm --platform linux/amd64 -v luckfox-sdk:/sdk -v "$OUT":/src luckfox-sdk bash -c '
 set -e

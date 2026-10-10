@@ -13,6 +13,9 @@ APP_DIR=/root/rknn_test
 GUARD=/userdata/.yolo-app-starting
 case "$1" in
 	stop)
+		# a deliberate stop is not a hang: clear the boot-loop guard too
+		# (killing this script also kills its 60s clear-the-guard timer)
+		rm -f $GUARD; sync
 		killall luckfox_video_hud_stream_cam rkaiq_3A_server 2>/dev/null
 		exit 0
 		;;
