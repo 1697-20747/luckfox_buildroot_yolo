@@ -3,6 +3,18 @@
 Terse, dated, factual record of real changes to this project. For the full narrative/discovery log
 (why, what was tried, what failed), see `PROJECT_MEMORY.md` — this file is the short version.
 
+## 2026-10-10
+
+- **USB from a Mac is now a permanent connection option** (`ssh pico@172.32.0.70`,
+  `http://172.32.0.70:8080/`). Root cause it didn't work: stock `/etc/init.d/S50usbdevice` exposes
+  the network over RNDIS, which macOS has no driver for. Patched it to CDC-NCM (kernel already has
+  `CONFIG_USB_CONFIGFS_NCM=y`), created first so it keeps the `usb0` name, with fixed dev/host MACs
+  (`02:4c:46:00:00:70` / `a2:77:da:49:66:9e`) so the Mac keeps its static `172.32.0.1/16` config.
+  ADB function unchanged. Copy in `board/etc/init.d/S50usbdevice`; stock original at
+  `/root/S50usbdevice.rndis.orig` on the board. Verified: real reboot (Mac reconnected with no
+  manual step), `S50usbdevice restart` (the path `rc.local` runs on USB disconnect), and the stream
+  serving HTTP 200 over USB with `luckfox-video-stream` active.
+
 ## 2026-09-20
 
 - **Connectivity decision: single viewer, point-to-point, no dedicated router.** Dropped the

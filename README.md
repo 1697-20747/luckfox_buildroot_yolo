@@ -112,11 +112,13 @@ the same binary already serves this over whichever link is up, with no code chan
 - **WiFi (current default path):** `http://<wifi-ip>:<port>/`, e.g. `http://192.168.1.196:8080/` —
   works today, as documented above.
 - **USB (preferred going forward — one cable for both power and data, no access point needed):**
-  the board already presents a `usb0` USB-gadget network interface at `172.32.0.70/16` over the
-  same USB cable used to power it (confirmed present in `LUCKFOX_ACCESS.local.md`, though not yet
-  re-confirmed *while the video-stream service is running* — that's the next on-device check).
-  Once confirmed, the browser target is just `http://172.32.0.70:8080/` with the laptop's USB
-  network interface as the only thing that needs to be up — no WiFi, no LAN, no router.
+  `ssh pico@172.32.0.70` / `http://172.32.0.70:8080/` over the same USB cable used to power the
+  board. **Verified working from a Mac 2026-10-10, across a real reboot and with the stream service
+  running.** The stock gadget used RNDIS, which macOS has no driver for (the Mac saw an `rk3xxx`
+  USB device but never got a network interface), so `board/etc/init.d/S50usbdevice` switches it to
+  CDC-NCM (native on macOS, Linux and Windows 11) with fixed MAC addresses. One-time Mac setup:
+  `networksetup -setmanual "rk3xxx" 172.32.0.1 255.255.0.0` — macOS remembers it, and the fixed
+  host-side MAC keeps it the same interface every boot.
 - **Mini travel router:** intentionally not used unless one of the two paths above turns out to be
   unusable on-device for a reason not yet known (e.g. `usb0` not surviving reboot, or a laptop's
   USB-gadget driver not cooperating) — not a planned part of this project's normal path.
@@ -283,6 +285,9 @@ is this project's own leaner adaptation of the decode math from it.
 - `docker/convert.Dockerfile` — the real, working Docker image for running `rknn-toolkit2 1.6.0`
   (the version matching this board's actual on-device runtime) under x86_64 emulation on Apple
   Silicon. Build/run commands are in the Dockerfile's own header comment.
+- `board/etc/init.d/S50usbdevice` — the board's USB-gadget init script, patched from stock RNDIS
+  to CDC-NCM so a Mac gets a USB network link (installed at `/etc/init.d/S50usbdevice`; stock
+  original backed up on-board at `/root/S50usbdevice.rndis.orig`).
 - `scripts/export_yolo_rknn_1.6.0.py` — runs inside that container: ONNX → RKNN int8 for `rv1106`.
 - `scripts/clear_execstack.py` — works around a real QEMU-emulation bug (old `.so` files with an
   executable-stack flag fail to load under Rosetta/QEMU x86_64 emulation on Apple Silicon).

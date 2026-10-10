@@ -1861,3 +1861,28 @@ down/NO-CARRIER" note either way, not just assume the interface behaves the same
 the USB-gadget link too -- typically automatic on macOS/Linux via a CDC-ECM/RNDIS driver, but not
 yet confirmed against this specific board's gadget descriptor), that's the trigger for falling back
 to WiFi as the default rather than reaching for a mini router.
+
+## 2026-10-10 -- USB-from-Mac made a permanent, verified connection option (RNDIS -> CDC-NCM)
+
+Closes the 2026-09-20 "next step". With the USB cable connected, the board's `usb0` was up at
+`172.32.0.70` but the Mac had no network interface for it -- it only enumerated an `rk3xxx` device
+(VID `0x2207`). Cause: stock `/etc/init.d/S50usbdevice` (run from `/etc/rc.local` at boot, and with
+`restart` by `rc.local`'s `usb_reset` loop on every USB DISCONNECTED) binds `rndis.gs0`, and macOS
+ships no RNDIS driver. The 2026-09-20 assumption that macOS handles "CDC-ECM/RNDIS" automatically
+was half wrong: ECM/NCM yes, RNDIS no.
+
+Fix: kernel already has `CONFIG_USB_CONFIGFS_NCM=y`/`ECM=y`. Proved it at runtime first (unbind UDC,
+swap the config's `f1` link from `rndis.gs0` to a new `ncm.gs0`, rebind -> Mac immediately got
+`en14` "rk3xxx"), then patched the init script: new `NCM_EN=on`, `RNDIS_EN=off`, `ncm.gs0` created
+before any other netdev-backed function so it takes the `usb0` name (the existing
+`ifconfig usb0 172.32.0.70` line then applies unchanged), and fixed `dev_addr`/`host_addr` --
+NCM otherwise randomizes MACs each boot, and macOS keys its saved interface config to the MAC.
+`luckfox-config`'s "rndis" branch was checked: it's for a 4G modem, unrelated. Mac side:
+`networksetup -setmanual "rk3xxx" 172.32.0.1 255.255.0.0` (persists).
+
+Verified, not assumed: real reboot -> Mac reconnected at 172.32.0.1 with no manual step, board
+`usb0` = NCM with fixed MAC, `luckfox-video-stream` active; `S50usbdevice restart` (triggered over
+WiFi) -> link back; `curl http://172.32.0.70:8080/` -> HTTP 200. Patched script tracked at
+`board/etc/init.d/S50usbdevice`; stock original at `/root/S50usbdevice.rndis.orig` on the board
+(deliberately not in `/etc/init.d/`, where an `S*` file would be executed). LAN `192.168.1.180` did
+not answer this session (cable presumably unplugged); WiFi was still `192.168.1.196`.
