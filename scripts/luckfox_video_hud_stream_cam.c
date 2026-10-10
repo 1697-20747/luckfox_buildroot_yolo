@@ -88,12 +88,16 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <errno.h>
+#include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <linux/videodev2.h>
+#include <string>
 #include <vector>
 #include <algorithm>
 #include <set>
@@ -641,9 +645,384 @@ static bool v4l2_capture_frame(V4L2Capture* cap, unsigned char* out_rgb) {
     return true;
 }
 
-/* --- minimal single-client blocking MJPEG-over-HTTP server --- */
+/* --- per-session object log (2026-10-10, web UI) ---
+ * A "session" is one stream viewer's connection: it starts on /stream and
+ * the log is wiped when that viewer disconnects or is taken over. Raw
+ * per-frame detections would list the same car ~8 times a second, so
+ * detections are matched frame-to-frame (same class + IoU, greedy) into
+ * objects: each real object appears once, with first/last seen and best
+ * confidence. Deliberately simple -- no motion model, so a fast object or
+ * a long occlusion can be counted twice. Lives only in RAM. */
+#define SESSION_MAX_OBJECTS 200   /* ring buffer; oldest entries roll off */
+#define TRACK_MATCH_IOU 0.3f
+#define TRACK_MAX_MISSED 8        /* ~1s at 8fps before an object counts as gone */
+
+typedef struct {
+    int id, cls_id, missed;
+    float best_score;
+    double first_s, last_s;
+    Detection box;
+    bool active;
+} SessionObject;
+
+static struct {
+    int session_id;
+    struct timespec t0;
+    int total; /* objects ever created this session; ring index = (id-1) % MAX */
+    SessionObject objs[SESSION_MAX_OBJECTS];
+    int class_counts[OBJ_CLASS_NUM];
+} g_session;
+
+static double session_elapsed_s(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (now.tv_sec - g_session.t0.tv_sec) + (now.tv_nsec - g_session.t0.tv_nsec) / 1e9;
+}
+
+static void session_reset(void) {
+    g_session.session_id++;
+    g_session.total = 0;
+    memset(g_session.objs, 0, sizeof(g_session.objs));
+    memset(g_session.class_counts, 0, sizeof(g_session.class_counts));
+    clock_gettime(CLOCK_MONOTONIC, &g_session.t0);
+}
+
+static void session_update(const std::vector<Detection>& dets) {
+    double t = session_elapsed_s();
+    int n_live = std::min(g_session.total, SESSION_MAX_OBJECTS);
+    bool matched[SESSION_MAX_OBJECTS] = {false};
+    for (const Detection& d : dets) {
+        int best = -1;
+        float best_iou = TRACK_MATCH_IOU;
+        for (int i = 0; i < n_live; i++) {
+            SessionObject& o = g_session.objs[i];
+            if (!o.active || matched[i] || o.cls_id != d.cls_id) continue;
+            float v = iou(o.box, d);
+            if (v > best_iou) { best_iou = v; best = i; }
+        }
+        if (best < 0) {
+            int id = ++g_session.total;
+            best = (id - 1) % SESSION_MAX_OBJECTS;
+            SessionObject& o = g_session.objs[best];
+            o.id = id;
+            o.cls_id = d.cls_id;
+            o.best_score = 0;
+            o.first_s = t;
+            o.active = true;
+            g_session.class_counts[d.cls_id]++;
+            n_live = std::min(g_session.total, SESSION_MAX_OBJECTS);
+        }
+        SessionObject& o = g_session.objs[best];
+        matched[best] = true;
+        o.box = d;
+        o.last_s = t;
+        o.missed = 0;
+        if (d.score > o.best_score) o.best_score = d.score;
+    }
+    for (int i = 0; i < n_live; i++) {
+        SessionObject& o = g_session.objs[i];
+        if (o.active && !matched[i] && ++o.missed > TRACK_MAX_MISSED) o.active = false;
+    }
+}
+
+/* View mode, switchable live from the UI (/api/view?mode=hud|plain):
+ * full apex_hud overlay, or plain video with just the YOLO boxes. */
+static bool g_view_hud = true;
+
+static void draw_plain_overlay(image_buffer_t* img, const std::vector<Detection>& dets,
+                               float scale_x, float scale_y) {
+    int fsz = apex_hud_font_size(img, 7);
+    for (const Detection& d : dets) {
+        int x = (int)(d.x * scale_x), y = (int)(d.y * scale_y);
+        int w = (int)(d.w * scale_x), h = (int)(d.h * scale_y);
+        draw_rectangle(img, x, y, w, h, COLOR_GREEN, 2);
+        char label[96];
+        snprintf(label, sizeof(label), "%s %.0f%%", class_names[d.cls_id], d.score * 100);
+        draw_text(img, label, x, std::max(y - fsz - 4, 0), COLOR_GREEN, fsz);
+    }
+}
+
+/* --- minimal single-viewer HTTP server: web UI + MJPEG stream ---
+ *
+ * One process, one port, no threads (2026-10-10, plug-and-play web UI):
+ *   /             -> static files from the web root (index.html = the UI)
+ *   /stream       -> the MJPEG HUD stream (the single viewer slot)
+ *   /api/status   -> small JSON of live pipeline stats for the UI
+ * Single viewer by design (README "Connectivity", 2026-09-20): a new
+ * /stream request REPLACES the current viewer instead of queueing behind
+ * it -- a browser refresh or a second laptop just takes over. Pages and
+ * /api requests are answered between frames (poll() with zero timeout,
+ * so they never stall the pipeline) and immediately while idle. With no
+ * viewer the pipeline doesn't run at all: output only on connection.
+ *
+ * Web root: $LUCKFOX_WEB_ROOT, default "www" relative to the working
+ * directory (/home/pico/rknn_test/www under the systemd unit). If
+ * index.html is missing, a tiny built-in page with just the stream is
+ * served instead, so the stream is never unreachable. */
 static int server_fd = -1;
 static int client_fd = -1;
+static const char* g_web_root = "www";
+
+static struct {
+    int streaming;
+    int frame;
+    double fps, infer_ms, jpeg_ms, read_ms;
+    int dets;
+    float cpu_pct;
+    int display_w, display_h;
+    const char* source;
+    char viewer_ip[INET_ADDRSTRLEN];
+    char viewer_id[24];
+    int viewers_served;
+} g_status;
+
+static int send_all(int fd, const void* data, size_t len) {
+    const char* p = (const char*)data;
+    while (len > 0) {
+        ssize_t n = send(fd, p, len, MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1; /* includes the SO_SNDTIMEO timeout: a stalled viewer counts as gone */
+        }
+        p += n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+static void set_socket_timeouts(int fd, int seconds) {
+    struct timeval tv;
+    tv.tv_sec = seconds;
+    tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
+static void http_send_simple(int fd, const char* status, const char* ctype, const char* body, size_t len) {
+    char header[256];
+    int hlen = snprintf(header, sizeof(header),
+                        "HTTP/1.0 %s\r\nConnection: close\r\nCache-Control: no-cache\r\n"
+                        "Content-Type: %s\r\nContent-Length: %zu\r\n\r\n", status, ctype, len);
+    if (send_all(fd, header, hlen) == 0) send_all(fd, body, len);
+}
+
+static const char* content_type_for(const char* path) {
+    const char* dot = strrchr(path, '.');
+    if (!dot) return "application/octet-stream";
+    if (!strcmp(dot, ".html")) return "text/html; charset=utf-8";
+    if (!strcmp(dot, ".css")) return "text/css; charset=utf-8";
+    if (!strcmp(dot, ".js")) return "text/javascript; charset=utf-8";
+    if (!strcmp(dot, ".json")) return "application/json";
+    if (!strcmp(dot, ".svg")) return "image/svg+xml";
+    if (!strcmp(dot, ".png")) return "image/png";
+    if (!strcmp(dot, ".jpg") || !strcmp(dot, ".jpeg")) return "image/jpeg";
+    if (!strcmp(dot, ".ico")) return "image/x-icon";
+    if (!strcmp(dot, ".xml")) return "application/xml";
+    if (!strcmp(dot, ".txt")) return "text/plain; charset=utf-8";
+    if (!strcmp(dot, ".woff2")) return "font/woff2";
+    return "application/octet-stream";
+}
+
+static const char FALLBACK_INDEX[] =
+    "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
+    "<title>Luckfox</title><body style='margin:0;background:#000'>"
+    "<img src='/stream' style='width:100%;height:100vh;object-fit:contain'>";
+
+static void http_send_file(int fd, const char* url_path) {
+    char path[600];
+    if (strstr(url_path, "..")) { http_send_simple(fd, "403 Forbidden", "text/plain", "forbidden\n", 10); return; }
+    size_t ul = strlen(url_path);
+    snprintf(path, sizeof(path), "%s%s%s", g_web_root, url_path,
+             (ul == 0 || url_path[ul - 1] == '/') ? "index.html" : "");
+    struct stat st;
+    if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
+        /* /docs -> /docs/index.html */
+        strncat(path, "/index.html", sizeof(path) - strlen(path) - 1);
+    }
+    int file = open(path, O_RDONLY);
+    if (file < 0 || fstat(file, &st) != 0) {
+        if (file >= 0) close(file);
+        if (!strcmp(url_path, "/") || !strcmp(url_path, "/index.html")) {
+            http_send_simple(fd, "200 OK", "text/html; charset=utf-8", FALLBACK_INDEX, sizeof(FALLBACK_INDEX) - 1);
+        } else {
+            http_send_simple(fd, "404 Not Found", "text/plain", "not found\n", 10);
+        }
+        return;
+    }
+    char header[256];
+    int hlen = snprintf(header, sizeof(header),
+                        "HTTP/1.0 200 OK\r\nConnection: close\r\nCache-Control: no-cache\r\n"
+                        "Content-Type: %s\r\nContent-Length: %lld\r\n\r\n",
+                        content_type_for(path), (long long)st.st_size);
+    if (send_all(fd, header, hlen) == 0) {
+        char chunk[16384];
+        ssize_t n;
+        while ((n = read(file, chunk, sizeof(chunk))) > 0) {
+            if (send_all(fd, chunk, (size_t)n) < 0) break;
+        }
+    }
+    close(file);
+}
+
+static int read_mem_available_mb(void) {
+    FILE* f = fopen("/proc/meminfo", "r");
+    if (!f) return -1;
+    char line[128];
+    int kb = -1;
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "MemAvailable: %d kB", &kb) == 1) break;
+    }
+    fclose(f);
+    return kb < 0 ? -1 : kb / 1024;
+}
+
+static float read_soc_temp_c(void) {
+    FILE* f = fopen("/sys/class/thermal/thermal_zone0/temp", "r");
+    if (!f) return -1;
+    int milli = 0;
+    int ok = fscanf(f, "%d", &milli);
+    fclose(f);
+    return ok == 1 ? milli / 1000.0f : -1;
+}
+
+static void http_send_status(int fd) {
+    char body[768];
+    int len = snprintf(body, sizeof(body),
+        "{\"streaming\":%s,\"viewer_ip\":\"%s\",\"viewer_id\":\"%s\",\"viewers_served\":%d,"
+        "\"frame\":%d,\"fps\":%.2f,\"infer_ms\":%.1f,\"jpeg_ms\":%.1f,\"read_ms\":%.1f,"
+        "\"dets\":%d,\"cpu_pct\":%.0f,\"mem_avail_mb\":%d,\"soc_temp_c\":%.1f,"
+        "\"display_w\":%d,\"display_h\":%d,\"model_size\":%d,\"source\":\"%s\","
+        "\"view\":\"%s\",\"session\":%d,\"session_s\":%.0f,\"objects_total\":%d}",
+        g_status.streaming ? "true" : "false", g_status.viewer_ip, g_status.viewer_id, g_status.viewers_served,
+        g_status.frame, g_status.fps, g_status.infer_ms, g_status.jpeg_ms, g_status.read_ms,
+        g_status.dets, g_status.cpu_pct, read_mem_available_mb(), read_soc_temp_c(),
+        g_status.display_w, g_status.display_h, MODEL_SIZE, g_status.source ? g_status.source : "",
+        g_view_hud ? "hud" : "plain", g_session.session_id,
+        g_status.streaming ? session_elapsed_s() : 0.0, g_session.total);
+    http_send_simple(fd, "200 OK", "application/json", body, (size_t)len);
+}
+
+/* Newest first, at most the ring's 200 entries, plus per-class totals. */
+static void http_send_objects(int fd) {
+    std::string body;
+    body.reserve(16384);
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "{\"session\":%d,\"streaming\":%s,\"session_s\":%.1f,\"total\":%d,\"counts\":{",
+             g_session.session_id, g_status.streaming ? "true" : "false",
+             g_status.streaming ? session_elapsed_s() : 0.0, g_session.total);
+    body += tmp;
+    bool first = true;
+    for (int c = 0; c < OBJ_CLASS_NUM; c++) {
+        if (!g_session.class_counts[c]) continue;
+        snprintf(tmp, sizeof(tmp), "%s\"%s\":%d", first ? "" : ",", class_names[c], g_session.class_counts[c]);
+        body += tmp;
+        first = false;
+    }
+    body += "},\"objects\":[";
+    int n_live = std::min(g_session.total, SESSION_MAX_OBJECTS);
+    for (int k = 0; k < n_live; k++) {
+        int id = g_session.total - k;
+        const SessionObject& o = g_session.objs[(id - 1) % SESSION_MAX_OBJECTS];
+        snprintf(tmp, sizeof(tmp), "%s{\"id\":%d,\"cls\":\"%s\",\"score\":%.2f,\"first_s\":%.1f,\"last_s\":%.1f,\"active\":%s}",
+                 k ? "," : "", o.id, class_names[o.cls_id], o.best_score, o.first_s, o.last_s,
+                 o.active ? "true" : "false");
+        body += tmp;
+    }
+    body += "]}";
+    http_send_simple(fd, "200 OK", "application/json", body.data(), body.size());
+}
+
+/* Reads one request from a freshly accepted connection and answers it.
+ * Returns true if the connection became the stream viewer (kept open
+ * as client_fd); otherwise it has been answered and closed. */
+static bool http_handle_connection(int fd, const char* ipstr) {
+    set_socket_timeouts(fd, 2); /* a slow/dead client can't stall the pipeline for long */
+    char buf[2048];
+    ssize_t n = recv(fd, buf, sizeof(buf) - 1, 0);
+    if (n <= 0) { close(fd); return false; }
+    buf[n] = '\0';
+
+    char method[8] = {0}, target[512] = {0};
+    if (sscanf(buf, "%7s %511s", method, target) != 2 || strcmp(method, "GET") != 0) {
+        http_send_simple(fd, "405 Method Not Allowed", "text/plain", "GET only\n", 9);
+        close(fd);
+        return false;
+    }
+    char* query = strchr(target, '?');
+    if (query) *query++ = '\0';
+
+    if (!strcmp(target, "/stream")) {
+        if (client_fd >= 0) {
+            printf("RESULT: VIEWER_REPLACED %s -> %s\n", g_status.viewer_ip, ipstr);
+            close(client_fd);
+        }
+        client_fd = fd;
+        /* the UI tags its stream request with ?id=<random> so each tab can
+         * tell whether it is the current viewer or has been taken over */
+        g_status.viewer_id[0] = '\0';
+        if (query && !strncmp(query, "id=", 3)) {
+            size_t k = 0;
+            for (const char* q = query + 3; *q && *q != '&' && k < sizeof(g_status.viewer_id) - 1; q++) {
+                if ((*q >= '0' && *q <= '9') || (*q >= 'a' && *q <= 'z') || (*q >= 'A' && *q <= 'Z')) {
+                    g_status.viewer_id[k++] = *q;
+                }
+            }
+            g_status.viewer_id[k] = '\0';
+        }
+        snprintf(g_status.viewer_ip, sizeof(g_status.viewer_ip), "%s", ipstr);
+        g_status.viewers_served++;
+        session_reset();
+        printf("RESULT: CLIENT_CONNECTED %s\n", ipstr);
+        const char* header =
+            "HTTP/1.0 200 OK\r\n"
+            "Connection: close\r\n"
+            "Cache-Control: no-cache\r\n"
+            "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
+        if (send_all(fd, header, strlen(header)) < 0) {
+            close(fd);
+            client_fd = -1;
+            return false;
+        }
+        return true;
+    }
+    if (!strcmp(target, "/api/status")) {
+        http_send_status(fd);
+    } else if (!strcmp(target, "/api/objects")) {
+        http_send_objects(fd);
+    } else if (!strcmp(target, "/api/view")) {
+        if (query && strstr(query, "mode=plain")) g_view_hud = false;
+        else if (query && strstr(query, "mode=hud")) g_view_hud = true;
+        http_send_status(fd);
+    } else {
+        http_send_file(fd, target);
+    }
+    close(fd);
+    return false;
+}
+
+static void http_accept_one(void) {
+    struct sockaddr_in client_addr;
+    socklen_t len = sizeof(client_addr);
+    int fd = accept(server_fd, (struct sockaddr*)&client_addr, &len);
+    if (fd < 0) return;
+    char ipstr[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &client_addr.sin_addr, ipstr, sizeof(ipstr));
+    http_handle_connection(fd, ipstr);
+}
+
+/* Between frames: answer whatever is waiting (pages, /api/status, or a
+ * new /stream that takes over), never blocking. Capped per frame so a
+ * burst of page-asset requests can't starve the pipeline. */
+static void http_poll_requests(void) {
+    for (int i = 0; i < 8; i++) {
+        struct pollfd pfd;
+        pfd.fd = server_fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        if (poll(&pfd, 1, 0) <= 0 || !(pfd.revents & POLLIN)) return;
+        http_accept_one();
+    }
+}
 
 static int http_start_server(int port) {
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -655,28 +1034,19 @@ static int http_start_server(int port) {
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons(port);
     if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) { perror("bind"); return -1; }
-    listen(server_fd, 1);
+    /* backlog 8, not 1: the UI page loads a few files at once (page, then
+     * /stream and /api/status); there is still only ever one stream viewer */
+    listen(server_fd, 8);
     printf("RESULT: HTTP_SERVER_LISTENING port=%d\n", port);
     return 0;
 }
 
+/* Idle: answer pages/API requests as they come, until someone opens /stream. */
 static void http_wait_for_client() {
     printf("Waiting for a browser to connect...\n");
-    struct sockaddr_in client_addr;
-    socklen_t len = sizeof(client_addr);
-    client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &len);
-    char ipstr[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &client_addr.sin_addr, ipstr, sizeof(ipstr));
-    printf("RESULT: CLIENT_CONNECTED %s\n", ipstr);
-    /* consume the request line (ignored -- always stream the same feed) */
-    char buf[2048];
-    recv(client_fd, buf, sizeof(buf), 0);
-    const char* header =
-        "HTTP/1.0 200 OK\r\n"
-        "Connection: close\r\n"
-        "Cache-Control: no-cache\r\n"
-        "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
-    send(client_fd, header, strlen(header), 0);
+    g_status.streaming = 0;
+    while (client_fd < 0) http_accept_one();
+    g_status.streaming = 1;
 }
 
 /* libjpeg-turbo encode to an in-memory buffer via the standard
@@ -743,9 +1113,9 @@ static int http_send_frame(unsigned char* rgb, int w, int h, double* out_jpeg_ms
     int hlen = snprintf(part_header, sizeof(part_header),
                          "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %lu\r\n\r\n", jpeg_size);
     int ret = 0;
-    if (send(client_fd, part_header, hlen, 0) < 0) ret = -1;
-    if (ret == 0 && send(client_fd, jpeg_buf, jpeg_size, 0) < 0) ret = -1;
-    if (ret == 0 && send(client_fd, "\r\n", 2, 0) < 0) ret = -1;
+    if (send_all(client_fd, part_header, hlen) < 0) ret = -1;
+    if (ret == 0 && send_all(client_fd, jpeg_buf, jpeg_size) < 0) ret = -1;
+    if (ret == 0 && send_all(client_fd, "\r\n", 2) < 0) ret = -1;
 
     clock_gettime(CLOCK_MONOTONIC, &t2);
     *out_jpeg_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
@@ -777,6 +1147,7 @@ int main(int argc, char** argv) {
     int http_port = argc > 4 ? atoi(argv[4]) : HTTP_PORT_DEFAULT;
     setvbuf(stdout, NULL, _IOLBF, 0); /* line-buffer even when redirected to a file/log */
     load_labels(labels_path);
+    if (getenv("LUCKFOX_WEB_ROOT")) g_web_root = getenv("LUCKFOX_WEB_ROOT");
 
     bool live_camera = (strncmp(video_path, "/dev/video", 10) == 0);
 
@@ -822,6 +1193,9 @@ int main(int argc, char** argv) {
         display_h = v4l2_cap.height;
     }
     printf("RESULT: DISPLAY_RES %dx%d (inference stays %dx%d)\n", display_w, display_h, MODEL_SIZE, MODEL_SIZE);
+    g_status.display_w = display_w;
+    g_status.display_h = display_h;
+    g_status.source = video_path;
 
     /* --- RKNN init, zero-copy I/O, ONCE --- */
     rknn_context ctx = 0;
@@ -981,87 +1355,102 @@ int main(int argc, char** argv) {
             img.virt_addr = frame_full;
             img.size = display_w * display_h * 3;
 
-            /* apex_hud port (see PROJECT_MEMORY.md 2026-09-13) --
-             * CrosshairWidget (static), TrackBoxesWidget (real detections,
-             * reduced to bbox+class+confidence -- no azimuth/distance,
-             * that needs #32's mono-distance work), RadarMapWidget (honest
-             * grey stub, no real per-object x/y/z yet). */
-            apex_hud_draw_crosshair(&img);
-            {
-                std::vector<HudTrack> hud_tracks;
-                hud_tracks.reserve(dets.size());
-                for (auto& d : dets) {
-                    HudTrack t;
-                    t.x = d.x; t.y = d.y; t.w = d.w; t.h = d.h; t.score = d.score;
-                    t.class_name = class_names[d.cls_id];
-                    hud_tracks.push_back(t);
-                }
-                apex_hud_draw_track_boxes(&img, hud_tracks.data(), (int)hud_tracks.size(), scale_x, scale_y);
-            }
-            {
-                HudBounds radar_box;
-                radar_box.x1 = std::max((int)(display_w * 0.815f), 4);
-                radar_box.y1 = std::max((int)(display_h * 0.775f) + 4, 4);
-                radar_box.x2 = display_w - 4;
-                radar_box.y2 = std::min((int)(display_h * 0.93f), display_h - 4);
-                apex_hud_draw_radar_map_stub(&img, radar_box);
-            }
-            /* Neutral/grey stubs -- this board has no orientation/heading
-             * source (MPU-6050 raw accel only). Matches apex_hud's own
-             * real "no imu_reading" default for each of these, per
-             * PROJECT_MEMORY.md 2026-09-13 "apex_hud: full HUD pass". */
-            {
-                HudBounds cluster_box = apex_hud_cluster_bounds(&img);
-                apex_hud_draw_horizon_stub(&img, cluster_box);
-                apex_hud_draw_roll_ring_stub(&img, cluster_box);
-            }
-            {
-                HudBounds frame_box = apex_hud_frame_bounds(&img);
-                apex_hud_draw_compass_tape_stub(&img, frame_box, 0);
-                apex_hud_draw_attitude_readouts_stub(&img, frame_box);
-            }
-
-            /* always-visible HUD readout panel, top-left -- apex_hud's
-             * "always draw the instrument, neutral default when idle"
-             * convention, loosely */
-            int diag_fsz = apex_hud_font_size(&img, 7);
-            int diag_line_h = diag_fsz + 4;
-            int diag_panel_h = diag_line_h * 4 + 8;
-            int diag_panel_w = (int)(220 * img.height / 540.0f + 0.5f);
-            fill_rect(frame_full, display_w, display_h, 4, 4, diag_panel_w, diag_panel_h, 15, 15, 15);
-            char hud_line1[64], hud_line2[64], hud_line3[64], hud_line4[64];
             frame_count++;
             clock_gettime(CLOCK_MONOTONIC, &now);
             double elapsed = (now.tv_sec - fps_t0.tv_sec) + (now.tv_nsec - fps_t0.tv_nsec) / 1e9;
             double fps = elapsed > 0 ? frame_count / elapsed : 0;
             float cpu_pct = read_cpu_percent();
-            snprintf(hud_line1, 64, "frame %d  fps %.1f", frame_count, fps);
-            snprintf(hud_line2, 64, "infer %.1fms  det %zu", infer_ms, dets.size());
-            snprintf(hud_line3, 64, "cpu %.0f%%", cpu_pct);
-            snprintf(hud_line4, 64, "LUCKFOX RV1106 / yolov8n @ %dx%d disp", display_w, display_h);
-            draw_text(&img, hud_line1, 8, 8, COLOR_WHITE, diag_fsz);
-            draw_text(&img, hud_line2, 8, 8 + diag_line_h, COLOR_YELLOW, diag_fsz);
-            draw_text(&img, hud_line3, 8, 8 + diag_line_h * 2, COLOR_ORANGE, diag_fsz);
-            draw_text(&img, hud_line4, 8, 8 + diag_line_h * 3, COLOR_GREEN, diag_fsz);
+            g_status.frame = frame_count;
+            g_status.fps = fps;
+            g_status.infer_ms = infer_ms;
+            g_status.read_ms = read_ms;
+            g_status.dets = (int)dets.size();
+            g_status.cpu_pct = cpu_pct;
+            session_update(dets);
 
-            /* accelerometer readout panel, below the first -- always
-             * drawn (apex_hud convention), grey "not connected" text
-             * until a real MPU-6050 is actually found and reading */
-            {
-                HudBounds accel_box;
-                accel_box.x1 = 4;
-                accel_box.y1 = std::max((int)(display_h * 0.775f) + 4, 4);
-                accel_box.x2 = std::max((int)(display_w * 0.20f) - 4, 20);
-                accel_box.y2 = display_h - 4;
-                int has_accel = accel.found && accel.ema_initialized;
-                apex_hud_draw_accelerometer(&img, accel_box, has_accel,
-                                             accel.smoothed_x * 9.81f, accel.smoothed_y * 9.81f);
+            if (!g_view_hud) {
+                draw_plain_overlay(&img, dets, scale_x, scale_y);
+            } else {
+                /* apex_hud port (see PROJECT_MEMORY.md 2026-09-13) --
+                 * CrosshairWidget (static), TrackBoxesWidget (real detections,
+                 * reduced to bbox+class+confidence -- no azimuth/distance,
+                 * that needs #32's mono-distance work), RadarMapWidget (honest
+                 * grey stub, no real per-object x/y/z yet). */
+                apex_hud_draw_crosshair(&img);
+                {
+                    std::vector<HudTrack> hud_tracks;
+                    hud_tracks.reserve(dets.size());
+                    for (auto& d : dets) {
+                        HudTrack t;
+                        t.x = d.x; t.y = d.y; t.w = d.w; t.h = d.h; t.score = d.score;
+                        t.class_name = class_names[d.cls_id];
+                        hud_tracks.push_back(t);
+                    }
+                    apex_hud_draw_track_boxes(&img, hud_tracks.data(), (int)hud_tracks.size(), scale_x, scale_y);
+                }
+                {
+                    HudBounds radar_box;
+                    radar_box.x1 = std::max((int)(display_w * 0.815f), 4);
+                    radar_box.y1 = std::max((int)(display_h * 0.775f) + 4, 4);
+                    radar_box.x2 = display_w - 4;
+                    radar_box.y2 = std::min((int)(display_h * 0.93f), display_h - 4);
+                    apex_hud_draw_radar_map_stub(&img, radar_box);
+                }
+                /* Neutral/grey stubs -- this board has no orientation/heading
+                 * source (MPU-6050 raw accel only). Matches apex_hud's own
+                 * real "no imu_reading" default for each of these, per
+                 * PROJECT_MEMORY.md 2026-09-13 "apex_hud: full HUD pass". */
+                {
+                    HudBounds cluster_box = apex_hud_cluster_bounds(&img);
+                    apex_hud_draw_horizon_stub(&img, cluster_box);
+                    apex_hud_draw_roll_ring_stub(&img, cluster_box);
+                }
+                {
+                    HudBounds frame_box = apex_hud_frame_bounds(&img);
+                    apex_hud_draw_compass_tape_stub(&img, frame_box, 0);
+                    apex_hud_draw_attitude_readouts_stub(&img, frame_box);
+                }
+
+                /* always-visible HUD readout panel, top-left -- apex_hud's
+                 * "always draw the instrument, neutral default when idle"
+                 * convention, loosely */
+                int diag_fsz = apex_hud_font_size(&img, 7);
+                int diag_line_h = diag_fsz + 4;
+                int diag_panel_h = diag_line_h * 4 + 8;
+                int diag_panel_w = (int)(220 * img.height / 540.0f + 0.5f);
+                fill_rect(frame_full, display_w, display_h, 4, 4, diag_panel_w, diag_panel_h, 15, 15, 15);
+                char hud_line1[64], hud_line2[64], hud_line3[64], hud_line4[64];
+                snprintf(hud_line1, 64, "frame %d  fps %.1f", frame_count, fps);
+                snprintf(hud_line2, 64, "infer %.1fms  det %zu", infer_ms, dets.size());
+                snprintf(hud_line3, 64, "cpu %.0f%%", cpu_pct);
+                snprintf(hud_line4, 64, "LUCKFOX RV1106 / yolov8n @ %dx%d disp", display_w, display_h);
+                draw_text(&img, hud_line1, 8, 8, COLOR_WHITE, diag_fsz);
+                draw_text(&img, hud_line2, 8, 8 + diag_line_h, COLOR_YELLOW, diag_fsz);
+                draw_text(&img, hud_line3, 8, 8 + diag_line_h * 2, COLOR_ORANGE, diag_fsz);
+                draw_text(&img, hud_line4, 8, 8 + diag_line_h * 3, COLOR_GREEN, diag_fsz);
+
+                /* accelerometer readout panel, below the first -- always
+                 * drawn (apex_hud convention), grey "not connected" text
+                 * until a real MPU-6050 is actually found and reading */
+                {
+                    HudBounds accel_box;
+                    accel_box.x1 = 4;
+                    accel_box.y1 = std::max((int)(display_h * 0.775f) + 4, 4);
+                    accel_box.x2 = std::max((int)(display_w * 0.20f) - 4, 20);
+                    accel_box.y2 = display_h - 4;
+                    int has_accel = accel.found && accel.ema_initialized;
+                    apex_hud_draw_accelerometer(&img, accel_box, has_accel,
+                                                 accel.smoothed_x * 9.81f, accel.smoothed_y * 9.81f);
+                }
             }
 
             double jpeg_ms = 0, net_ms = 0;
             if (http_send_frame(frame_full, display_w, display_h, &jpeg_ms, &net_ms) < 0) {
                 printf("RESULT: CLIENT_DISCONNECTED after %d frames\n", frame_count);
                 client_alive = 0;
+            } else {
+                g_status.jpeg_ms = jpeg_ms;
+                http_poll_requests();
             }
 
             if (frame_count % 10 == 0) {
@@ -1074,6 +1463,7 @@ int main(int argc, char** argv) {
         if (ffmpeg_pipe) pclose(ffmpeg_pipe);
         close(client_fd);
         client_fd = -1;
+        session_reset(); /* per-session object log is wiped on disconnect */
     }
 
     if (live_camera) {
