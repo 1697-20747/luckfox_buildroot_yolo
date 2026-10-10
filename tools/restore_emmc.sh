@@ -6,13 +6,19 @@
 #   2. bash tools/restore_emmc.sh board_backup/emmc-YYYYMMDD-HHMM.img.gz
 #
 # Needs build/rkdeveloptool (macOS build of rockchip-linux/rkdeveloptool) and
-# build/rv1106_download_*.bin (made by the SDK's boot_merger from
-# rkbin/RKBOOT/RV1106MINIALL.ini). THIS OVERWRITES THE WHOLE eMMC.
+# build/rv1106_download_v1.15.108.bin, made by the SDK's boot_merger from
+# rkbin/RKBOOT/RV1106MINIALL.ini (DDR init + usbplug in one file).
+# Verified 2026-10-10 on this board from macOS: `db` with that file, then
+# `wl` writes correctly (checked by reading back on the booted board).
+# `rl` reads always fail with it, so don't use reads to check. Upstream
+# rkdeveloptool's `db` rejects the raw rv1106_ddr_*.bin ("Opening loader
+# failed"), so the db-ddr + ul-usbplug sequence some guides use doesn't
+# work with this build. THIS OVERWRITES THE WHOLE eMMC.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 RKDT="$ROOT/build/rkdeveloptool/rkdeveloptool"
-LOADER="$(ls "$ROOT"/build/rv1106_download_*.bin | head -1)"
+LOADER="$ROOT/build/rv1106_download_v1.15.108.bin"
 IMG_GZ="${1:?usage: $0 <emmc image .img.gz>}"
 
 [ -f "$IMG_GZ.sha256" ] && { echo "Checking checksum..."; shasum -a 256 -c "$IMG_GZ.sha256"; }
@@ -27,7 +33,8 @@ read -r -p "Overwrite the board's ENTIRE eMMC with $(basename "$IMG_GZ")? Type Y
 [ "$ok" = "YES" ] || { echo "Aborted, nothing written."; rm -f "$RAW"; exit 1; }
 
 "$RKDT" db "$LOADER"
-sleep 1
+sleep 2
+"$RKDT" rfi
 "$RKDT" wl 0 "$RAW"
 "$RKDT" rd
 rm -f "$RAW"
