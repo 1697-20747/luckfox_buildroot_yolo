@@ -1,0 +1,15 @@
+[Unit]
+Description=Luckfox live YOLO detection HUD stream (960x540 default)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/pico/rknn_test
+ExecStart=/home/pico/rknn_test/luckfox_video_hud_stream_cam /home/pico/rknn_test/yolov8n-optimized-rv1106-1.6.0.rknn /dev/video11 /home/pico/rknn_test/coco_80_labels_list.txt 8080
+Restart=on-failure
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target

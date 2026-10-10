@@ -1,0 +1,13 @@
+[Unit]
+Description=Load AIC8800DC WiFi/BT SDIO driver modules
+After=local-fs.target
+Before=network-pre.target NetworkManager.service
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/aic8800-wifi.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
