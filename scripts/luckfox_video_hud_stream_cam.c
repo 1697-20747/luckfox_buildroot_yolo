@@ -1058,7 +1058,13 @@ static void http_wait_for_client() {
  * enough (per its own documented contract) and only reallocs when it
  * needs to grow, avoiding a malloc/free cycle every single frame. */
 static unsigned char* jpeg_buf = NULL;
+/* jpeg_mem_dest()'s size argument is unsigned long* in libjpeg-turbo (the
+ * Ubuntu build) but size_t* in IJG libjpeg 9 (the Buildroot SDK's library). */
+#if JPEG_LIB_VERSION >= 90
+static size_t jpeg_buf_size = 0;
+#else
 static unsigned long jpeg_buf_size = 0;
+#endif
 
 static unsigned long jpeg_encode_turbo(unsigned char* rgb, int w, int h) {
     struct jpeg_compress_struct cinfo;
