@@ -100,6 +100,10 @@
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <linux/videodev2.h>
+#include <linux/dma-buf.h>
+#include <sys/un.h>
+#include <stddef.h>
+#include "yolo_camd.h"
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -669,6 +673,101 @@ static bool v4l2_capture_frame(V4L2Capture* cap, unsigned char* out_rgb) {
     nv12_to_rgb((const unsigned char*)cap->buffers[buf.index].start, cap->width, cap->height, out_rgb);
     if (ioctl(cap->fd, VIDIOC_QBUF, &buf) < 0) { perror("VIDIOC_QBUF requeue"); return false; }
     return true;
+}
+
+/* --- frames from yolo_camd (default): the camera stream lives in that
+ * process for the whole boot and is never stopped, so this server can exit
+ * and restart without restarting the stream (every eMMC hang on this board
+ * followed a stream restart -- see scripts/yolo_camd.c). Its capture buffers
+ * arrive as DMA-BUF fds and are mapped once; per frame we borrow the newest
+ * one, convert it, and hand it back. LUCKFOX_CAMD=0: capture directly. --- */
+typedef struct {
+    int sock;
+    int n;
+    struct { int fd; void* start; size_t length; } buffers[CAMD_MAX_BUFFERS];
+} CamdClient;
+
+static bool camd_open(CamdClient* c, V4L2Capture* geom) {
+    memset(c, 0, sizeof(*c));
+    c->sock = -1;
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    memcpy(addr.sun_path, CAMD_SOCKET, sizeof(CAMD_SOCKET) - 1);
+    socklen_t alen = offsetof(struct sockaddr_un, sun_path) + sizeof(CAMD_SOCKET) - 1;
+    /* yolo-app-start starts yolo_camd first; allow it a few seconds */
+    for (int tries = 0; tries < 20; tries++) {
+        c->sock = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+        if (c->sock >= 0 && connect(c->sock, (struct sockaddr*)&addr, alen) == 0) break;
+        if (c->sock >= 0) close(c->sock);
+        c->sock = -1;
+        usleep(500000);
+    }
+    if (c->sock < 0) { fprintf(stderr, "RESULT: CAMD_CONNECT_FAIL (is yolo_camd running?)\n"); return false; }
+    struct timeval tv = { 3, 0 };   /* a frame comes every ~33ms; 3s means camd is stuck */
+    setsockopt(c->sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    CamdHello h;
+    char ctrl[CMSG_SPACE(sizeof(int) * CAMD_MAX_BUFFERS)];
+    struct iovec iov = { &h, sizeof(h) };
+    struct msghdr msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_iov = &iov; msg.msg_iovlen = 1;
+    msg.msg_control = ctrl; msg.msg_controllen = sizeof(ctrl);
+    ssize_t n = recvmsg(c->sock, &msg, MSG_CMSG_CLOEXEC);
+    struct cmsghdr* cm = n > 0 ? CMSG_FIRSTHDR(&msg) : NULL;
+    if (n != (ssize_t)sizeof(h) || h.magic != CAMD_MAGIC || !cm || cm->cmsg_type != SCM_RIGHTS ||
+        h.n_buffers < 1 || h.n_buffers > CAMD_MAX_BUFFERS ||
+        cm->cmsg_len != CMSG_LEN(sizeof(int) * h.n_buffers)) {
+        fprintf(stderr, "RESULT: CAMD_HELLO_BAD\n");
+        return false;
+    }
+    int fds[CAMD_MAX_BUFFERS];
+    memcpy(fds, CMSG_DATA(cm), sizeof(int) * h.n_buffers);
+    c->n = (int)h.n_buffers;
+    for (int i = 0; i < c->n; i++) {
+        c->buffers[i].fd = fds[i];
+        c->buffers[i].length = h.length[i];
+        c->buffers[i].start = mmap(NULL, h.length[i], PROT_READ, MAP_SHARED, fds[i], 0);
+        if (c->buffers[i].start == MAP_FAILED) { c->buffers[i].start = NULL; perror("mmap camd buffer"); return false; }
+    }
+    if (h.stride != h.width) {   /* nv12_to_rgb assumes packed rows */
+        fprintf(stderr, "RESULT: CAMD_STRIDE_UNSUPPORTED stride %u width %u\n", h.stride, h.width);
+        return false;
+    }
+    memset(geom, 0, sizeof(*geom));
+    geom->fd = -1;
+    geom->width = (int)h.width;
+    geom->height = (int)h.height;
+    printf("RESULT: CAMD_CAPTURE_READY %ux%u NV12 buffers=%d (stream owned by yolo_camd)\n", h.width, h.height, c->n);
+    return true;
+}
+
+static bool camd_capture_frame(CamdClient* c, int w, int h, unsigned char* out_rgb) {
+    char cmd = 'N';
+    CamdFrame f;
+    if (send(c->sock, &cmd, 1, MSG_NOSIGNAL) != 1) { perror("camd send"); return false; }
+    if (recv(c->sock, &f, sizeof(f), 0) != (ssize_t)sizeof(f) || f.index < 0 || f.index >= c->n) {
+        perror("camd recv");
+        return false;
+    }
+    int fd = c->buffers[f.index].fd;
+    struct dma_buf_sync sync = { DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ };
+    ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
+    nv12_to_rgb((const unsigned char*)c->buffers[f.index].start, w, h, out_rgb);
+    sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+    ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
+    cmd = 'R';
+    send(c->sock, &cmd, 1, MSG_NOSIGNAL);
+    return true;
+}
+
+static void camd_close(CamdClient* c) {
+    for (int i = 0; i < c->n; i++) {
+        if (c->buffers[i].start) munmap(c->buffers[i].start, c->buffers[i].length);
+        close(c->buffers[i].fd);
+    }
+    if (c->sock >= 0) close(c->sock);
 }
 
 #ifdef LUCKFOX_ROCKIT_VI
@@ -1853,7 +1952,16 @@ int main(int argc, char** argv) {
         v4l2_cap.height = display_h;
     }
 #else
-    if (live_camera) {
+    CamdClient camd;
+    const char* camd_env = getenv("LUCKFOX_CAMD");
+    const bool use_camd = live_camera && !(camd_env && camd_env[0] == '0');
+    if (use_camd) {
+        step_mark("start: connecting to yolo_camd (camera stream stays up)");
+        if (!camd_open(&camd, &v4l2_cap)) {
+            camd_close(&camd);
+            return 1;
+        }
+    } else if (live_camera) {
         step_mark("start: opening V4L2 camera");
         if (!v4l2_open_and_configure(&v4l2_cap, video_path, display_w, display_h)) {
             printf("RESULT: V4L2_INIT_FAIL\n");
@@ -2048,7 +2156,8 @@ int main(int argc, char** argv) {
 #ifdef LUCKFOX_ROCKIT_VI
                     got_frame = rockit_cam_capture(&rk_cam, cap_frame);
 #else
-                    got_frame = v4l2_capture_frame(&v4l2_cap, cap_frame);
+                    got_frame = use_camd ? camd_capture_frame(&camd, display_w, display_h, cap_frame)
+                                         : v4l2_capture_frame(&v4l2_cap, cap_frame);
 #endif
                 } else {
                     size_t n = fread(cap_frame, 1, display_w * display_h * 3, ffmpeg_pipe);
@@ -2295,7 +2404,9 @@ int main(int argc, char** argv) {
 #ifdef LUCKFOX_ROCKIT_VI
     if (live_camera) rockit_cam_close(&rk_cam);
 #else
-    if (live_camera) {
+    if (use_camd) {
+        camd_close(&camd);   /* the stream itself keeps running in yolo_camd */
+    } else if (live_camera) {
         enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
         ioctl(v4l2_cap.fd, VIDIOC_STREAMOFF, &type);
         for (int i = 0; i < v4l2_cap.n_buffers; i++) munmap(v4l2_cap.buffers[i].start, v4l2_cap.buffers[i].length);

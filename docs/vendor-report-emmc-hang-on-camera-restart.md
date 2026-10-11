@@ -47,6 +47,8 @@ during that window — only the camera stream and rkaiq were active.
 | No 3A at all (raw V4L2 capture only) | 30 | **0** |
 | `rkaiq_3A_server` killed and started fresh, then 2 s wait, before every stream start | 30, then 3 of a 100-cycle soak | **0**, then **1** (≈1/33 overall) |
 | In-process rkaiq (uAPI2 init/prepare/start before `RK_MPI_VI`, as `sample_vi`) | 2 | **1** |
+| Persistent 3A + kernel experiment: ISP guarded writes (`rv1106_sdmmc_get_lock` callers) wait, IRQs off, for eMMC IDMAC idle | 40 | **1** (same signature) |
+| Camera stream started once at boot and never stopped; only the consumer application restarts | 100 | **0** |
 
 Ruled out: NPU activity, the hardware JPEG encoder (not linked), eMMC host runtime PM
 (`power/control=on` → still failed), IR-cut switching (no IR-cut node in the DT, nothing in the 3A log),
@@ -113,11 +115,26 @@ On this board:
 Our capture (an eMMC IDMAC write stalled in DESC_RD shortly after ISP reconfiguration) looks like the
 same class of problem.
 
-## Mitigation in use (not a fix)
+### Kernel experiment
 
-Restarting `rkaiq_3A_server` (kill, wait for exit, start, wait 2 s) before every stream start
-reduces the rate (≈1/33 restarts instead of ≈1/5) but does not remove it. The board recovers through
-a hardware-watchdog reset (~45 s). The cause inside rkaiq (or between rkaiq/ISP activity and the
-dw_mmc eMMC controller's DMA) is not visible to us — rkaiq is closed source — so we'd appreciate a
-look at what rkaiq/ISP does ~5.5 s after a stream restart that could stall the eMMC IDMAC (DDR
-frequency scaling, power-domain switching, or AXI/QoS changes would fit the timing).
+We patched `rv1106_sdmmc_get_lock()` so that, for the eMMC host, the ISP/VICAP guarded register
+writes disable interrupts and wait, up to 10 ms, until the eMMC IDMAC FSM is idle and the data state
+machine is not busy.
+
+- **The hang still occurred** (1 in 40 restarts), with the same signature at 5.7 s after
+  `stream ON`.
+- **No guarded write was logged in the seconds before the stall.** So the reset, clock-gating and
+  low-offset control writes guarded today are not, or not alone, the trigger.
+- What does rkaiq/ISP do about 5.5 s after `stream ON` that could block an AXI read by the eMMC
+  IDMAC?
+
+## What we run now
+
+The camera stream is started once at boot (3A server first) by a small daemon that never stops it.
+The application gets frames from it as DMA-BUFs and can restart freely.
+- **100 restarts, 0 failures**, against 8 in about 55 when each restart also restarted the stream.
+- A stream restart only happens if that daemon dies.
+- A hardware-watchdog supervisor recovers the board (about 45 s) if storage stops responding anyway.
+
+We'd still like the root cause fixed, since any camera reconfiguration (resolution change, second
+stream) would expose it again.

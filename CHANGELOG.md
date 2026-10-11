@@ -5,6 +5,26 @@ Terse, dated, factual record of real changes to this project. For the full narra
 
 ## 2026-10-11
 
+- **Camera stream no longer restarts with the server (`yolo_camd`).** Every eMMC hang followed a
+  camera stream restart, and the first stream start of a boot never failed. So `scripts/yolo_camd.c`
+  (static, about 250 lines) now opens `/dev/video11` once at boot and never stops it. It exports the 4
+  capture buffers as DMA-BUFs to the stream server over a unix socket (`\0yolo-camd`, SCM_RIGHTS). Per
+  frame the server borrows the newest buffer, converts it to RGB and gives it back, with no copy.
+  yolo-app-start starts 3A then camd once; a server restart touches neither. Only if camd dies are 3A
+  and the stream restarted (boot order).
+  - Result: 100 of 100 server restarts clean, with one `stream ON` for the whole run. Before:
+    option A about 1 hang in 33 restarts, persistent 3A 8 in about 55.
+  - Video unchanged: 13.95 fps.
+  - `LUCKFOX_CAMD=0` in app.env goes back to direct capture.
+
+- **Kernel experiment (not adopted): ISP writes wait for eMMC DMA idle.**
+  `buildroot/kernel-patches-experimental/0004` makes the ISP/VICAP register writes that Rockchip
+  guards with `rv1106_sdmmc_get_lock()` disable IRQs and wait, up to 10 ms, for the eMMC IDMAC to go
+  idle. That lock is a no-op on this single-core PREEMPT_NONE kernel.
+  - Persistent-3A restart test: 1 hang in 40, same signature, with no guarded write logged before
+    the stall. So those writes are not, or not alone, the trigger.
+  - Board back on kernel #7; the kernel #7 boot image is kept at `/userdata/boot-k7.img`.
+
 - **Correction: option A is a mitigation, not a fix.** The 100-cycle soak hung at cycle 3 (same
   signature), so A is about 1 failure in 33 restarts, against 1 in 5 with a persistent 3A server.
   The eMMC controller state at the hang shows a write (CMD25) with 0 of 32 blocks moved, TXDR pending

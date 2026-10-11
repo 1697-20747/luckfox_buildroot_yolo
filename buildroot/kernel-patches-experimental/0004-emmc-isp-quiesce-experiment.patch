@@ -1,0 +1,77 @@
+diff --git a/drivers/mmc/host/dw_mmc.c b/drivers/mmc/host/dw_mmc.c
+--- a/drivers/mmc/host/dw_mmc.c
++++ b/drivers/mmc/host/dw_mmc.c
+@@ -109,15 +109,60 @@
+ #if IS_ENABLED(CONFIG_CPU_RV1106)
+ static spinlock_t *g_sdmmc_ispvicap_lock;
+ 
++/*
++ * luckfox_buildroot_yolo experiment (kernel-patches/0004): on this board
++ * (cpu version 1, so the SD-only workaround is off) the eMMC host's IDMAC
++ * stalls in DESC_RD shortly after ISP reconfiguration. The lock above is a
++ * no-op on a uniprocessor PREEMPT_NONE kernel, so instead: the ISP/VICAP
++ * register writes that call rv1106_sdmmc_get_lock() run with interrupts off
++ * and only once the eMMC DMA is idle (up to 10ms), so they never overlap an
++ * eMMC transfer. Counters go to the kernel log.
++ */
++static struct dw_mci *g_emmc_quiesce_host;
++static unsigned long g_emmc_quiesce_flags;
++static unsigned long g_emmc_quiesce_calls, g_emmc_quiesce_waits, g_emmc_quiesce_timeouts;
++
++static bool dw_mci_emmc_dma_idle(struct dw_mci *host)
++{
++	return ((mci_readl(host, IDSTS) >> 13) & 0xf) == 0 &&   /* IDMAC FSM idle */
++	       !(mci_readl(host, STATUS) & BIT(10));            /* data state machine idle */
++}
++
++static void dw_mci_emmc_quiesce(struct dw_mci *host)
++{
++	int us;
++
++	g_emmc_quiesce_calls++;
++	if (pm_runtime_suspended(host->dev) || dw_mci_emmc_dma_idle(host))
++		return;
++	g_emmc_quiesce_waits++;
++	for (us = 0; us < 10000; us += 2) {
++		udelay(2);
++		if (dw_mci_emmc_dma_idle(host))
++			goto out;
++	}
++	g_emmc_quiesce_timeouts++;
++out:
++	if (printk_ratelimit())
++		pr_info("dw_mmc emmc-quiesce: calls %lu waited %lu timeouts %lu\n",
++			g_emmc_quiesce_calls, g_emmc_quiesce_waits, g_emmc_quiesce_timeouts);
++}
++
+ void rv1106_sdmmc_get_lock(void)
+ {
+ 	if (g_sdmmc_ispvicap_lock)
+ 		spin_lock(g_sdmmc_ispvicap_lock);
++	if (g_emmc_quiesce_host) {
++		local_irq_save(g_emmc_quiesce_flags);
++		dw_mci_emmc_quiesce(g_emmc_quiesce_host);
++	}
+ }
+ EXPORT_SYMBOL(rv1106_sdmmc_get_lock);
+ 
+ void rv1106_sdmmc_put_lock(void)
+ {
++	if (g_emmc_quiesce_host)
++		local_irq_restore(g_emmc_quiesce_flags);
+ 	if (g_sdmmc_ispvicap_lock)
+ 		spin_unlock(g_sdmmc_ispvicap_lock);
+ }
+@@ -3546,6 +3591,12 @@
+ 		goto err_dmaunmap;
+ 	}
+ 
++#if IS_ENABLED(CONFIG_CPU_RV1106)
++	if (!host->is_rv1106_sd && !strcmp(dev_name(host->dev), "ffa90000.mmc")) {
++		g_emmc_quiesce_host = host;
++		dev_info(host->dev, "ISP/VICAP guarded register writes wait for eMMC DMA idle (experiment)\n");
++	}
++#endif
+ 	if (host->is_rv1106_sd) {
+ #if IS_ENABLED(CONFIG_CPU_RV1106)
+ 		g_sdmmc_ispvicap_lock = &host->lock;

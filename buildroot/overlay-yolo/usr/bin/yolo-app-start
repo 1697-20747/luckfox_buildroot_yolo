@@ -16,7 +16,7 @@ case "$1" in
 		# a deliberate stop is not a hang: clear the boot-loop guard too
 		# (killing this script also kills its 60s clear-the-guard timer)
 		rm -f $GUARD; sync
-		killall luckfox_video_hud_stream_cam luckfox_video_hud_stream_rockit rkaiq_3A_server 2>/dev/null
+		killall luckfox_video_hud_stream_cam luckfox_video_hud_stream_rockit yolo_camd rkaiq_3A_server 2>/dev/null
 		exit 0
 		;;
 esac
@@ -66,12 +66,30 @@ BIN=luckfox_video_hud_stream_cam
 if [ "${LUCKFOX_PIPELINE:-v4l2}" = rockit ] && [ -x $APP_DIR/luckfox_video_hud_stream_rockit ]; then
 	BIN=luckfox_video_hud_stream_rockit
 fi
+# Camera stream owner (default, 2026-10-11): yolo_camd starts the stream once
+# and never stops it; the server takes frames from it, so a server restart no
+# longer restarts the camera stream. Update to the evidence above: option A
+# (fresh 3A per stream restart) only cut the eMMC hang to ~1 in 33 restarts,
+# and every hang followed a stream restart while the first start of a boot
+# never failed. Only if yolo_camd itself dies is the stream restarted (3A
+# first, as at boot). LUCKFOX_CAMD=0 in app.env: the server captures directly
+# again (option A behaviour).
+start_camd() {
+	$APP_DIR/yolo_camd /dev/video11 960 540 >> /var/log/yolo-camd.log 2>&1 &
+	sleep 1
+}
 # LUCKFOX_3A_RESTART=0 (experiments only): keep one 3A server across stream
 # restarts -- the configuration that triggers the eMMC hang most often.
 prepare_camera() {
 	if [ $BIN = luckfox_video_hud_stream_rockit ]; then
 		killall rkaiq_3A_server 2>/dev/null
 		sleep 2
+	elif [ "${LUCKFOX_CAMD:-1}" != 0 ] && [ -x $APP_DIR/yolo_camd ]; then
+		if ! pidof yolo_camd > /dev/null; then
+			echo "$(date) yolo_camd not running: starting 3A + camera stream" >> /var/log/yolo-stream.log
+			start_3a
+			start_camd
+		fi
 	elif [ "${LUCKFOX_3A_RESTART:-1}" = 0 ] && pidof rkaiq_3A_server > /dev/null; then
 		sleep 2
 	else
