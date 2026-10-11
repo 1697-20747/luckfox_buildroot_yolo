@@ -26,7 +26,9 @@ rkaiq_3A_server > /var/log/yolo-3a.log 2>&1 &
 sleep 2
 
 # opt-in settings for the app, e.g. LUCKFOX_HW_JPEG=1
-[ -f $APP_DIR/app.env ] && . $APP_DIR/app.env
+# set -a: everything app.env assigns is exported to the app (e.g.
+# LUCKFOX_CAM_HFOV_DEG / LUCKFOX_CAM_VFOV_DEG for navigation bearings)
+set -a; [ -f $APP_DIR/app.env ] && . $APP_DIR/app.env; set +a
 if [ -f $GUARD ]; then
 	echo "$(date) previous boot did not clear $GUARD: safe mode (experimental options off)" >> /var/log/yolo-stream.log
 	unset LUCKFOX_HW_JPEG LUCKFOX_VENC_FMT

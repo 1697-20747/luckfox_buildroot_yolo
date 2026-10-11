@@ -698,8 +698,9 @@ static void session_reset(void) {
     clock_gettime(CLOCK_MONOTONIC, &g_session.t0);
 }
 
-static void session_update(const std::vector<Detection>& dets) {
+static void session_update(const std::vector<Detection>& dets, std::vector<int>* ids_out) {
     double t = session_elapsed_s();
+    if (ids_out) ids_out->clear();
     int n_live = std::min(g_session.total, SESSION_MAX_OBJECTS);
     bool matched[SESSION_MAX_OBJECTS] = {false};
     for (const Detection& d : dets) {
@@ -725,6 +726,7 @@ static void session_update(const std::vector<Detection>& dets) {
         }
         SessionObject& o = g_session.objs[best];
         matched[best] = true;
+        if (ids_out) ids_out->push_back(o.id);
         o.box = d;
         o.last_s = t;
         o.missed = 0;
@@ -751,6 +753,58 @@ static void draw_plain_overlay(image_buffer_t* img, const std::vector<Detection>
         snprintf(label, sizeof(label), "%s %.0f%%", class_names[d.cls_id], d.score * 100);
         draw_text(img, label, x, std::max(y - fsz - 4, 0), COLOR_GREEN, fsz);
     }
+}
+
+/* --- navigation output (2026-10-11) ---
+ * Per-frame detections for other systems (e.g. the Pi 5's navigation):
+ *   /api/detections         latest frame as JSON
+ *   /api/detections/stream  Server-Sent Events, one JSON event per frame
+ * Coordinates are normalised to the frame (0..1, origin top-left); cx/cy is
+ * the bounding-box centre (YOLO gives boxes, so this approximates the
+ * object's centre of mass). "id" is the frame-to-frame track id from the
+ * session tracker. bearing/elevation (degrees, +right/+up from the optical
+ * axis) are included when LUCKFOX_CAM_HFOV_DEG / LUCKFOX_CAM_VFOV_DEG are set
+ * (pinhole model). One stream subscriber at a time; a newer one replaces it.
+ * A subscriber keeps the detector running with no video viewer, and then
+ * the HUD drawing and JPEG encode are skipped entirely. */
+static int g_nav_fd = -1;
+static std::string g_last_det_json = "{\"active\":false}";
+static float g_hfov_deg = 0, g_vfov_deg = 0;
+
+static std::string build_det_json(int frame, const std::vector<Detection>& dets, const std::vector<int>& ids,
+                                  int display_w, int display_h, int has_tilt, float pitch, float roll) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    char tmp[320];
+    snprintf(tmp, sizeof(tmp),
+             "{\"active\":true,\"frame\":%d,\"t_ms\":%lld,\"w\":%d,\"h\":%d,\"session\":%d,"
+             "\"has_tilt\":%s,\"pitch\":%.1f,\"roll\":%.1f,\"dets\":[",
+             frame, (long long)now.tv_sec * 1000 + now.tv_nsec / 1000000, display_w, display_h,
+             g_session.session_id, has_tilt ? "true" : "false", pitch, roll);
+    std::string j = tmp;
+    for (size_t i = 0; i < dets.size(); i++) {
+        const Detection& d = dets[i];
+        float bx = d.x / MODEL_SIZE, by = d.y / MODEL_SIZE, bw = d.w / MODEL_SIZE, bh = d.h / MODEL_SIZE;
+        float cx = bx + bw / 2, cy = by + bh / 2;
+        snprintf(tmp, sizeof(tmp),
+                 "%s{\"id\":%d,\"cls\":\"%s\",\"score\":%.2f,\"cx\":%.4f,\"cy\":%.4f,"
+                 "\"bx\":%.4f,\"by\":%.4f,\"bw\":%.4f,\"bh\":%.4f",
+                 i ? "," : "", i < ids.size() ? ids[i] : 0, class_names[d.cls_id], d.score, cx, cy, bx, by, bw, bh);
+        j += tmp;
+        if (g_hfov_deg > 0) {
+            float b = atanf((cx - 0.5f) * 2.0f * tanf(g_hfov_deg * (float)M_PI / 360.0f)) * 180.0f / (float)M_PI;
+            snprintf(tmp, sizeof(tmp), ",\"bearing_deg\":%.2f", b);
+            j += tmp;
+        }
+        if (g_vfov_deg > 0) {
+            float e = atanf((0.5f - cy) * 2.0f * tanf(g_vfov_deg * (float)M_PI / 360.0f)) * 180.0f / (float)M_PI;
+            snprintf(tmp, sizeof(tmp), ",\"elev_deg\":%.2f", e);
+            j += tmp;
+        }
+        j += "}";
+    }
+    j += "]}";
+    return j;
 }
 
 /* --- minimal single-viewer HTTP server: web UI + MJPEG stream ---
@@ -912,14 +966,14 @@ static void http_send_status(int fd) {
         "\"dets\":%d,\"cpu_pct\":%.0f,\"mem_avail_mb\":%d,\"soc_temp_c\":%.1f,"
         "\"display_w\":%d,\"display_h\":%d,\"model_size\":%d,\"source\":\"%s\","
         "\"view\":\"%s\",\"session\":%d,\"session_s\":%.0f,\"objects_total\":%d,"
-        "\"has_tilt\":%s,\"pitch\":%.1f,\"roll\":%.1f}",
+        "\"has_tilt\":%s,\"pitch\":%.1f,\"roll\":%.1f,\"nav_subscriber\":%s}",
         g_status.streaming ? "true" : "false", g_status.viewer_ip, g_status.viewer_id, g_status.viewers_served,
         g_status.frame, g_status.fps, g_status.infer_ms, g_status.jpeg_ms, g_status.read_ms,
         g_status.dets, g_status.cpu_pct, read_mem_available_mb(), read_soc_temp_c(),
         g_status.display_w, g_status.display_h, MODEL_SIZE, g_status.source ? g_status.source : "",
         g_view_hud ? "hud" : "plain", g_session.session_id,
         g_status.streaming ? session_elapsed_s() : 0.0, g_session.total,
-        g_status.has_tilt ? "true" : "false", g_status.pitch, g_status.roll);
+        g_status.has_tilt ? "true" : "false", g_status.pitch, g_status.roll, g_nav_fd >= 0 ? "true" : "false");
     http_send_simple(fd, "200 OK", "application/json", body, (size_t)len);
 }
 
@@ -1006,6 +1060,26 @@ static bool http_handle_connection(int fd, const char* ipstr) {
         }
         return true;
     }
+    if (!strcmp(target, "/api/detections/stream")) {
+        if (g_nav_fd >= 0) {
+            printf("RESULT: NAV_SUBSCRIBER_REPLACED\n");
+            close(g_nav_fd);
+        }
+        const char* header =
+            "HTTP/1.0 200 OK\r\n"
+            "Connection: close\r\n"
+            "Cache-Control: no-cache\r\n"
+            "Content-Type: text/event-stream\r\n\r\n";
+        if (send_all(fd, header, strlen(header)) < 0) { close(fd); return false; }
+        g_nav_fd = fd;
+        printf("RESULT: NAV_SUBSCRIBER_CONNECTED %s\n", ipstr);
+        return true;
+    }
+    if (!strcmp(target, "/api/detections")) {
+        http_send_simple(fd, "200 OK", "application/json", g_last_det_json.data(), g_last_det_json.size());
+        close(fd);
+        return false;
+    }
     if (!strcmp(target, "/api/status")) {
         http_send_status(fd);
     } else if (!strcmp(target, "/api/objects")) {
@@ -1066,8 +1140,8 @@ static int http_start_server(int port) {
 static void http_wait_for_client() {
     printf("Waiting for a browser to connect...\n");
     g_status.streaming = 0;
-    while (client_fd < 0 && !g_quit) http_accept_one();
-    g_status.streaming = 1;
+    while (client_fd < 0 && g_nav_fd < 0 && !g_quit) http_accept_one();
+    g_status.streaming = client_fd >= 0;
 }
 
 /* libjpeg-turbo encode to an in-memory buffer via the standard
@@ -1383,6 +1457,8 @@ int main(int argc, char** argv) {
     setvbuf(stdout, NULL, _IOLBF, 0); /* line-buffer even when redirected to a file/log */
     load_labels(labels_path);
     if (getenv("LUCKFOX_WEB_ROOT")) g_web_root = getenv("LUCKFOX_WEB_ROOT");
+    if (getenv("LUCKFOX_CAM_HFOV_DEG")) g_hfov_deg = atof(getenv("LUCKFOX_CAM_HFOV_DEG"));
+    if (getenv("LUCKFOX_CAM_VFOV_DEG")) g_vfov_deg = atof(getenv("LUCKFOX_CAM_VFOV_DEG"));
 
     bool live_camera = (strncmp(video_path, "/dev/video", 10) == 0);
 
@@ -1524,9 +1600,8 @@ int main(int argc, char** argv) {
         int frame_count = 0;
         struct timespec fps_t0, now;
         clock_gettime(CLOCK_MONOTONIC, &fps_t0);
-        int client_alive = 1;
 
-        while (client_alive && !g_quit) {
+        while ((client_fd >= 0 || g_nav_fd >= 0) && !g_quit) {
             struct timespec t_read_start, t_read_end;
             clock_gettime(CLOCK_MONOTONIC, &t_read_start);
             bool got_frame;
@@ -1605,7 +1680,8 @@ int main(int argc, char** argv) {
             g_status.read_ms = read_ms;
             g_status.dets = (int)dets.size();
             g_status.cpu_pct = cpu_pct;
-            session_update(dets);
+            std::vector<int> det_ids;
+            session_update(dets, &det_ids);
 
             /* tilt from gravity: roll about the sensor X axis, pitch about Y
              * (standard accelerometer-only formulas; valid while the board
@@ -1620,6 +1696,22 @@ int main(int argc, char** argv) {
             g_status.has_tilt = has_tilt;
             g_status.pitch = tilt_pitch;
             g_status.roll = tilt_roll;
+            g_status.streaming = client_fd >= 0;
+
+            /* navigation output: every frame, viewer or not */
+            g_last_det_json = build_det_json(frame_count, dets, det_ids, display_w, display_h,
+                                             has_tilt, tilt_pitch, tilt_roll);
+            if (g_nav_fd >= 0) {
+                std::string ev = "data: " + g_last_det_json + "\n\n";
+                if (send_all(g_nav_fd, ev.data(), ev.size()) < 0) {
+                    printf("RESULT: NAV_SUBSCRIBER_DISCONNECTED\n");
+                    close(g_nav_fd);
+                    g_nav_fd = -1;
+                }
+            }
+
+            double jpeg_ms = 0, net_ms = 0;
+            if (client_fd >= 0) {
 
             if (!g_view_hud) {
                 draw_plain_overlay(&img, dets, scale_x, scale_y);
@@ -1701,14 +1793,17 @@ int main(int argc, char** argv) {
                 }
             }
 
-            double jpeg_ms = 0, net_ms = 0;
             if (http_send_frame(frame_full, display_w, display_h, &jpeg_ms, &net_ms) < 0) {
                 printf("RESULT: CLIENT_DISCONNECTED after %d frames\n", frame_count);
-                client_alive = 0;
+                close(client_fd);
+                client_fd = -1;
+                g_status.streaming = 0;
+                session_reset(); /* per-session object log is wiped on disconnect */
             } else {
                 g_status.jpeg_ms = jpeg_ms;
-                http_poll_requests();
             }
+            } /* client_fd >= 0: HUD + JPEG only when someone is watching */
+            http_poll_requests();
 
             if (frame_count % 10 == 0) {
                 printf("frame=%d fps=%.1f read_ms=%.1f downscale_ms=%.1f infer_ms=%.1f jpeg_ms=%.1f net_ms=%.1f dets=%zu\n",
@@ -1718,8 +1813,9 @@ int main(int argc, char** argv) {
         }
 
         if (ffmpeg_pipe) pclose(ffmpeg_pipe);
-        close(client_fd);
-        client_fd = -1;
+        if (client_fd >= 0) { close(client_fd); client_fd = -1; }
+        g_status.streaming = 0;
+        g_last_det_json = "{\"active\":false}";
         session_reset(); /* per-session object log is wiped on disconnect */
     }
 
