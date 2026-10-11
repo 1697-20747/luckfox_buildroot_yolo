@@ -791,6 +791,8 @@ static struct {
     char viewer_ip[INET_ADDRSTRLEN];
     char viewer_id[24];
     int viewers_served;
+    int has_tilt;
+    float pitch, roll;
 } g_status;
 
 static int send_all(int fd, const void* data, size_t len) {
@@ -903,19 +905,21 @@ static float read_soc_temp_c(void) {
 }
 
 static void http_send_status(int fd) {
-    char body[768];
+    char body[1024];
     int len = snprintf(body, sizeof(body),
         "{\"streaming\":%s,\"viewer_ip\":\"%s\",\"viewer_id\":\"%s\",\"viewers_served\":%d,"
         "\"frame\":%d,\"fps\":%.2f,\"infer_ms\":%.1f,\"jpeg_ms\":%.1f,\"read_ms\":%.1f,"
         "\"dets\":%d,\"cpu_pct\":%.0f,\"mem_avail_mb\":%d,\"soc_temp_c\":%.1f,"
         "\"display_w\":%d,\"display_h\":%d,\"model_size\":%d,\"source\":\"%s\","
-        "\"view\":\"%s\",\"session\":%d,\"session_s\":%.0f,\"objects_total\":%d}",
+        "\"view\":\"%s\",\"session\":%d,\"session_s\":%.0f,\"objects_total\":%d,"
+        "\"has_tilt\":%s,\"pitch\":%.1f,\"roll\":%.1f}",
         g_status.streaming ? "true" : "false", g_status.viewer_ip, g_status.viewer_id, g_status.viewers_served,
         g_status.frame, g_status.fps, g_status.infer_ms, g_status.jpeg_ms, g_status.read_ms,
         g_status.dets, g_status.cpu_pct, read_mem_available_mb(), read_soc_temp_c(),
         g_status.display_w, g_status.display_h, MODEL_SIZE, g_status.source ? g_status.source : "",
         g_view_hud ? "hud" : "plain", g_session.session_id,
-        g_status.streaming ? session_elapsed_s() : 0.0, g_session.total);
+        g_status.streaming ? session_elapsed_s() : 0.0, g_session.total,
+        g_status.has_tilt ? "true" : "false", g_status.pitch, g_status.roll);
     http_send_simple(fd, "200 OK", "application/json", body, (size_t)len);
 }
 
@@ -1577,6 +1581,20 @@ int main(int argc, char** argv) {
             g_status.cpu_pct = cpu_pct;
             session_update(dets);
 
+            /* tilt from gravity: roll about the sensor X axis, pitch about Y
+             * (standard accelerometer-only formulas; valid while the board
+             * isn't accelerating hard -- the EMA smoothing helps there) */
+            int has_tilt = accel.found && accel.ema_initialized;
+            float tilt_pitch = 0, tilt_roll = 0;
+            if (has_tilt) {
+                float ax = accel.smoothed_x, ay = accel.smoothed_y, az = accel.smoothed_z;
+                tilt_roll = atan2f(ay, az) * 180.0f / (float)M_PI;
+                tilt_pitch = atan2f(-ax, sqrtf(ay * ay + az * az)) * 180.0f / (float)M_PI;
+            }
+            g_status.has_tilt = has_tilt;
+            g_status.pitch = tilt_pitch;
+            g_status.roll = tilt_roll;
+
             if (!g_view_hud) {
                 draw_plain_overlay(&img, dets, scale_x, scale_y);
             } else {
@@ -1609,15 +1627,19 @@ int main(int argc, char** argv) {
                  * source (MPU-6050 raw accel only). Matches apex_hud's own
                  * real "no imu_reading" default for each of these, per
                  * PROJECT_MEMORY.md 2026-09-13 "apex_hud: full HUD pass". */
+                /* Pitch/roll from the MPU-6050's smoothed gravity vector
+                 * (2026-10-11; previously grey stubs). Heading needs a
+                 * magnetometer/gyro integration this board doesn't have, so
+                 * the compass tape stays a stub. */
                 {
                     HudBounds cluster_box = apex_hud_cluster_bounds(&img);
-                    apex_hud_draw_horizon_stub(&img, cluster_box);
-                    apex_hud_draw_roll_ring_stub(&img, cluster_box);
+                    apex_hud_draw_horizon(&img, cluster_box, has_tilt, tilt_pitch, tilt_roll);
+                    apex_hud_draw_roll_ring(&img, cluster_box, has_tilt, tilt_roll);
                 }
                 {
                     HudBounds frame_box = apex_hud_frame_bounds(&img);
                     apex_hud_draw_compass_tape_stub(&img, frame_box, 0);
-                    apex_hud_draw_attitude_readouts_stub(&img, frame_box);
+                    apex_hud_draw_attitude_readouts(&img, frame_box, has_tilt, tilt_pitch, tilt_roll);
                 }
 
                 /* always-visible HUD readout panel, top-left -- apex_hud's

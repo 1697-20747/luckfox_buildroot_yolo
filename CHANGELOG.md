@@ -5,6 +5,13 @@ Terse, dated, factual record of real changes to this project. For the full narra
 
 ## 2026-10-11
 
+- **HUD tilt instruments now live from the MPU-6050** (were grey "no orientation source" stubs):
+  pitch/roll from the smoothed gravity vector (`atan2`), feeding the horizon ladder (shifts with
+  pitch, rotates with roll), the roll-ring pointer and the P/R readouts; also `pitch`/`roll` in
+  `/api/status` and a "Tilt" row in the web UI. Compass tape stays a stub (heading needs a
+  magnetometer or gyro integration). Readout boxes now size to their text (bitmap glyphs ~1 font
+  size wide). No zero-offset for the mounting yet: angles are relative to the sensor's own axes.
+
 - **MPU-6050 accelerometer ported to the Buildroot kernel.** The Ubuntu-era kernel fix had only
   ever lived in a scratch SDK clone; it's now `buildroot/kernel-patches/0001-mpu6050-i2c2-polled-mode.patch`
   (applied by `buildroot/apply_kernel_patches.sh`): i2c2 enabled with an `mpu6050@68` node (header

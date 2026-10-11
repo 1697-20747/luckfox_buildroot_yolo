@@ -92,6 +92,10 @@ void apex_hud_draw_radar_map_stub(image_buffer_t* img, HudBounds bounds);
  * roll=0 ("level"), in NO_DATA_COLOR -- a real, meaningful default per
  * that file's own docstring, not a fabricated reading. */
 void apex_hud_draw_horizon_stub(image_buffer_t* img, HudBounds cluster_bounds);
+/* Live version (2026-10-11): pitch/roll in degrees from the accelerometer's
+ * gravity vector; has_data=0 draws exactly the stub above. */
+void apex_hud_draw_horizon(image_buffer_t* img, HudBounds cluster_bounds, int has_data,
+                           float pitch_deg, float roll_deg);
 
 /* RollRingWidget port (widgets/roll_ring.py) -- tick-marked arc (ticks
  * always drawn in their own fixed light-grey regardless of data, same as
@@ -102,6 +106,7 @@ void apex_hud_draw_horizon_stub(image_buffer_t* img, HudBounds cluster_bounds);
  * faithfully matches its real "no data -> not drawn" contract by simply
  * not being called. */
 void apex_hud_draw_roll_ring_stub(image_buffer_t* img, HudBounds cluster_bounds);
+void apex_hud_draw_roll_ring(image_buffer_t* img, HudBounds cluster_bounds, int has_data, float roll_deg);
 
 /* CompassTapeWidget port (widgets/compass_tape.py) -- scrolling heading
  * tape, always drawn centered on heading=0 ("unknown, default to North")
@@ -114,6 +119,8 @@ void apex_hud_draw_compass_tape_stub(image_buffer_t* img, HudBounds frame_bounds
  * "P--"/"R--" numeric placeholders at the frame's left/right edges,
  * vertically centered, in NO_DATA_COLOR (no orientation source). */
 void apex_hud_draw_attitude_readouts_stub(image_buffer_t* img, HudBounds frame_bounds);
+void apex_hud_draw_attitude_readouts(image_buffer_t* img, HudBounds frame_bounds, int has_data,
+                                     float pitch_deg, float roll_deg);
 
 #ifdef __cplusplus
 }

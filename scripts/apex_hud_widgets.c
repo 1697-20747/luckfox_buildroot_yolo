@@ -188,45 +188,63 @@ void apex_hud_draw_radar_map_stub(image_buffer_t* img, HudBounds b) {
      * per-object distance yet, see header comment. */
 }
 
-/* Neutral pitch=0/roll=0 -- horizon.py's own real "no imu_reading"
- * default, not a fabricated reading. Since roll=0 the rotation this
- * widget normally applies is the identity, so this is the ladder's
- * unrotated, unshifted layout. */
-void apex_hud_draw_horizon_stub(image_buffer_t* img, HudBounds b) {
+/* Horizon ladder, live from the MPU-6050's gravity vector when has_data
+ * (2026-10-11): ticks shift with pitch (pitch up => ladder moves down, the
+ * +10 line reaches the aircraft symbol at +10 deg) and the whole ladder
+ * rotates opposite to roll, like a real attitude indicator. Without data:
+ * pitch=0/roll=0 in NO_DATA_COLOR -- horizon.py's own "no imu_reading"
+ * default. The aircraft symbol itself never moves. */
+static void rotate_about(int cx, int cy, float dx, float dy, float c, float s, int* ox, int* oy) {
+    *ox = cx + (int)lroundf(dx * c - dy * s);
+    *oy = cy + (int)lroundf(dx * s + dy * c);
+}
+
+void apex_hud_draw_horizon(image_buffer_t* img, HudBounds b, int has_data, float pitch_deg, float roll_deg) {
+    if (!has_data) { pitch_deg = 0; roll_deg = 0; }
+    unsigned int color = has_data ? COLOR_GREEN : APEX_HUD_NO_DATA_COLOR;
     float scale = (0.4f / 0.55f); /* _SCALE_RELATIVE_TO_BOUNDS, bounds.scale=1.0 */
     int bw = b.x2 - b.x1, bh = b.y2 - b.y1;
     int center_x = (b.x1 + b.x2) / 2, center_y = (b.y1 + b.y2) / 2;
     float px_per_deg = (bh / 90.0f) * scale;
+    float a = -roll_deg * (float)M_PI / 180.0f;
+    float ca = cosf(a), sa = sinf(a);
 
     static const float TICKS_DEG[4] = {10.0f, 20.0f, -10.0f, -20.0f};
     static const float HALF_WIDTH_FRAC[4] = {0.12f, 0.20f, 0.12f, 0.20f};
     int fsz = apex_hud_font_size(img, 9);
     for (int i = 0; i < 4; i++) {
-        float tick_dy = -TICKS_DEG[i] * px_per_deg;
+        float tick_dy = -(TICKS_DEG[i] - pitch_deg) * px_per_deg;
+        if (fabsf(tick_dy) > bh / 2.0f) continue; /* scrolled out of the cluster */
         float half_w = bw * HALF_WIDTH_FRAC[i] * scale;
-        int y = center_y + (int)(tick_dy + 0.5f);
-        int x1 = center_x - (int)half_w, x2 = center_x + (int)half_w;
-        draw_line(img, x1, y, x2, y, APEX_HUD_NO_DATA_COLOR, 1);
+        int x1, y1, x2, y2, lx, ly;
+        rotate_about(center_x, center_y, -half_w, tick_dy, ca, sa, &x1, &y1);
+        rotate_about(center_x, center_y, half_w, tick_dy, ca, sa, &x2, &y2);
+        rotate_about(center_x, center_y, half_w + 3, tick_dy + 3, ca, sa, &lx, &ly);
+        draw_line(img, x1, y1, x2, y2, color, 1);
         char label[8];
         snprintf(label, sizeof(label), "%+.0f", TICKS_DEG[i]);
-        draw_text(img, label, x2 + 3, y + 3, APEX_HUD_NO_DATA_COLOR, fsz);
+        draw_text(img, label, lx, ly, color, fsz);
     }
 
     /* Fixed aircraft-symbol reference -- never rotates/shifts. */
     int wing = (int)(bw * 0.06f * scale);
-    draw_line(img, center_x - wing, center_y, center_x - wing / 3, center_y, APEX_HUD_NO_DATA_COLOR, 1);
-    draw_line(img, center_x + wing / 3, center_y, center_x + wing, center_y, APEX_HUD_NO_DATA_COLOR, 1);
-    draw_line(img, center_x - wing / 3, center_y, center_x, center_y + wing / 4, APEX_HUD_NO_DATA_COLOR, 1);
-    draw_line(img, center_x, center_y + wing / 4, center_x + wing / 3, center_y, APEX_HUD_NO_DATA_COLOR, 1);
-    draw_circle(img, center_x, center_y, 2, APEX_HUD_NO_DATA_COLOR, 2);
+    draw_line(img, center_x - wing, center_y, center_x - wing / 3, center_y, color, 1);
+    draw_line(img, center_x + wing / 3, center_y, center_x + wing, center_y, color, 1);
+    draw_line(img, center_x - wing / 3, center_y, center_x, center_y + wing / 4, color, 1);
+    draw_line(img, center_x, center_y + wing / 4, center_x + wing / 3, center_y, color, 1);
+    draw_circle(img, center_x, center_y, 2, color, 2);
+}
+
+void apex_hud_draw_horizon_stub(image_buffer_t* img, HudBounds b) {
+    apex_hud_draw_horizon(img, b, 0, 0, 0);
 }
 
 /* Ticks always draw in their own fixed light grey (matching roll_ring.py
- * exactly -- that color isn't data-conditional in the original either);
- * only the pointer (roll=0, straight up) uses NO_DATA_COLOR, since this
- * board has no real roll source. RolloverMarkerWidget is deliberately not
- * ported -- see header comment. */
-void apex_hud_draw_roll_ring_stub(image_buffer_t* img, HudBounds b) {
+ * exactly -- that color isn't data-conditional in the original either).
+ * The pointer sits at the live roll angle in TRACK_COLOR when has_data,
+ * else straight up in NO_DATA_COLOR. RolloverMarkerWidget is deliberately
+ * not ported -- see header comment. */
+void apex_hud_draw_roll_ring(image_buffer_t* img, HudBounds b, int has_data, float roll_deg) {
     int center_x = (b.x1 + b.x2) / 2, center_y = (b.y1 + b.y2) / 2;
     int bh = b.y2 - b.y1;
     int arc_radius = imax((int)(bh * (0.22f / 0.55f)), 8 + 6);
@@ -252,12 +270,26 @@ void apex_hud_draw_roll_ring_stub(image_buffer_t* img, HudBounds b) {
         }
     }
 
-    /* Pointer at roll=0 (straight up, tick_deg-90 => -90deg => cos=0,sin=-1). */
-    int tip_x = center_x;
-    int tip_y = center_y - (arc_radius - 8);
-    draw_line(img, tip_x, tip_y, tip_x - 4, tip_y - 8, APEX_HUD_NO_DATA_COLOR, 1);
-    draw_line(img, tip_x - 4, tip_y - 8, tip_x + 4, tip_y - 8, APEX_HUD_NO_DATA_COLOR, 1);
-    draw_line(img, tip_x + 4, tip_y - 8, tip_x, tip_y, APEX_HUD_NO_DATA_COLOR, 1);
+    /* Pointer: a small triangle just inside the arc at the roll angle,
+     * clamped to the ring's +-60 deg scale. */
+    if (!has_data) roll_deg = 0;
+    if (roll_deg > 60) roll_deg = 60;
+    if (roll_deg < -60) roll_deg = -60;
+    unsigned int color = has_data ? APEX_HUD_TRACK_COLOR : APEX_HUD_NO_DATA_COLOR;
+    float r = (roll_deg - 90) * (float)M_PI / 180.0f;
+    float ux = cosf(r), uy = sinf(r);  /* outward unit vector */
+    float px = -uy, py = ux;           /* perpendicular */
+    float tip_r = arc_radius - 8, base_r = arc_radius;
+    int tip_x = center_x + (int)lroundf(ux * tip_r), tip_y = center_y + (int)lroundf(uy * tip_r);
+    int b1x = center_x + (int)lroundf(ux * base_r + px * 4), b1y = center_y + (int)lroundf(uy * base_r + py * 4);
+    int b2x = center_x + (int)lroundf(ux * base_r - px * 4), b2y = center_y + (int)lroundf(uy * base_r - py * 4);
+    draw_line(img, tip_x, tip_y, b1x, b1y, color, 1);
+    draw_line(img, b1x, b1y, b2x, b2y, color, 1);
+    draw_line(img, b2x, b2y, tip_x, tip_y, color, 1);
+}
+
+void apex_hud_draw_roll_ring_stub(image_buffer_t* img, HudBounds b) {
+    apex_hud_draw_roll_ring(img, b, 0, 0);
 }
 
 /* Heading=0 ("unknown, default to North"), NO_DATA_COLOR throughout,
@@ -297,25 +329,37 @@ void apex_hud_draw_compass_tape_stub(image_buffer_t* img, HudBounds b, int posit
               apex_hud_font_size(img, 12));
 }
 
-/* "P--"/"R--" boxed placeholders -- attitude_readouts.py's own real
- * no-data default, box/font sizes scaled with resolution (the Python
+/* Boxed pitch/roll readouts: live whole degrees ("P+5", "R-12") in
+ * TRACK_COLOR when has_data, else "P--"/"R--" -- attitude_readouts.py's
+ * own no-data default. Box/font sizes scale with resolution (the Python
  * original uses fixed pixel sizes since it only ever runs at one
- * resolution; this pipeline runs at several). */
-void apex_hud_draw_attitude_readouts_stub(image_buffer_t* img, HudBounds b) {
+ * resolution; this pipeline runs at several); boxes widen to fit the text. */
+void apex_hud_draw_attitude_readouts(image_buffer_t* img, HudBounds b, int has_data, float pitch_deg, float roll_deg) {
     int center_y = (b.y1 + b.y2) / 2;
     float scale = img->height / APEX_HUD_REF_HEIGHT;
-    int box_w = imax((int)(28 * scale), 20);
+    int fsz = apex_hud_font_size(img, 12);
     int box_h = imax((int)(24 * scale), 16);
     int margin = 2;
-    int fsz = apex_hud_font_size(img, 12);
 
-    int left_x = b.x1 + margin;
-    int right_x = b.x2 - margin - box_w;
-    const char* labels[2] = {"P--", "R--"};
-    int xs[2] = {left_x, right_x};
-    for (int i = 0; i < 2; i++) {
-        int top_y = center_y - box_h / 2;
-        draw_rectangle(img, xs[i], top_y, box_w, box_h, APEX_HUD_BOX_COLOR, 1);
-        draw_text(img, labels[i], xs[i] + 2, center_y + 5, APEX_HUD_NO_DATA_COLOR, fsz);
+    char labels[2][12];
+    if (has_data) {
+        snprintf(labels[0], sizeof(labels[0]), "P%+.0f", pitch_deg);
+        snprintf(labels[1], sizeof(labels[1]), "R%+.0f", roll_deg);
+    } else {
+        snprintf(labels[0], sizeof(labels[0]), "P--");
+        snprintf(labels[1], sizeof(labels[1]), "R--");
     }
+    unsigned int text_color = has_data ? APEX_HUD_TRACK_COLOR : APEX_HUD_NO_DATA_COLOR;
+    for (int i = 0; i < 2; i++) {
+        /* glyphs measured ~1 fsz wide in this bitmap font ("P-33" ~ 48px at fsz 12) */
+        int box_w = imax(imax((int)(28 * scale), 20), (int)strlen(labels[i]) * fsz + 6);
+        int x = (i == 0) ? b.x1 + margin : b.x2 - margin - box_w;
+        int top_y = center_y - box_h / 2;
+        draw_rectangle(img, x, top_y, box_w, box_h, APEX_HUD_BOX_COLOR, 1);
+        draw_text(img, labels[i], x + 2, center_y + 5, text_color, fsz);
+    }
+}
+
+void apex_hud_draw_attitude_readouts_stub(image_buffer_t* img, HudBounds b) {
+    apex_hud_draw_attitude_readouts(img, b, 0, 0, 0);
 }

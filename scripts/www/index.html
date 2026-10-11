@@ -127,6 +127,7 @@
         <dt>CPU</dt><dd id="cpu">–</dd>
         <dt>SoC temp</dt><dd id="temp">–</dd>
         <dt>Mem available</dt><dd id="mem">–</dd>
+        <dt>Tilt</dt><dd id="tilt">–</dd>
       </dl>
     </div>
     <div class="card">
@@ -245,6 +246,9 @@
     $('cpu').textContent = fmt(s.cpu_pct, 0, ' %');
     $('temp').textContent = fmt(s.soc_temp_c, 1, ' °C');
     $('mem').textContent = fmt(s.mem_avail_mb, 0, ' MB');
+    $('tilt').textContent = s.has_tilt
+      ? 'P ' + (s.pitch > 0 ? '+' : '') + s.pitch.toFixed(0) + '°  R ' + (s.roll > 0 ? '+' : '') + s.roll.toFixed(0) + '°'
+      : '–';
     $('res').textContent = s.display_w + '×' + s.display_h;
     $('model').textContent = s.model_size + '×' + s.model_size;
     $('src').textContent = s.source;
