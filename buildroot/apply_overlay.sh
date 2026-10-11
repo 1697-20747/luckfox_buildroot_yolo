@@ -36,3 +36,17 @@ for MKFS in $SDK/sysdrv/tools/pc/e2fsprogs/mkfs_ext4.sh $SDK/sysdrv/out/bin/pc/m
     fi
     echo "hooked: $MKFS"
 done
+
+# Mount root read-write at boot (kernel "rw"). Stock Luckfox boots root
+# read-only and inittab remounts it rw -- but after a hard power loss ext4
+# refuses that remount while it has an orphan-inode list to process
+# ("Couldn't remount RDWR because of unprocessed orphan inode list"), which
+# left the board with a read-only root (seen 2026-10-11). Mounting rw from the
+# start lets ext4 replay its journal and clear orphans on every boot.
+# $SDK/build.sh is a symlink to project/build.sh: edit the real file (sed -i
+# on the symlink would replace it with a copy that runs from the wrong dir).
+BUILD_SH=$(readlink -f $SDK/build.sh)
+if ! grep -q 'SYS_BOOTARGS="sys_bootargs= rw"' "$BUILD_SH"; then
+    sed -i 's/^\(\s*\)SYS_BOOTARGS="sys_bootargs="$/\1SYS_BOOTARGS="sys_bootargs= rw"/' "$BUILD_SH"
+fi
+grep -n 'SYS_BOOTARGS="sys_bootargs' "$BUILD_SH"

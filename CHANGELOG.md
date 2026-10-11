@@ -5,6 +5,18 @@ Terse, dated, factual record of real changes to this project. For the full narra
 
 ## 2026-10-11
 
+- **Root filesystem survives power loss:** after repeated hard power cycles the board came up with
+  a READ-ONLY root ("Couldn't remount RDWR because of unprocessed orphan inode list": stock Luckfox
+  mounts root ro, then inittab remounts rw, which ext4 refuses while orphans are pending). Repaired
+  with e2fsck on the ro root + `reboot -f`; fixed for good by booting with `rw` on the kernel command
+  line (`apply_overlay.sh` patches `project/build.sh`; env partition rewritten live, old one backed
+  up), so ext4 replays its journal on mount. Verified: cmdline has `rw`, root rw at boot.
+- **Stream server feeds the hardware watchdog itself** (arms after start-up, kicks with the
+  heartbeat unless an NPU job is overdue, disarms after full teardown); NPU worker thread blocks
+  SIGTERM/SIGINT/SIGPIPE/SIGALRM. Restart stress: 18/19 clean (was ~1 in 3-5 failing); the 19th
+  lost the USB link without a watchdog reset, i.e. the server kept running -- `yolo-healthlog`
+  now records usb0 counters/state, heartbeat age and USB kernel messages to /userdata every 5s.
+
 - **Three-stage NPU/CPU pipeline:** an NPU worker thread runs YOLO on frame N while the main
   thread captures/prepares N+1 and draws/encodes N-1 with N-1's own detections (3 frame buffers,
   2 NPU input tensors). Measured: video **7.8 -> 14.2fps**, navigation-only **10.3 -> 15.0Hz**
