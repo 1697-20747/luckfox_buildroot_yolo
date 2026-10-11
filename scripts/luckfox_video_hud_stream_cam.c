@@ -88,6 +88,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <pthread.h>
 #include <errno.h>
 #include <poll.h>
 #include <sys/ioctl.h>
@@ -657,6 +658,93 @@ static bool v4l2_capture_frame(V4L2Capture* cap, unsigned char* out_rgb) {
     return true;
 }
 
+/* --- NPU worker thread (2026-10-11 optimisation) ---
+ * Measured per 960x540 frame before this: CPU ~67ms (capture+convert 16,
+ * downscale 9, quantize 6, HUD 4, JPEG 27, misc) and NPU 61ms (rknn_run,
+ * during which the single CPU core just waited) -- run back to back, 7.8fps.
+ * Now the NPU works on frame N in this thread while the main thread
+ * captures/prepares N+1 and draws/encodes N-1 with N-1's own detections, so
+ * a frame costs ~max(CPU, NPU) instead of the sum. Only this thread touches
+ * the RKNN context after setup. Two input tensors are alternated so the CPU
+ * can fill one while the NPU reads the other; outputs are decoded here,
+ * right after the run, before the next run can overwrite them. */
+typedef struct {
+    rknn_context ctx;
+    rknn_tensor_mem* input_mems[2];
+    rknn_tensor_attr input_attr;
+    std::vector<rknn_tensor_attr>* output_attrs;
+    std::vector<rknn_tensor_mem*>* output_mems;
+
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+    int job_idx;       /* -1 = no job queued */
+    bool job_done;
+    bool quit;
+    /* results, per input slot */
+    std::vector<Detection> dets[2];
+    double npu_ms[2], post_ms[2];
+    int ret[2];
+} NpuWorker;
+
+static void* npu_worker_main(void* arg) {
+    NpuWorker* w = (NpuWorker*)arg;
+    for (;;) {
+        pthread_mutex_lock(&w->lock);
+        while (w->job_idx < 0 && !w->quit) pthread_cond_wait(&w->cond, &w->lock);
+        if (w->quit) { pthread_mutex_unlock(&w->lock); break; }
+        int idx = w->job_idx;
+        pthread_mutex_unlock(&w->lock);
+
+        struct timespec t0, t1, t2;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        int ret = rknn_set_io_mem(w->ctx, w->input_mems[idx], &w->input_attr);
+        if (ret == RKNN_SUCC) ret = rknn_run(w->ctx, NULL);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        std::vector<Detection> all_dets;
+        if (ret == RKNN_SUCC) {
+            std::vector<rknn_tensor_attr>& oa = *w->output_attrs;
+            std::vector<rknn_tensor_mem*>& om = *w->output_mems;
+            for (int s = 0; s < NUM_SCALES; s++) {
+                rknn_tensor_attr& box_attr = oa[s * 3 + 0];
+                rknn_tensor_attr& score_attr = oa[s * 3 + 1];
+                rknn_tensor_attr& sum_attr = oa[s * 3 + 2];
+                int grid_h = box_attr.dims[1], grid_w = box_attr.dims[2], dfl_len = box_attr.dims[3] / 4;
+                decode_scale((int8_t*)om[s * 3 + 0]->virt_addr, box_attr.zp, box_attr.scale,
+                             (int8_t*)om[s * 3 + 1]->virt_addr, score_attr.zp, score_attr.scale,
+                             (int8_t*)om[s * 3 + 2]->virt_addr, sum_attr.zp, sum_attr.scale,
+                             grid_h, grid_w, STRIDES[s], dfl_len, all_dets);
+            }
+        }
+        std::vector<Detection> dets = nms(all_dets);
+        clock_gettime(CLOCK_MONOTONIC, &t2);
+
+        pthread_mutex_lock(&w->lock);
+        w->dets[idx].swap(dets);
+        w->ret[idx] = ret;
+        w->npu_ms[idx] = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+        w->post_ms[idx] = (t2.tv_sec - t1.tv_sec) * 1000.0 + (t2.tv_nsec - t1.tv_nsec) / 1e6;
+        w->job_idx = -1;
+        w->job_done = true;
+        pthread_cond_broadcast(&w->cond);
+        pthread_mutex_unlock(&w->lock);
+    }
+    return NULL;
+}
+
+static void npu_submit(NpuWorker* w, int idx) {
+    pthread_mutex_lock(&w->lock);
+    w->job_idx = idx;
+    w->job_done = false;
+    pthread_cond_broadcast(&w->cond);
+    pthread_mutex_unlock(&w->lock);
+}
+
+static void npu_wait(NpuWorker* w) {
+    pthread_mutex_lock(&w->lock);
+    while (!w->job_done) pthread_cond_wait(&w->cond, &w->lock);
+    pthread_mutex_unlock(&w->lock);
+}
+
 /* --- per-session object log (2026-10-10, web UI) ---
  * A "session" is one stream viewer's connection: it starts on /stream and
  * the log is wiped when that viewer disconnects or is taken over. Raw
@@ -1194,26 +1282,39 @@ static void http_wait_for_client() {
 /* libjpeg-turbo encode to an in-memory buffer via the standard
  * jpeg_mem_dest() API (part of libjpeg's public API since v8, real and
  * portable -- not the simplified TurboJPEG API, since jpeglib.h was
- * already the header on hand). jpeg_buf/jpeg_buf_size are kept static
- * and passed back in on every call rather than freed each time --
- * jpeg_mem_dest() reuses the existing allocation if it's already large
- * enough (per its own documented contract) and only reallocs when it
- * needs to grow, avoiding a malloc/free cycle every single frame. */
+ * already the header on hand). */
+/* One output buffer, allocated once with room for any frame (raw RGB size
+ * is a safe upper bound at this quality), and its real capacity passed to
+ * jpeg_mem_dest() every call.
+ *
+ * Real leak found 2026-10-11 (3-minute soak: process heap +200KB/s, ~14KB
+ * per frame, same on Ubuntu): the old code passed back the previous call's
+ * buffer with *outsize = the previous frame's COMPRESSED length, not the
+ * buffer's capacity. Whenever a frame compressed larger than the one
+ * before (about every other frame), libjpeg allocated a bigger buffer and
+ * copied -- and never freed the old one, since a buffer passed in is the
+ * caller's. */
 static unsigned char* jpeg_buf = NULL;
-/* jpeg_mem_dest()'s size argument is unsigned long* in libjpeg-turbo (the
- * Ubuntu build) but size_t* in IJG libjpeg 9 (the Buildroot SDK's library). */
-#if JPEG_LIB_VERSION >= 90
-static size_t jpeg_buf_size = 0;
-#else
-static unsigned long jpeg_buf_size = 0;
-#endif
+static unsigned long jpeg_buf_cap = 0;
 
 static unsigned long jpeg_encode_turbo(unsigned char* rgb, int w, int h) {
+    if (!jpeg_buf) {
+        jpeg_buf_cap = (unsigned long)w * h * 3 + 65536;
+        jpeg_buf = (unsigned char*)malloc(jpeg_buf_cap);
+    }
+    /* size type differs: unsigned long* in libjpeg-turbo, size_t* in IJG 9 */
+#if JPEG_LIB_VERSION >= 90
+    size_t out_size = jpeg_buf_cap;
+#else
+    unsigned long out_size = jpeg_buf_cap;
+#endif
+    unsigned char* out = jpeg_buf;
+
     struct jpeg_compress_struct cinfo;
     struct jpeg_error_mgr jerr;
     cinfo.err = jpeg_std_error(&jerr);
     jpeg_create_compress(&cinfo);
-    jpeg_mem_dest(&cinfo, &jpeg_buf, &jpeg_buf_size);
+    jpeg_mem_dest(&cinfo, &out, &out_size);
 
     cinfo.image_width = w;
     cinfo.image_height = h;
@@ -1230,16 +1331,16 @@ static unsigned long jpeg_encode_turbo(unsigned char* rgb, int w, int h) {
         jpeg_write_scanlines(&cinfo, row_pointer, 1);
     }
     jpeg_finish_compress(&cinfo);
-
-    /* jpeg_mem_dest() may have grown jpeg_buf via realloc() during
-     * compress -- jpeg_destroy_compress() doesn't touch it, real size
-     * actually written is in cinfo.dest's own tracked count, exposed
-     * back to us via jpeg_buf_size (jpeg_mem_dest updates *outsize to
-     * the real compressed length on jpeg_finish_compress -- confirmed
-     * in jpeglib.h's own documented contract for this function). */
-    unsigned long real_size = jpeg_buf_size;
     jpeg_destroy_compress(&cinfo);
-    return real_size;
+
+    if (out != jpeg_buf) {
+        /* only if a frame ever outgrew the buffer: libjpeg allocated a new
+         * one (ours untouched); adopt it so nothing leaks */
+        free(jpeg_buf);
+        jpeg_buf = out;
+        jpeg_buf_cap = out_size;
+    }
+    return out_size; /* compressed length */
 }
 
 /* Splits the combined "send_ms" this file used to report into its two
@@ -1587,7 +1688,24 @@ int main(int argc, char** argv) {
         output_mems[i] = rknn_create_mem(ctx, output_attrs[i].size_with_stride);
         rknn_set_io_mem(ctx, output_mems[i], &output_attrs[i]);
     }
-    int8_t* in_buf = (int8_t*)input_mem->virt_addr;
+    rknn_tensor_mem* input_mem2 = rknn_create_mem(ctx, input_attr.size_with_stride);
+    NpuWorker npu;
+    npu.ctx = ctx;
+    npu.input_mems[0] = input_mem;
+    npu.input_mems[1] = input_mem2;
+    npu.input_attr = input_attr;
+    npu.output_attrs = &output_attrs;
+    npu.output_mems = &output_mems;
+    pthread_mutex_init(&npu.lock, NULL);
+    pthread_cond_init(&npu.cond, NULL);
+    npu.job_idx = -1;
+    npu.job_done = true;
+    npu.quit = false;
+    pthread_t npu_thread;
+    if (pthread_create(&npu_thread, NULL, npu_worker_main, &npu) != 0) {
+        printf("RESULT: NPU_THREAD_FAIL\n");
+        return 1;
+    }
     printf("RESULT: MODEL_READY n_output=%d\n", io_num.n_output);
 
     if (http_start_server(http_port) != 0) return 1;
@@ -1609,7 +1727,11 @@ int main(int argc, char** argv) {
      * re-verify or build on this finding, not deleted -- a real,
      * working, just not currently worthwhile code path. */
     bool use_rga_downscale = (getenv("USE_RGA_DOWNSCALE") != NULL);
-    unsigned char* frame_full = (unsigned char*)malloc(display_w * display_h * 3);
+    /* three full-res frames: one being captured, one in the NPU, one being
+     * drawn and encoded (see NPU worker) */
+    unsigned char* frames[3];
+    for (int i = 0; i < 3; i++) frames[i] = (unsigned char*)malloc(display_w * display_h * 3);
+    unsigned char* frame_full = frames[0];
     unsigned char* frame_small = (unsigned char*)malloc(MODEL_SIZE * MODEL_SIZE * 3);
     if (use_rga_downscale) {
         if (drm_init()) {
@@ -1647,61 +1769,86 @@ int main(int argc, char** argv) {
         int frame_count = 0;
         struct timespec fps_t0, now;
         clock_gettime(CLOCK_MONOTONIC, &fps_t0);
+        /* Three-stage pipeline over frame buffers 0..2: ready (captured +
+         * prepared, waiting for the NPU), in flight (in the NPU), display
+         * (inferred, being drawn/encoded/sent). Each iteration: hand the
+         * ready frame to the NPU, capture+prepare the next one while it
+         * runs, display the previous one, then wait for the NPU. */
+        int ready_fb = -1, infl_fb = -1, disp_fb = -1;
+        int fb_slot[3] = {0, 0, 0};  /* which NPU input tensor each frame uses */
+        double fb_read_ms[3] = {0, 0, 0}, fb_ds_ms[3] = {0, 0, 0}, fb_quant_ms[3] = {0, 0, 0};
+        bool stop = false;
 
         while ((client_fd >= 0 || g_nav_fd >= 0) && !g_quit) {
-            struct timespec t_read_start, t_read_end;
-            clock_gettime(CLOCK_MONOTONIC, &t_read_start);
-            bool got_frame;
-            if (live_camera) {
-                got_frame = v4l2_capture_frame(&v4l2_cap, frame_full);
-            } else {
-                size_t n = fread(frame_full, 1, display_w * display_h * 3, ffmpeg_pipe);
-                got_frame = (n == (size_t)(display_w * display_h * 3));
-            }
-            clock_gettime(CLOCK_MONOTONIC, &t_read_end);
-            double read_ms = (t_read_end.tv_sec - t_read_start.tv_sec) * 1000.0 +
-                              (t_read_end.tv_nsec - t_read_start.tv_nsec) / 1e6;
-            if (!got_frame) {
-                if (live_camera) printf("RESULT: V4L2_CAPTURE_FAIL\n");
-                break; /* video ended, or a real capture error */
+            /* 1. hand the prepared frame to the NPU */
+            if (ready_fb >= 0 && infl_fb < 0) {
+                npu_submit(&npu, fb_slot[ready_fb]);
+                infl_fb = ready_fb;
+                ready_fb = -1;
             }
 
-            struct timespec t_infer_start, t_infer_end;
-            clock_gettime(CLOCK_MONOTONIC, &t_infer_start);
-
-            struct timespec t_ds_start, t_ds_end;
-            clock_gettime(CLOCK_MONOTONIC, &t_ds_start);
-            if (use_rga_downscale) {
-                if (!downscale_for_inference_rga(frame_full, display_w, display_h, frame_small, MODEL_SIZE, MODEL_SIZE)) {
-                    fprintf(stderr, "RESULT: RGA_DOWNSCALE_FAILED, falling back to CPU downscale for this and all future frames\n");
-                    use_rga_downscale = false;
-                    downscale_for_inference(frame_full, display_w, display_h, frame_small, MODEL_SIZE, MODEL_SIZE);
+            /* 2. capture + prepare the next frame while the NPU runs: a
+             * frame buffer not in flight or awaiting display, and the NPU
+             * input tensor the in-flight frame isn't using */
+            if (ready_fb < 0 && !stop) {
+                int fb = 0;
+                while (fb == infl_fb || fb == disp_fb) fb++;
+                const int slot = (infl_fb >= 0) ? (fb_slot[infl_fb] ^ 1) : 0;
+                struct timespec t_read_start, t_read_end;
+                clock_gettime(CLOCK_MONOTONIC, &t_read_start);
+                bool got_frame;
+                unsigned char* cap_frame = frames[fb];
+                if (live_camera) {
+                    got_frame = v4l2_capture_frame(&v4l2_cap, cap_frame);
+                } else {
+                    size_t n = fread(cap_frame, 1, display_w * display_h * 3, ffmpeg_pipe);
+                    got_frame = (n == (size_t)(display_w * display_h * 3));
                 }
-            } else {
-                downscale_for_inference(frame_full, display_w, display_h, frame_small, MODEL_SIZE, MODEL_SIZE);
-            }
-            clock_gettime(CLOCK_MONOTONIC, &t_ds_end);
-            double downscale_ms = (t_ds_end.tv_sec - t_ds_start.tv_sec) * 1000.0 +
-                                   (t_ds_end.tv_nsec - t_ds_start.tv_nsec) / 1e6;
-            for (int i = 0; i < MODEL_SIZE * MODEL_SIZE * 3; i++) in_buf[i] = (int8_t)((int)frame_small[i] - 128);
-            ret = rknn_run(ctx, NULL);
-            if (ret != RKNN_SUCC) { printf("RESULT: RUN_FAIL ret=%d\n", ret); break; }
+                clock_gettime(CLOCK_MONOTONIC, &t_read_end);
+                double read_ms = (t_read_end.tv_sec - t_read_start.tv_sec) * 1000.0 +
+                                  (t_read_end.tv_nsec - t_read_start.tv_nsec) / 1e6;
+                if (!got_frame) {
+                    if (live_camera) printf("RESULT: V4L2_CAPTURE_FAIL\n");
+                    stop = true; /* video ended, or a real capture error */
+                } else {
 
-            std::vector<Detection> all_dets;
-            for (int s = 0; s < NUM_SCALES; s++) {
-                rknn_tensor_attr& box_attr = output_attrs[s * 3 + 0];
-                rknn_tensor_attr& score_attr = output_attrs[s * 3 + 1];
-                rknn_tensor_attr& sum_attr = output_attrs[s * 3 + 2];
-                int grid_h = box_attr.dims[1], grid_w = box_attr.dims[2], dfl_len = box_attr.dims[3] / 4;
-                decode_scale((int8_t*)output_mems[s * 3 + 0]->virt_addr, box_attr.zp, box_attr.scale,
-                             (int8_t*)output_mems[s * 3 + 1]->virt_addr, score_attr.zp, score_attr.scale,
-                             (int8_t*)output_mems[s * 3 + 2]->virt_addr, sum_attr.zp, sum_attr.scale,
-                             grid_h, grid_w, STRIDES[s], dfl_len, all_dets);
+                struct timespec t_ds_start, t_ds_end;
+                clock_gettime(CLOCK_MONOTONIC, &t_ds_start);
+                if (use_rga_downscale) {
+                    if (!downscale_for_inference_rga(cap_frame, display_w, display_h, frame_small, MODEL_SIZE, MODEL_SIZE)) {
+                        fprintf(stderr, "RESULT: RGA_DOWNSCALE_FAILED, falling back to CPU downscale for this and all future frames\n");
+                        use_rga_downscale = false;
+                        downscale_for_inference(cap_frame, display_w, display_h, frame_small, MODEL_SIZE, MODEL_SIZE);
+                    }
+                } else {
+                    downscale_for_inference(cap_frame, display_w, display_h, frame_small, MODEL_SIZE, MODEL_SIZE);
+                }
+                clock_gettime(CLOCK_MONOTONIC, &t_ds_end);
+                double downscale_ms = (t_ds_end.tv_sec - t_ds_start.tv_sec) * 1000.0 +
+                                       (t_ds_end.tv_nsec - t_ds_start.tv_nsec) / 1e6;
+                struct timespec t_q0, t_q1;
+                clock_gettime(CLOCK_MONOTONIC, &t_q0);
+                int8_t* in_buf = (int8_t*)npu.input_mems[slot]->virt_addr;
+                for (int i = 0; i < MODEL_SIZE * MODEL_SIZE * 3; i++) in_buf[i] = (int8_t)((int)frame_small[i] - 128);
+                clock_gettime(CLOCK_MONOTONIC, &t_q1);
+                fb_read_ms[fb] = read_ms;
+                fb_ds_ms[fb] = downscale_ms;
+                fb_quant_ms[fb] = (t_q1.tv_sec - t_q0.tv_sec) * 1000.0 + (t_q1.tv_nsec - t_q0.tv_nsec) / 1e6;
+                fb_slot[fb] = slot;
+                ready_fb = fb;
+                } /* got_frame */
             }
-            std::vector<Detection> dets = nms(all_dets);
-            clock_gettime(CLOCK_MONOTONIC, &t_infer_end);
-            double infer_ms = (t_infer_end.tv_sec - t_infer_start.tv_sec) * 1000.0 +
-                               (t_infer_end.tv_nsec - t_infer_start.tv_nsec) / 1e6;
+
+            /* 3. draw / encode / send the previous frame with its own detections */
+            if (disp_fb >= 0) {
+            const int dslot = fb_slot[disp_fb];
+            unsigned char* frame_full = frames[disp_fb];
+            std::vector<Detection>& dets = npu.dets[dslot];
+            double read_ms = fb_read_ms[disp_fb];
+            double downscale_ms = fb_ds_ms[disp_fb];
+            double quant_ms = fb_quant_ms[disp_fb];
+            double npu_ms = npu.npu_ms[dslot];
+            double infer_ms = downscale_ms + quant_ms + npu_ms + npu.post_ms[dslot];
 
             accel_update(&accel);
 
@@ -1757,7 +1904,9 @@ int main(int argc, char** argv) {
                 }
             }
 
-            double jpeg_ms = 0, net_ms = 0;
+            double jpeg_ms = 0, net_ms = 0, hud_ms = 0;
+            struct timespec t_hud0, t_hud1;
+            clock_gettime(CLOCK_MONOTONIC, &t_hud0);
             if (client_fd >= 0) {
 
             if (!g_view_hud) {
@@ -1840,6 +1989,8 @@ int main(int argc, char** argv) {
                 }
             }
 
+            clock_gettime(CLOCK_MONOTONIC, &t_hud1);
+            hud_ms = (t_hud1.tv_sec - t_hud0.tv_sec) * 1000.0 + (t_hud1.tv_nsec - t_hud0.tv_nsec) / 1e6;
             if (http_send_frame(frame_full, display_w, display_h, &jpeg_ms, &net_ms) < 0) {
                 printf("RESULT: CLIENT_DISCONNECTED after %d frames\n", frame_count);
                 close(client_fd);
@@ -1853,10 +2004,26 @@ int main(int argc, char** argv) {
             http_poll_requests();
 
             if (frame_count % 10 == 0) {
-                printf("frame=%d fps=%.1f read_ms=%.1f downscale_ms=%.1f infer_ms=%.1f jpeg_ms=%.1f net_ms=%.1f dets=%zu\n",
-                       frame_count, fps, read_ms, downscale_ms, infer_ms, jpeg_ms, net_ms, dets.size());
+                printf("frame=%d fps=%.1f read_ms=%.1f downscale_ms=%.1f infer_ms=%.1f (quant=%.1f npu=%.1f post=%.1f) "
+                       "hud_ms=%.1f jpeg_ms=%.1f net_ms=%.1f dets=%zu\n",
+                       frame_count, fps, read_ms, downscale_ms, infer_ms, quant_ms, npu_ms,
+                       infer_ms - quant_ms - npu_ms - downscale_ms, hud_ms, jpeg_ms, net_ms, dets.size());
                 fflush(stdout);
             }
+            disp_fb = -1;
+            } /* disp_fb */
+
+            /* 4. wait for the NPU; that frame is displayed next iteration */
+            if (infl_fb >= 0) {
+                npu_wait(&npu);
+                if (npu.ret[fb_slot[infl_fb]] != RKNN_SUCC) {
+                    printf("RESULT: RUN_FAIL ret=%d\n", npu.ret[fb_slot[infl_fb]]);
+                    break;
+                }
+                disp_fb = infl_fb;
+                infl_fb = -1;
+            }
+            if (stop && infl_fb < 0) break;
         }
 
         if (ffmpeg_pipe) pclose(ffmpeg_pipe);
@@ -1883,10 +2050,16 @@ int main(int argc, char** argv) {
     if (g_hwjpeg_blk) kmsg_mark("main: v4l2 stream closed, Rockit teardown next");
     hwjpeg_shutdown();
 #endif
-    free(frame_full);
+    pthread_mutex_lock(&npu.lock);
+    npu.quit = true;
+    pthread_cond_broadcast(&npu.cond);
+    pthread_mutex_unlock(&npu.lock);
+    pthread_join(npu_thread, NULL);
+    for (int i = 0; i < 3; i++) free(frames[i]);
     free(frame_small);
     for (uint32_t i = 0; i < io_num.n_output; i++) rknn_destroy_mem(ctx, output_mems[i]);
     rknn_destroy_mem(ctx, input_mem);
+    rknn_destroy_mem(ctx, input_mem2);
     rknn_destroy(ctx);
 #ifdef LUCKFOX_HW_JPEG
     if (g_hwjpeg_nv12) kmsg_mark("main: teardown done, exiting");

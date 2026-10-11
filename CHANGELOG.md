@@ -5,6 +5,19 @@ Terse, dated, factual record of real changes to this project. For the full narra
 
 ## 2026-10-11
 
+- **Three-stage NPU/CPU pipeline:** an NPU worker thread runs YOLO on frame N while the main
+  thread captures/prepares N+1 and draws/encodes N-1 with N-1's own detections (3 frame buffers,
+  2 NPU input tensors). Measured: video **7.8 -> 14.2fps**, navigation-only **10.3 -> 15.0Hz**
+  (NPU 61 -> 64ms; CPU now fully used). 3-minute soak with viewer + subscriber: flat 14.1fps,
+  2,610 frames / 2,612 events, max event gap 99ms, 60C.
+- **Memory leak fixed (old, also on Ubuntu):** the JPEG output buffer was passed back with the last
+  frame's compressed length as its size, so libjpeg reallocated whenever a frame grew and never
+  freed the old buffer -- ~14KB/frame, +200KB/s; the process had grown to 52MB. Now one buffer of
+  known capacity: flat 11.3MB over 90s of streaming.
+- **Board freeze NOT specific to hardware JPEG:** it froze during a software-mode stop/restart cycle
+  (5th of 10) with Rockit not even loaded. Every freeze so far involves stopping/restarting the
+  camera stream while the separate rkaiq_3A_server process is running. Under investigation.
+
 - **WiFi off by default, with an on/off button** in the web UI (Board card, `/api/wifi`).
   `/usr/bin/yolo-wifi on|off|status` stops/starts rkwifi_server, wpa_supplicant and wlan0 DHCP;
   `yolo-app-start` runs `yolo-wifi boot-off` once Luckfox's background WiFi bring-up settles.
