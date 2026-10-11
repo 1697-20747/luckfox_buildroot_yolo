@@ -63,6 +63,7 @@
   .seg button { border: 0; border-radius: 0; }
   .seg button.on { background: var(--accent); color: #04140d; font-weight: 600; }
   .spacer { flex: 1; }
+  button.small { padding: 2px 8px; font-size: 12px; margin-left: 6px; }
   .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
   .chip { background: var(--bg); border: 1px solid var(--line); border-radius: 99px;
     padding: 2px 9px; font-size: 12px; }
@@ -132,6 +133,7 @@
         <dt>SoC temp</dt><dd id="temp">–</dd>
         <dt>Mem available</dt><dd id="mem">–</dd>
         <dt>Tilt</dt><dd id="tilt">–</dd>
+        <dt>WiFi</dt><dd><span id="wifiState">–</span> <button id="wifiBtn" class="small" disabled>…</button></dd>
       </dl>
     </div>
     <div class="card">
@@ -300,6 +302,26 @@
   // Only offer the Docs link when a docs site is installed on this board
   // (it's deployed separately into www/docs/, not part of this repo).
   fetch('/docs/', { cache: 'no-store' }).then((r) => { if (r.ok) $('docsLink').hidden = false; }).catch(() => {});
+
+  // WiFi on/off (off by default at boot; the USB link always stays up)
+  let wifiOn = false;
+  async function wifi(query) {
+    try {
+      const w = await fetch('/api/wifi' + (query || ''), { cache: 'no-store' }).then((r) => r.json());
+      if (!w.present) { $('wifiState').textContent = 'not present'; $('wifiBtn').hidden = true; return; }
+      wifiOn = w.enabled;
+      $('wifiState').textContent = w.enabled ? ('on' + (w.ip ? ' (' + w.ip + ')' : ', no IP yet')) : 'off';
+      $('wifiBtn').textContent = w.enabled ? 'Turn off' : 'Turn on';
+      $('wifiBtn').disabled = false;
+    } catch (e) {}
+  }
+  $('wifiBtn').onclick = () => {
+    $('wifiBtn').disabled = true; $('wifiState').textContent = 'switching…';
+    wifi(wifiOn ? '?enable=0' : '?enable=1');
+    setTimeout(wifi, 3000);
+  };
+  wifi();
+  setInterval(wifi, 5000);
 
   play();
   poll();

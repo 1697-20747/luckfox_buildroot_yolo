@@ -5,6 +5,16 @@ Terse, dated, factual record of real changes to this project. For the full narra
 
 ## 2026-10-11
 
+- **WiFi off by default, with an on/off button** in the web UI (Board card, `/api/wifi`).
+  `/usr/bin/yolo-wifi on|off|status` stops/starts rkwifi_server, wpa_supplicant and wlan0 DHCP;
+  `yolo-app-start` runs `yolo-wifi boot-off` once Luckfox's background WiFi bring-up settles.
+  Verified across a reboot (off by 30s, still off at 72s); USB stays up throughout. Credentials:
+  `/userdata/wpa_supplicant.conf` still holds Luckfox's placeholder network.
+- **Navigation output:** `/api/detections` and `/api/detections/stream` (SSE) -- per frame: track id,
+  class, score, normalised bounding-box centre (approximate centre of mass) and box, pitch/roll,
+  optional bearing/elevation from `LUCKFOX_CAM_HFOV_DEG`/`VFOV_DEG`. A subscriber runs the detector
+  without a video viewer and skips HUD + JPEG: 10.3Hz detections vs 7.7fps with video.
+
 - **JPEG: libjpeg-turbo (NEON), statically linked; hardware JPEG dropped.** 7.7fps, JPEG 27ms
   (IJG libjpeg 9: 5.4fps / 83-93ms). `tools/build_jpeg_turbo.sh` cross-builds 2.1.4, sha256-pinned
   to the SDK's own Buildroot package. The app no longer links or loads Rockit at all.

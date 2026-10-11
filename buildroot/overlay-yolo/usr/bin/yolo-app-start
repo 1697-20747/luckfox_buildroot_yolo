@@ -23,6 +23,8 @@ esac
 export PATH=/oem/usr/bin:$PATH LD_LIBRARY_PATH=/oem/usr/lib:$LD_LIBRARY_PATH
 mkdir -p /var/log
 rkaiq_3A_server > /var/log/yolo-3a.log 2>&1 &
+# WiFi is off by default (web UI button turns it on); see /usr/bin/yolo-wifi
+/usr/bin/yolo-wifi boot-off > /dev/null 2>&1 &
 sleep 2
 
 # opt-in settings for the app, e.g. LUCKFOX_HW_JPEG=1

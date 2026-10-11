@@ -96,6 +96,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <net/if.h>
 #include <linux/videodev2.h>
 #include <string>
 #include <vector>
@@ -977,6 +978,42 @@ static void http_send_status(int fd) {
     http_send_simple(fd, "200 OK", "application/json", body, (size_t)len);
 }
 
+/* /api/wifi[?enable=0|1] -- WiFi on/off (2026-10-11; off by default at boot,
+ * see /usr/bin/yolo-wifi). Switching runs yolo-wifi in the background so the
+ * frame loop never waits on it; the UI polls status. */
+static void http_send_wifi(int fd, const char* query) {
+    const char* action = NULL;
+    if (query && strstr(query, "enable=1")) action = "on";
+    else if (query && strstr(query, "enable=0")) action = "off";
+    if (action) {
+        char cmd[96];
+        snprintf(cmd, sizeof(cmd), "/usr/bin/yolo-wifi %s > /dev/null 2>&1 &", action);
+        if (system(cmd) != 0) { /* reported through status below */ }
+    }
+    bool up = false;
+    char ip[INET_ADDRSTRLEN] = "";
+    FILE* f = fopen("/sys/class/net/wlan0/flags", "r");
+    if (f) {
+        unsigned int flags = 0;
+        if (fscanf(f, "%x", &flags) == 1) up = flags & IFF_UP;
+        fclose(f);
+    }
+    if (up) {
+        int sfd = socket(AF_INET, SOCK_DGRAM, 0);
+        struct ifreq ifr;
+        memset(&ifr, 0, sizeof(ifr));
+        snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "wlan0");
+        if (sfd >= 0 && ioctl(sfd, SIOCGIFADDR, &ifr) == 0)
+            inet_ntop(AF_INET, &((struct sockaddr_in*)&ifr.ifr_addr)->sin_addr, ip, sizeof(ip));
+        if (sfd >= 0) close(sfd);
+    }
+    char body[160];
+    int len = snprintf(body, sizeof(body), "{\"present\":%s,\"enabled\":%s,\"ip\":\"%s\",\"pending\":%s}",
+                       access("/sys/class/net/wlan0", F_OK) == 0 ? "true" : "false",
+                       up ? "true" : "false", ip, action ? "true" : "false");
+    http_send_simple(fd, "200 OK", "application/json", body, (size_t)len);
+}
+
 /* Newest first, at most the ring's 200 entries, plus per-class totals. */
 static void http_send_objects(int fd) {
     std::string body;
@@ -1082,6 +1119,8 @@ static bool http_handle_connection(int fd, const char* ipstr) {
     }
     if (!strcmp(target, "/api/status")) {
         http_send_status(fd);
+    } else if (!strcmp(target, "/api/wifi")) {
+        http_send_wifi(fd, query);
     } else if (!strcmp(target, "/api/objects")) {
         http_send_objects(fd);
     } else if (!strcmp(target, "/api/view")) {

@@ -1,0 +1,51 @@
+#!/bin/sh
+# luckfox_buildroot_yolo: WiFi on/off (2026-10-11). Off by default at boot
+# (yolo-app-start calls "yolo-wifi boot-off"); the web UI's WiFi button calls
+# this through the stream server's /api/wifi. The board is always reachable
+# over the USB cable (usb0), so WiFi off never locks you out.
+#   yolo-wifi on | off | status | boot-off
+# Network credentials: /userdata/wpa_supplicant.conf (Luckfox ships a
+# placeholder "Your wifi ssid" entry -- edit it before turning WiFi on).
+CONF=/userdata/wpa_supplicant.conf
+
+wifi_off() {
+	killall rkwifi_server wpa_supplicant 2>/dev/null
+	for p in $(pidof udhcpc); do
+		grep -q "wlan0" /proc/$p/cmdline 2>/dev/null && kill $p
+	done
+	ifconfig wlan0 down 2>/dev/null
+}
+
+case "$1" in
+	on)
+		[ -e /sys/class/net/wlan0 ] || { echo "no wlan0"; exit 1; }
+		wifi_off
+		ifconfig wlan0 up
+		wpa_supplicant -B -D nl80211 -i wlan0 -c $CONF
+		udhcpc -i wlan0 -b -q >/dev/null 2>&1
+		echo on
+		;;
+	off)
+		wifi_off
+		echo off
+		;;
+	boot-off)
+		# The WiFi stack starts in the background during boot (driver load,
+		# rkwifi_server -> wpa_supplicant, then S99hciinit's ifconfig/udhcpc),
+		# so wait for it to settle, then switch it off -- twice, in case a
+		# late starter brings it back.
+		for i in $(seq 1 30); do pidof wpa_supplicant >/dev/null && break; sleep 1; done
+		sleep 3; wifi_off
+		sleep 10; wifi_off
+		;;
+	status)
+		if [ -e /sys/class/net/wlan0 ] && [ $(( $(cat /sys/class/net/wlan0/flags) & 1 )) = 1 ]; then
+			echo "on $(ifconfig wlan0 | grep -o 'inet addr:[^ ]*' | cut -d: -f2)"
+		else
+			echo off
+		fi
+		;;
+	*)
+		echo "usage: $0 on|off|status|boot-off"; exit 1
+		;;
+esac
