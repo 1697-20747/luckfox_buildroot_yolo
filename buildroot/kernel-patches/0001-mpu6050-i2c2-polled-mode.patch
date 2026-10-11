@@ -1,0 +1,82 @@
+diff --git a/arch/arm/boot/dts/rv1106-luckfox-pico-ultra-ipc.dtsi b/arch/arm/boot/dts/rv1106-luckfox-pico-ultra-ipc.dtsi
+index 505e53a83..7efbeadd2 100755
+--- a/arch/arm/boot/dts/rv1106-luckfox-pico-ultra-ipc.dtsi
++++ b/arch/arm/boot/dts/rv1106-luckfox-pico-ultra-ipc.dtsi
+@@ -473,7 +473,17 @@ &i2c1 {
+ 	pinctrl-0 = <&i2c1m1_xfer>;
+ };
+ &i2c2 {
++	/* luckfox_buildroot_yolo: GY-521 / MPU-6050 on header pins 32 (SCL)
++	 * and 33 (SDA). Only VDD/GND/SCL/SDA wired, no INT line, so no
++	 * interrupts property: the driver runs in polled/direct mode. */
++	status = "okay";
++	clock-frequency = <100000>;
+ 	pinctrl-0 = <&i2c2m0_xfer>;
++
++	mpu6050@68 {
++		compatible = "invensense,mpu6050";
++		reg = <0x68>;
++	};
+ };
+ &i2c3 {
+ 	pinctrl-names = "default", "config";
+diff --git a/arch/arm/configs/luckfox_rv1106_linux_defconfig b/arch/arm/configs/luckfox_rv1106_linux_defconfig
+index 203ce2997..3c0482bb4 100755
+--- a/arch/arm/configs/luckfox_rv1106_linux_defconfig
++++ b/arch/arm/configs/luckfox_rv1106_linux_defconfig
+@@ -448,6 +448,7 @@ CONFIG_RK_MEMBLOCK_PROCFS=y
+ CONFIG_DEVFREQ_GOV_USERSPACE=y
+ CONFIG_EXTCON=y
+ CONFIG_IIO=y
++CONFIG_INV_MPU6050_I2C=y
+ CONFIG_ROCKCHIP_SARADC=y
+ CONFIG_PWM=y
+ CONFIG_PWM_ROCKCHIP=y
+diff --git a/drivers/iio/imu/inv_mpu6050/inv_mpu_core.c b/drivers/iio/imu/inv_mpu6050/inv_mpu_core.c
+index ae391ec4a..c658b367e 100644
+--- a/drivers/iio/imu/inv_mpu6050/inv_mpu_core.c
++++ b/drivers/iio/imu/inv_mpu6050/inv_mpu_core.c
+@@ -1457,6 +1457,12 @@ int inv_mpu_core_probe(struct regmap *regmap, int irq, const char *name,
+ 		st->plat_data = *pdata;
+ 	}
+ 
++	/* luckfox_buildroot_yolo: allow no IRQ (INT pin not wired) -- the
++	 * device then works in direct mode (polled sysfs reads) only. */
++	if (irq <= 0) {
++		irq_type = IRQF_TRIGGER_RISING;
++		goto irq_type_done;
++	}
+ 	desc = irq_get_irq_data(irq);
+ 	if (!desc) {
+ 		dev_err(dev, "Could not find IRQ %d\n", irq);
+@@ -1481,6 +1487,9 @@ int inv_mpu_core_probe(struct regmap *regmap, int irq, const char *name,
+ 			irq_type);
+ 		return -EINVAL;
+ 	}
++irq_type_done:
++	if (irq <= 0)
++		st->irq_mask = INV_MPU6050_ACTIVE_HIGH;
+ 
+ 	st->vdd_supply = devm_regulator_get(dev, "vdd");
+ 	if (IS_ERR(st->vdd_supply))
+@@ -1590,6 +1599,12 @@ int inv_mpu_core_probe(struct regmap *regmap, int irq, const char *name,
+ 	}
+ 
+ 	indio_dev->info = &mpu_info;
++
++	if (irq <= 0) {
++		dev_info(dev, "no IRQ, running in polled/direct mode only\n");
++		indio_dev->modes = INDIO_DIRECT_MODE;
++		goto register_device;
++	}
+ 	indio_dev->modes = INDIO_BUFFER_TRIGGERED;
+ 
+ 	result = devm_iio_triggered_buffer_setup(dev, indio_dev,
+@@ -1606,6 +1621,7 @@ int inv_mpu_core_probe(struct regmap *regmap, int irq, const char *name,
+ 		return result;
+ 	}
+ 
++register_device:
+ 	result = devm_iio_device_register(dev, indio_dev);
+ 	if (result) {
+ 		dev_err(dev, "IIO register fail %d\n", result);

@@ -1950,5 +1950,20 @@ never clears its marker (it fired for real once -- a false alarm from killing th
 135MB available** -- vs Ubuntu 8.5fps / JPEG 26ms / ~95MB.
 
 **Not ported yet:** MPU-6050 (needs the device-tree fix in the SDK kernel), docs site. Camera is
-mounted rotated 90 degrees (image sideways).
+mounted rotated 90 degrees (image sideways) -- 1697-20747: it goes back in its fixture, leave it.
+
+## 2026-10-11 -- MPU-6050 ported to the Buildroot kernel, as a patch file this time
+
+The September fix (i2c2 + `mpu6050@68` DT node, `CONFIG_INV_MPU6050_I2C=y`, driver IRQ fallback) was
+never saved in this repo -- it lived only in a scratch SDK clone. Re-created against the Buildroot
+SDK's kernel and saved as `buildroot/kernel-patches/0001-mpu6050-i2c2-polled-mode.patch`, applied by
+`buildroot/apply_kernel_patches.sh` (idempotent). One real difference from the Ubuntu-era kernel: here
+a missing IRQ fails at `irq_get_irq_data()`/trigger-type detection, before the trigger setup the old
+fix gated, so the patch skips both when `irq <= 0` and registers the device in `INDIO_DIRECT_MODE`.
+Checked the built `boot.img` for the `mpu6050@68` node before flashing (the September lesson: a clean
+build once silently lacked the patch). Flashed the same way as in September, live over SSH: backup of
+`/dev/mmcblk0p4` to the Mac (sha256 matched the board), `dd` the new `boot.img`, read back, reboot.
+Result: kernel #5 boots, `2-0068` on i2c-2, `iio:device1` = `mpu6050`, scale 0.000598 m/s^2/LSB,
+resting magnitude ~11.6 m/s^2 (uncalibrated offsets), stream server `ACCEL_FOUND`, HUD panel live,
+8.7fps with hardware JPEG, CPU 40%.
 

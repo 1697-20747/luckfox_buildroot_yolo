@@ -3,6 +3,18 @@
 Terse, dated, factual record of real changes to this project. For the full narrative/discovery log
 (why, what was tried, what failed), see `PROJECT_MEMORY.md` — this file is the short version.
 
+## 2026-10-11
+
+- **MPU-6050 accelerometer ported to the Buildroot kernel.** The Ubuntu-era kernel fix had only
+  ever lived in a scratch SDK clone; it's now `buildroot/kernel-patches/0001-mpu6050-i2c2-polled-mode.patch`
+  (applied by `buildroot/apply_kernel_patches.sh`): i2c2 enabled with an `mpu6050@68` node (header
+  pins 32/33, no INT line), `CONFIG_INV_MPU6050_I2C=y`, and the driver allowed to run without an IRQ
+  (direct/polled mode). On this kernel the missing IRQ fails earlier than on Ubuntu (at
+  `irq_get_irq_data`, before the trigger setup), so both points are guarded. Flashed live over SSH
+  (`dd` of `boot.img` to `/dev/mmcblk0p4`, sha256-verified, previous boot partition backed up to the
+  Mac first). Verified: `2-0068` on i2c-2, `iio:device1` = `mpu6050`, live readings, stream server
+  `ACCEL_FOUND`, HUD accelerometer panel live; 8.7fps (hardware JPEG), CPU 40%.
+
 ## 2026-10-10
 
 - **Board moved from Ubuntu 22.04 to Luckfox's Buildroot SDK image** (Pico Ultra eMMC config,

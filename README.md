@@ -11,7 +11,8 @@ been tried and found — this README is just the current entry point.
 > started at boot by `/usr/bin/yolo-app-start`; build on the Mac with `tools/build_app.sh`, deploy
 > with `tools/deploy_app.sh`; rebuild/flash the OS with the SDK in Docker (`docker/sdk.Dockerfile`,
 > `buildroot/`, `tools/flash_buildroot.sh`). Back to Ubuntu: `tools/restore_emmc.sh` with the image
-> in `board_backup/`. Live camera now has real auto-exposure, and JPEG is hardware-encoded: 8.9fps.
+> in `board_backup/`. Live camera now has real auto-exposure, JPEG is hardware-encoded (8.9fps), and
+> the MPU-6050 works again (kernel patch in `buildroot/kernel-patches/`, 2026-10-11).
 > See `CHANGELOG.md` / `PROJECT_MEMORY.md` 2026-10-10.
 
 **Why this whole pipeline is plain C, not Python: a deliberate choice, not a lack of Python.**
