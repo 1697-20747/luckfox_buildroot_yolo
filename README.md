@@ -29,9 +29,9 @@ times this project (see the CMA/memory-sizing entries in `PROJECT_MEMORY.md`).
 
 **Want the "how does this actually work" explainer instead of the session-by-session log?** See
 [`RV1106_NPU_YOLO_GUIDE.md`](RV1106_NPU_YOLO_GUIDE.md) — hardware, the RKNN toolchain, and why some
-YOLO generations run on this chip and others don't. Also served live, straight off the board, at
-`http://<board-ip>:1313/docs/rv1106-npu-yolo-guide/` (a small Hugo site running on-device — see
-[`docs-site/`](docs-site/)).
+YOLO generations run on this chip and others don't. Also served straight off the board, from a small
+Hugo site under `http://172.32.0.70:8080/docs/` (linked from the web UI). The site is built on the Mac
+and deliberately kept out of this repo (removed 2026-10-11).
 
 **Status as of 2026-09-08: yolov8n detection is fully working end-to-end on real hardware; YOLO26
 itself remains blocked.** YOLO26 fails to even load on this board's NPU (an unsupported `MatMul` op

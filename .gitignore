@@ -9,3 +9,4 @@ __pycache__/
 board_backup/
 build/
 local/
+docs-site/

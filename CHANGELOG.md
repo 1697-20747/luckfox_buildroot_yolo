@@ -5,6 +5,9 @@ Terse, dated, factual record of real changes to this project. For the full narra
 
 ## 2026-10-11
 
+- **`docs-site/` removed from the repo** (kept locally, now gitignored): the Hugo mini site is
+  board-only by choice. Earlier commits still contain it.
+
 - **Hardware JPEG switched back OFF by default** (`scripts/app.env`: `LUCKFOX_HW_JPEG=0`; software
   libjpeg, 5.4fps). Stopping the server in hardware mode proved unsafe after all: once
   `RK_MPI_SYS_Exit()` hung on a futex (process stuck holding port 8080; now bounded by a 3s
