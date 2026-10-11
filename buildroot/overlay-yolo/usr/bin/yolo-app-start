@@ -34,6 +34,9 @@ set -a; [ -f $APP_DIR/app.env ] && . $APP_DIR/app.env; set +a
 if [ -f $GUARD ]; then
 	echo "$(date) previous boot did not clear $GUARD: safe mode (experimental options off)" >> /var/log/yolo-stream.log
 	unset LUCKFOX_HW_JPEG LUCKFOX_VENC_FMT
+	# and no hardware watchdog this boot: a hang that recurs at every start
+	# must not turn into an endless reset loop (one reset, then this)
+	export LUCKFOX_NO_WATCHDOG=1
 fi
 export LUCKFOX_HW_JPEG LUCKFOX_VENC_FMT
 

@@ -94,6 +94,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <linux/watchdog.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -658,6 +659,12 @@ static bool v4l2_capture_frame(V4L2Capture* cap, unsigned char* out_rgb) {
     return true;
 }
 
+/* Start time of the NPU job in flight (0 = none). A job that never finishes
+ * means the NPU hung -- seen 2026-10-11: the worker stuck uninterruptibly in
+ * rknpu_submit_ioctl while the main thread kept running, so a main-thread
+ * heartbeat alone hid the hang. heartbeat() skips beats while a job is >10s overdue. */
+static volatile time_t g_npu_job_started = 0;
+
 /* --- NPU worker thread (2026-10-11 optimisation) ---
  * Measured per 960x540 frame before this: CPU ~67ms (capture+convert 16,
  * downscale 9, quantize 6, HUD 4, JPEG 27, misc) and NPU 61ms (rknn_run,
@@ -732,6 +739,7 @@ static void* npu_worker_main(void* arg) {
 }
 
 static void npu_submit(NpuWorker* w, int idx) {
+    g_npu_job_started = time(NULL);
     pthread_mutex_lock(&w->lock);
     w->job_idx = idx;
     w->job_done = false;
@@ -743,6 +751,7 @@ static void npu_wait(NpuWorker* w) {
     pthread_mutex_lock(&w->lock);
     while (!w->job_done) pthread_cond_wait(&w->cond, &w->lock);
     pthread_mutex_unlock(&w->lock);
+    g_npu_job_started = 0;
 }
 
 /* --- per-session object log (2026-10-10, web UI) ---
@@ -920,6 +929,55 @@ static int client_fd = -1;
  * process in the middle of a Rockit VENC call deadlocked the encoder driver
  * and froze the whole board; the hardware encoder must be shut down cleanly. */
 static volatile sig_atomic_t g_quit = 0;
+
+/* Heartbeat for /usr/bin/yolo-health (2026-10-11): touched about once a
+ * second while running, idle or streaming. The board's freezes leave the
+ * kernel half-alive (USB networking dead, watchdog feeder still running),
+ * with this process stuck; a stale heartbeat makes the health monitor stop
+ * the watchdog feeder so the hardware watchdog resets the board. */
+#define HEARTBEAT_FILE "/tmp/yolo-heartbeat"
+/* Hardware watchdog, fed by this process itself (2026-10-11). A separate
+ * feeder + monitor failed in a real freeze: the kernel was half-alive, the
+ * feeder kept feeding, and the monitor hung in pidof (reading /proc/<pid>/
+ * cmdline of a task stuck in the kernel blocks). Now the kick comes from the
+ * same place as the heartbeat -- each frame and each idle second, never
+ * while an NPU job is overdue -- so if this process gets stuck anywhere the
+ * board resets within WATCHDOG_TIMEOUT_S. It's disarmed only at the very
+ * end of a clean exit, after all teardown (several freezes were in
+ * teardown). A crash (no disarm) also resets the board. */
+#define WATCHDOG_TIMEOUT_S 20
+static int g_wdt_fd = -1;
+static void watchdog_arm(void) {
+    if (getenv("LUCKFOX_NO_WATCHDOG")) { printf("RESULT: WATCHDOG_OFF (LUCKFOX_NO_WATCHDOG set)\n"); return; }
+    g_wdt_fd = open("/dev/watchdog", O_WRONLY | O_CLOEXEC);
+    if (g_wdt_fd < 0) { printf("RESULT: WATCHDOG_UNAVAILABLE errno=%d\n", errno); return; }
+    int t = WATCHDOG_TIMEOUT_S;
+    ioctl(g_wdt_fd, WDIOC_SETTIMEOUT, &t);
+    printf("RESULT: WATCHDOG_ARMED timeout=%ds\n", t);
+}
+static void watchdog_disarm(void) {
+    if (g_wdt_fd < 0) return;
+    if (write(g_wdt_fd, "V", 1) < 0) { /* best effort */ }
+    close(g_wdt_fd);
+    g_wdt_fd = -1;
+}
+
+static void heartbeat(void) {
+    static time_t last = 0;
+    time_t now = time(NULL);
+    if (now == last) return;
+    time_t job = g_npu_job_started;
+    if (job && now - job > 10) return;
+    if (g_wdt_fd >= 0 && write(g_wdt_fd, "k", 1) < 0) { /* best effort */ }
+    last = now;
+    int fd = open(HEARTBEAT_FILE, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd >= 0) {
+        char b[24];
+        int n = snprintf(b, sizeof(b), "%ld\n", (long)now);
+        if (write(fd, b, n) < 0) { /* best effort */ }
+        close(fd);
+    }
+}
 static void on_quit_signal(int) { g_quit = 1; }
 static const char* g_web_root = "www";
 
@@ -1275,7 +1333,14 @@ static int http_start_server(int port) {
 static void http_wait_for_client() {
     printf("Waiting for a browser to connect...\n");
     g_status.streaming = 0;
-    while (client_fd < 0 && g_nav_fd < 0 && !g_quit) http_accept_one();
+    while (client_fd < 0 && g_nav_fd < 0 && !g_quit) {
+        heartbeat();
+        struct pollfd pfd;
+        pfd.fd = server_fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        if (poll(&pfd, 1, 1000) > 0 && (pfd.revents & POLLIN)) http_accept_one();
+    }
     g_status.streaming = client_fd >= 0;
 }
 
@@ -1584,6 +1649,7 @@ int main(int argc, char** argv) {
      * shutdown noise; the live-camera path has no ffmpeg to mask it,
      * which is how this got caught for real. */
     signal(SIGPIPE, SIG_IGN);
+    heartbeat(); /* first thing: a previous instance's stale beat must not look like a hang */
     {
         /* no SA_RESTART: a blocking accept()/capture returns EINTR so the
          * loops notice g_quit promptly */
@@ -1701,14 +1767,32 @@ int main(int argc, char** argv) {
     npu.job_idx = -1;
     npu.job_done = true;
     npu.quit = false;
+    /* The worker must never take a signal: SIGTERM (killall, deploy,
+     * reboot) can be delivered to any thread that doesn't block it, and one
+     * landing on the worker interrupts its wait inside the NPU driver --
+     * the likely trigger of the NPU hangs and board freezes seen
+     * 2026-10-11. The thread inherits this mask; main restores its own. */
+    sigset_t block_sigs, old_sigs;
+    sigemptyset(&block_sigs);
+    sigaddset(&block_sigs, SIGTERM);
+    sigaddset(&block_sigs, SIGINT);
+    sigaddset(&block_sigs, SIGPIPE);
+    sigaddset(&block_sigs, SIGALRM);
+    pthread_sigmask(SIG_BLOCK, &block_sigs, &old_sigs);
     pthread_t npu_thread;
-    if (pthread_create(&npu_thread, NULL, npu_worker_main, &npu) != 0) {
+    int thread_err = pthread_create(&npu_thread, NULL, npu_worker_main, &npu);
+    pthread_sigmask(SIG_SETMASK, &old_sigs, NULL);
+    if (thread_err != 0) {
         printf("RESULT: NPU_THREAD_FAIL\n");
         return 1;
     }
     printf("RESULT: MODEL_READY n_output=%d\n", io_num.n_output);
 
     if (http_start_server(http_port) != 0) return 1;
+    heartbeat();
+    /* armed only now that start-up has fully succeeded: an early "return 1"
+     * (no camera, no model, port busy) must not leave the board rebooting */
+    watchdog_arm();
 
     AccelState accel;
     accel_discover(&accel);
@@ -1780,6 +1864,7 @@ int main(int argc, char** argv) {
         bool stop = false;
 
         while ((client_fd >= 0 || g_nav_fd >= 0) && !g_quit) {
+            heartbeat();
             /* 1. hand the prepared frame to the NPU */
             if (ready_fb >= 0 && infl_fb < 0) {
                 npu_submit(&npu, fb_slot[ready_fb]);
@@ -2061,6 +2146,8 @@ int main(int argc, char** argv) {
     rknn_destroy_mem(ctx, input_mem);
     rknn_destroy_mem(ctx, input_mem2);
     rknn_destroy(ctx);
+    unlink(HEARTBEAT_FILE); /* clean exit: not a hang */
+    watchdog_disarm();      /* last of all: a teardown that hangs still resets the board */
 #ifdef LUCKFOX_HW_JPEG
     if (g_hwjpeg_nv12) kmsg_mark("main: teardown done, exiting");
 #endif

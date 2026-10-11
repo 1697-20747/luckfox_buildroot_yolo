@@ -1,0 +1,34 @@
+#!/bin/sh
+# luckfox_buildroot_yolo: persistent health log (2026-10-11 freeze hunt).
+# Every 5s: uptime, load, free memory, usb0 link state + rx/tx packet
+# counters, wlan0 state, stream-server heartbeat age, and any new USB-related
+# kernel messages -- appended to /userdata (survives a power cycle) and
+# synced. Question it answers: when the Mac loses the board, is the board
+# still running (server heartbeat fresh) with only usb0 dead, or is it hung?
+# Only plain file reads: nothing that can block on a task stuck in the kernel
+# (no pidof/ps, which read /proc/<pid>/cmdline).
+LOG=/userdata/healthlog.txt
+MAX=524288
+echo "=== boot $(cat /proc/sys/kernel/random/boot_id) ===" >> $LOG
+last_dmesg_lines=0
+while true; do
+	[ -f $LOG ] && [ $(wc -c < $LOG) -gt $MAX ] && mv -f $LOG $LOG.1
+	read up idle < /proc/uptime
+	read l1 l5 l15 rest < /proc/loadavg
+	avail=$(grep MemAvailable /proc/meminfo | tr -s ' ' | cut -d' ' -f2)
+	usb="absent"
+	if [ -d /sys/class/net/usb0 ]; then
+		usb="$(cat /sys/class/net/usb0/operstate) carrier=$(cat /sys/class/net/usb0/carrier 2>/dev/null) rx=$(cat /sys/class/net/usb0/statistics/rx_packets) tx=$(cat /sys/class/net/usb0/statistics/tx_packets) rxerr=$(cat /sys/class/net/usb0/statistics/rx_errors) txerr=$(cat /sys/class/net/usb0/statistics/tx_errors)"
+	fi
+	udc=$(cat /sys/class/udc/*/state 2>/dev/null | head -1)
+	hb="none"
+	[ -f /tmp/yolo-heartbeat ] && hb=$(( $(date +%s) - $(cat /tmp/yolo-heartbeat) ))s
+	echo "up=$up load=$l1 avail=${avail}kB udc=$udc usb0[$usb] hb_age=$hb" >> $LOG
+	# new USB / gadget kernel messages since the last pass
+	n=$(dmesg | wc -l)
+	if [ $n -lt $last_dmesg_lines ]; then last_dmesg_lines=0; fi
+	dmesg | tail -n +$((last_dmesg_lines + 1)) | grep -i -E "usb|dwc|gadget|ncm|android_work|udc" | sed 's/^/  kmsg: /' >> $LOG
+	last_dmesg_lines=$n
+	sync
+	sleep 5
+done
