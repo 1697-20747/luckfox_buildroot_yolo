@@ -1014,8 +1014,12 @@ static void http_send_wifi(int fd, const char* query) {
     http_send_simple(fd, "200 OK", "application/json", body, (size_t)len);
 }
 
-/* Newest first, at most the ring's 200 entries, plus per-class totals. */
-static void http_send_objects(int fd) {
+/* Newest first, at most the ring's 200 entries (or ?limit=N, e.g. the main
+ * page's last 20), plus per-class totals over the whole session. */
+static void http_send_objects(int fd, const char* query) {
+    int limit = SESSION_MAX_OBJECTS;
+    const char* l = query ? strstr(query, "limit=") : NULL;
+    if (l) limit = std::max(0, atoi(l + 6));
     std::string body;
     body.reserve(16384);
     char tmp[256];
@@ -1031,7 +1035,7 @@ static void http_send_objects(int fd) {
         first = false;
     }
     body += "},\"objects\":[";
-    int n_live = std::min(g_session.total, SESSION_MAX_OBJECTS);
+    int n_live = std::min(std::min(g_session.total, SESSION_MAX_OBJECTS), limit);
     for (int k = 0; k < n_live; k++) {
         int id = g_session.total - k;
         const SessionObject& o = g_session.objs[(id - 1) % SESSION_MAX_OBJECTS];
@@ -1121,8 +1125,12 @@ static bool http_handle_connection(int fd, const char* ipstr) {
         http_send_status(fd);
     } else if (!strcmp(target, "/api/wifi")) {
         http_send_wifi(fd, query);
+    } else if (!strcmp(target, "/api/objects/reset")) {
+        session_reset(); /* clears the object log and per-class counts; track ids restart */
+        printf("RESULT: OBJECT_LOG_RESET\n");
+        http_send_objects(fd, NULL);
     } else if (!strcmp(target, "/api/objects")) {
-        http_send_objects(fd);
+        http_send_objects(fd, query);
     } else if (!strcmp(target, "/api/view")) {
         if (query && strstr(query, "mode=plain")) g_view_hud = false;
         else if (query && strstr(query, "mode=hud")) g_view_hud = true;
