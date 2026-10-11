@@ -5,6 +5,9 @@ RKNN — a possible offload target for detection/positional processing that's be
 Raspberry Pi 5 CPU. See `PROJECT_MEMORY.md` for the full real, dated history of what's actually
 been tried and found — this README is just the current entry point.
 
+> **Current install and architecture: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)** (short summary:
+> boot order, components, build/deploy, performance, stability results).
+
 > **2026-10-10: the board now runs Luckfox's Buildroot image, not Ubuntu.** Much of this README
 > describes the Ubuntu era (the `pico` user, systemd units, apt, on-device `g++`). Current setup:
 > `ssh root@172.32.0.70` (key only) over the USB cable; web UI at `http://172.32.0.70:8080/`,
