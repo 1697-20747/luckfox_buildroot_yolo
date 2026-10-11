@@ -5,6 +5,16 @@ Terse, dated, factual record of real changes to this project. For the full narra
 
 ## 2026-10-11
 
+- **Hardware JPEG switched back OFF by default** (`scripts/app.env`: `LUCKFOX_HW_JPEG=0`; software
+  libjpeg, 5.4fps). Stopping the server in hardware mode proved unsafe after all: once
+  `RK_MPI_SYS_Exit()` hung on a futex (process stuck holding port 8080; now bounded by a 3s
+  `alarm()`), once the whole board froze during a deploy -- 2 bad stops in ~9. That freeze also left
+  the just-deployed binary and libjpeg as zero-byte files (never flushed), so `deploy_app.sh` now
+  `sync`s before stopping the old server. Software-mode restarts verified clean mid-stream.
+- **Main page "Docs" link**, shown only if a docs site is installed at `www/docs/` on the board. The
+  site itself (Hugo, built on the Mac) is deliberately kept out of this repo: it lives in the
+  gitignored `local/` folder with its own deploy script.
+
 - **HUD tilt instruments now live from the MPU-6050** (were grey "no orientation source" stubs):
   pitch/roll from the smoothed gravity vector (`atan2`), feeding the horizon ladder (shifts with
   pitch, rotates with roll), the roll-ring pointer and the P/R readouts; also `pitch`/`roll` in

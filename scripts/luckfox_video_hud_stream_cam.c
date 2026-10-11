@@ -1268,6 +1268,13 @@ static void hwjpeg_shutdown(void) {
     RK_MPI_VENC_DestroyChn(HWJPEG_CHN);
     RK_MPI_SYS_MmzFree(g_hwjpeg_blk);
     g_hwjpeg_blk = RK_NULL;
+    /* Real hang seen 2026-10-11: RK_MPI_SYS_Exit() blocked forever on a
+     * futex inside librockit (process stuck holding port 8080, so the
+     * restart loop never restarted it). The encoder channel is already
+     * destroyed at this point, so the dangerous part is done: a 3s SIGALRM
+     * (default action: terminate) guarantees the process still exits. */
+    fflush(stdout);
+    alarm(3);
     RK_MPI_SYS_Exit();
     printf("RESULT: HW_JPEG_SHUTDOWN clean\n");
 }

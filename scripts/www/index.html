@@ -21,7 +21,10 @@
     border-bottom: 1px solid var(--line); }
   header h1 { font-size: 15px; margin: 0; letter-spacing: .08em; font-weight: 600; }
   header .sub { color: var(--dim); font-size: 12px; }
-  .pill { margin-left: auto; display: inline-flex; align-items: center; gap: 6px;
+  .navlink { margin-left: auto; color: var(--text); text-decoration: none; font-size: 13px;
+    padding: 3px 10px; border: 1px solid var(--line); border-radius: 6px; }
+  .navlink:hover { border-color: var(--accent); }
+  .pill { display: inline-flex; align-items: center; gap: 6px;
     padding: 3px 10px; border: 1px solid var(--line); border-radius: 99px; font-size: 12px; }
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); }
   .live .dot { background: var(--accent); box-shadow: 0 0 8px var(--accent); }
@@ -80,6 +83,7 @@
     <h1>LUCKFOX · RV1106</h1>
     <div class="sub">YOLOv8n live detection HUD</div>
   </div>
+  <a class="navlink" id="docsLink" href="/docs/" hidden>Docs</a>
   <div id="pill" class="pill"><span class="dot"></span><span id="pillText">Connecting…</span></div>
 </header>
 
@@ -292,6 +296,10 @@
       renderObjects(await r.json());
     } catch (e) {}
   }
+
+  // Only offer the Docs link when a docs site is installed on this board
+  // (it's deployed separately into www/docs/, not part of this repo).
+  fetch('/docs/', { cache: 'no-store' }).then((r) => { if (r.ok) $('docsLink').hidden = false; }).catch(() => {});
 
   play();
   poll();
