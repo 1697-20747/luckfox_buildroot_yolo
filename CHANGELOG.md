@@ -5,6 +5,15 @@ Terse, dated, factual record of real changes to this project. For the full narra
 
 ## 2026-10-11
 
+- **Option C tested and rejected; board back on option A.** Rockit VI capture with in-process 3A
+  started cleanly (correct exposure, 14.1fps, same as A) but hung in restart cycle 2 with the same
+  signature: eMMC re-initialised 5.5s after the camera stream restart, write I/O error, journal
+  aborted. So the trigger is the 3A library's activity on a stream restart in whichever process runs
+  it; what option A changes is the timing -- a fresh 3A process gets ~2s to settle before the stream
+  starts. Summary: no 3A 0/30, option A 0/30, persistent 3A 5/~25, option C 1/2. Reverted via
+  app.env (LUCKFOX_PIPELINE removed). Also: S05watchdog now actually installed with its debugfs
+  mount (an earlier tar transfer had failed), so storage faults capture the eMMC controller registers.
+
 - **Board hangs: root cause localised by evidence, and fixed (option A).** New tooling first:
   `yolo_supervisor` (static, memory-locked) owns the hardware watchdog and resets the board when the
   stream server's heartbeat goes stale or a /userdata write+fsync stalls -- after dumping every task's
