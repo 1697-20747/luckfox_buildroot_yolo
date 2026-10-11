@@ -1,0 +1,25 @@
+#!/bin/sh
+# luckfox_buildroot_yolo: feed the hardware watchdog (enabled in the kernel
+# by buildroot/kernel-patches/0002). If userspace freezes -- as the board did
+# twice stopping the hardware-JPEG encoder -- the feeding stops and the SoC
+# resets itself ~15s later instead of needing a power cycle. The kernel log
+# of the frozen boot survives in ramoops: /sys/fs/pstore after reboot.
+case "$1" in
+	start)
+		# Hung-task detection is off: Rockchip's rockit kernel threads (vlog,
+		# valloc, vsys) idle in uninterruptible sleep by design, so with
+		# hung_task_panic every boot panicked ~60s in (seen 2026-10-11).
+		echo 0 > /proc/sys/kernel/hung_task_panic 2>/dev/null
+		echo 0 > /proc/sys/kernel/hung_task_timeout_secs 2>/dev/null
+		[ -e /dev/watchdog ] || { echo "S05watchdog: no /dev/watchdog"; exit 0; }
+		printf "Starting watchdog feeder: "
+		watchdog -T 15 -t 2 /dev/watchdog && echo "OK" || echo "FAIL"
+		;;
+	stop)
+		# busybox watchdog writes the magic 'V' on SIGTERM, disarming it
+		killall watchdog 2>/dev/null
+		;;
+	*)
+		exit 1
+		;;
+esac

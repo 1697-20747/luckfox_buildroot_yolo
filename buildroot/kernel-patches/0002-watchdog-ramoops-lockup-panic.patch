@@ -1,0 +1,46 @@
+diff --git a/arch/arm/boot/dts/rv1106-luckfox-pico-ultra-ipc.dtsi b/arch/arm/boot/dts/rv1106-luckfox-pico-ultra-ipc.dtsi
+index 505e53a83..5f3a60d93 100755
+--- a/arch/arm/boot/dts/rv1106-luckfox-pico-ultra-ipc.dtsi
++++ b/arch/arm/boot/dts/rv1106-luckfox-pico-ultra-ipc.dtsi
+@@ -564,3 +564,26 @@ tp_irq: tp-irq {
+ 		};
+ 	};
+ };
++
++/* luckfox_buildroot_yolo: crash diagnostics (2026-10-11, hardware-JPEG
++ * freeze investigation). The hardware watchdog resets the board if
++ * userspace stops feeding it (a frozen board recovers by itself instead of
++ * needing a power cycle), and ramoops keeps the kernel log of the previous
++ * boot in RAM across that reset (/sys/fs/pstore after the next boot).
++ * 1MB at 192MB: away from the top of RAM, where U-Boot relocates itself. */
++&wdt {
++	status = "okay";
++};
++
++/ {
++	reserved-memory {
++		ramoops@c000000 {
++			compatible = "ramoops";
++			reg = <0x0c000000 0x100000>;
++			record-size = <0x20000>;
++			console-size = <0x80000>;
++			pmsg-size = <0x20000>;
++			ftrace-size = <0x0>;
++		};
++	};
++};
+diff --git a/arch/arm/configs/luckfox_rv1106_linux_defconfig b/arch/arm/configs/luckfox_rv1106_linux_defconfig
+index 203ce2997..9407a1cc3 100755
+--- a/arch/arm/configs/luckfox_rv1106_linux_defconfig
++++ b/arch/arm/configs/luckfox_rv1106_linux_defconfig
+@@ -496,3 +496,10 @@ CONFIG_DEBUG_FS=y
+ # CONFIG_SCHED_DEBUG is not set
+ # CONFIG_FTRACE is not set
+ # CONFIG_RUNTIME_TESTING_MENU is not set
++CONFIG_PSTORE=y
++CONFIG_PSTORE_RAM=y
++CONFIG_PSTORE_CONSOLE=y
++CONFIG_PSTORE_PMSG=y
++CONFIG_SOFTLOCKUP_DETECTOR=y
++CONFIG_BOOTPARAM_SOFTLOCKUP_PANIC=y
++CONFIG_PANIC_TIMEOUT=5

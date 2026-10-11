@@ -5,6 +5,26 @@ Terse, dated, factual record of real changes to this project. For the full narra
 
 ## 2026-10-11
 
+- **JPEG: libjpeg-turbo (NEON), statically linked; hardware JPEG dropped.** 7.7fps, JPEG 27ms
+  (IJG libjpeg 9: 5.4fps / 83-93ms). `tools/build_jpeg_turbo.sh` cross-builds 2.1.4, sha256-pinned
+  to the SDK's own Buildroot package. The app no longer links or loads Rockit at all.
+- **Hardware JPEG freeze investigation, concluded.** Debug kernel (`kernel-patches/0002`): hardware
+  watchdog fed by `S05watchdog`, ramoops, soft-lockup panic; self-test passed (feeder killed -> reset
+  in 24s, log survived). `tools/hwjpeg_stress.sh` + kernel-log step markers from the app. Findings:
+  freezes during Rockit init, streaming and `RK_MPI_SYS_Exit()` teardown (last kernel line
+  `vi_release`), even with the V4L2 stream stopped first. The kernel is only half-dead -- USB
+  networking gone but the watchdog feeder alive -- so the board never resets and pstore stays empty;
+  only a power cycle recovers. Most likely cause: Rockit's media stack used alongside raw V4L2
+  capture on the same ISP, which Rockchip's own software never does. Side findings: the
+  hung-task panic I first enabled panicked every boot (~60s) because rockit's `vlog`/`valloc`/`vsys`
+  threads idle in D state -- removed from the patch and disabled at boot.
+- **`apply_kernel_patches.sh` fixed:** run inside the kernel subdirectory, `git apply` silently
+  ignored the patches' paths, so applying and the "already applied" check did nothing. Now applies
+  from the SDK root with `--directory`; verified on a pristine tree. Patch 0002 regenerated clean.
+- **Deploy no longer overwrites files in use:** `deploy_app.sh` unpacks to a staging dir and
+  renames into place (the four freezes before the stress tooling all followed a deploy that
+  overwrote the running binary/libjpeg in place).
+
 - **`docs-site/` removed from the repo** (kept locally, now gitignored): the Hugo mini site is
   board-only by choice. Earlier commits still contain it.
 

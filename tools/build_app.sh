@@ -2,8 +2,11 @@
 # Cross-compile the YOLO HUD stream server for the Buildroot board (uclibc
 # toolchain from the Luckfox SDK in the luckfox-sdk Docker volume) and stage
 # everything it needs to run in build/app_src/:
-#   luckfox_video_hud_stream_cam, lib/libjpeg.so.9 (not in the Buildroot image),
-#   the yolov8n model + labels (from board_backup/), www/ (the web UI).
+#   luckfox_video_hud_stream_cam (libjpeg-turbo linked statically -- build it
+#   first with tools/build_jpeg_turbo.sh), the yolov8n model + labels (from
+#   board_backup/), www/ (the web UI).
+# Hardware JPEG (Rockit VENC, -DLUCKFOX_HW_JPEG -lrockit) is deliberately not
+# built: it froze the board intermittently (2026-10-11, see CHANGELOG).
 # Then deploy with tools/deploy_app.sh.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -29,10 +32,8 @@ M=$S/output/out/media_out; A=$S/output/out/app_out
 cd /src
 ${TC}-g++ -O2 -Wall -Wno-unused-function -Wno-unused-variable -Wno-comment \
   luckfox_video_hud_stream_cam.c utils/image_drawing.c apex_hud_widgets.c \
-  -I. -Iutils -I3rdparty/stb_image -I$M/include/rga -I$M/include -I$A/include/libjpeg9 \
-  -L$M/lib -L$A/lib -Wl,-rpath-link,$M/lib -Wl,-rpath,/oem/usr/lib -Wl,-rpath,\$ORIGIN/lib \
-  -DLUCKFOX_HW_JPEG \
-  -o luckfox_video_hud_stream_cam -lrknnmrt -lrga -ljpeg -lrockit -lm -lpthread
-mkdir -p lib && cp -L $A/lib/libjpeg.so.9 lib/
+  -I. -Iutils -I3rdparty/stb_image -I$M/include/rga -I$M/include -I/sdk/jpeg-turbo/include \
+  -L$M/lib -Wl,-rpath-link,$M/lib -Wl,-rpath,/oem/usr/lib \
+  -o luckfox_video_hud_stream_cam -lrknnmrt -lrga /sdk/jpeg-turbo/lib/libjpeg.a -lm -lpthread
 '
 ls -la "$OUT/luckfox_video_hud_stream_cam"

@@ -1178,6 +1178,18 @@ static void rgb_to_nv12(const unsigned char* rgb, int w, int h, unsigned char* o
     }
 }
 
+/* Step markers written into the kernel log, so they land in order with the
+ * kernel's own messages -- and survive in ramoops (/sys/fs/pstore) if the
+ * board freezes and the watchdog resets it (2026-10-11 freeze hunt). */
+static void kmsg_mark(const char* step) {
+    static int fd = -2;
+    if (fd == -2) fd = open("/dev/kmsg", O_WRONLY | O_CLOEXEC);
+    if (fd < 0) return;
+    char line[160];
+    int n = snprintf(line, sizeof(line), "<6>yolo-hwjpeg: %s\n", step);
+    if (write(fd, line, n) < 0) { /* nothing useful to do */ }
+}
+
 static bool hwjpeg_create(int w, int h, PIXEL_FORMAT_E fmt) {
     VENC_CHN_ATTR_S attr;
     memset(&attr, 0, sizeof(attr));
@@ -1232,6 +1244,7 @@ static void hwjpeg_init(int w, int h) {
     }
     g_hwjpeg_stream.pstPack = (VENC_PACK_S*)malloc(sizeof(VENC_PACK_S));
     g_hwjpeg = true;
+    kmsg_mark("init: VENC channel + buffer ready");
     printf("RESULT: JPEG_MODE hardware VENC input=%s q=%d\n", g_hwjpeg_nv12 ? "NV12(cpu-converted)" : "RGB888", HWJPEG_QFACTOR);
 }
 
@@ -1264,9 +1277,13 @@ static void hwjpeg_release(void) {
 
 static void hwjpeg_shutdown(void) {
     if (!g_hwjpeg_blk) return;
+    kmsg_mark("shutdown: begin");
     RK_MPI_VENC_StopRecvFrame(HWJPEG_CHN);
+    kmsg_mark("shutdown: StopRecvFrame done");
     RK_MPI_VENC_DestroyChn(HWJPEG_CHN);
+    kmsg_mark("shutdown: DestroyChn done");
     RK_MPI_SYS_MmzFree(g_hwjpeg_blk);
+    kmsg_mark("shutdown: MmzFree done");
     g_hwjpeg_blk = RK_NULL;
     /* Real hang seen 2026-10-11: RK_MPI_SYS_Exit() blocked forever on a
      * futex inside librockit (process stuck holding port 8080, so the
@@ -1275,7 +1292,9 @@ static void hwjpeg_shutdown(void) {
      * (default action: terminate) guarantees the process still exits. */
     fflush(stdout);
     alarm(3);
+    kmsg_mark("shutdown: SYS_Exit begin");
     RK_MPI_SYS_Exit();
+    kmsg_mark("shutdown: SYS_Exit done");
     printf("RESULT: HW_JPEG_SHUTDOWN clean\n");
 }
 #endif
@@ -1706,19 +1725,28 @@ int main(int argc, char** argv) {
 
     printf("RESULT: SHUTTING_DOWN\n");
     if (client_fd >= 0) { close(client_fd); client_fd = -1; }
-#ifdef LUCKFOX_HW_JPEG
-    hwjpeg_shutdown();
-#endif
+    /* Camera first, Rockit last. Real freeze 2026-10-11 (kernel log streamed
+     * to the Mac): RK_MPI_SYS_Exit() closes every Rockit device, and the
+     * kernel locked up right after Rockit's vi_release -- while this
+     * process's own V4L2 stream on the same ISP was still running. So the
+     * V4L2 stream is fully stopped and closed before Rockit is torn down. */
     if (live_camera) {
         enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
         ioctl(v4l2_cap.fd, VIDIOC_STREAMOFF, &type);
         for (int i = 0; i < v4l2_cap.n_buffers; i++) munmap(v4l2_cap.buffers[i].start, v4l2_cap.buffers[i].length);
         close(v4l2_cap.fd);
     }
+#ifdef LUCKFOX_HW_JPEG
+    if (g_hwjpeg_blk) kmsg_mark("main: v4l2 stream closed, Rockit teardown next");
+    hwjpeg_shutdown();
+#endif
     free(frame_full);
     free(frame_small);
     for (uint32_t i = 0; i < io_num.n_output; i++) rknn_destroy_mem(ctx, output_mems[i]);
     rknn_destroy_mem(ctx, input_mem);
     rknn_destroy(ctx);
+#ifdef LUCKFOX_HW_JPEG
+    if (g_hwjpeg_nv12) kmsg_mark("main: teardown done, exiting");
+#endif
     return 0;
 }
