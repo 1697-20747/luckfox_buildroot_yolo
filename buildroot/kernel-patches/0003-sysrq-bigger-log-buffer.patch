@@ -1,0 +1,18 @@
+diff --git a/arch/arm/configs/luckfox_rv1106_linux_defconfig b/arch/arm/configs/luckfox_rv1106_linux_defconfig
+--- a/arch/arm/configs/luckfox_rv1106_linux_defconfig
++++ b/arch/arm/configs/luckfox_rv1106_linux_defconfig
+@@ -6,7 +6,7 @@
+ CONFIG_HIGH_RES_TIMERS=y
+ CONFIG_IKCONFIG=y
+ CONFIG_IKCONFIG_PROC=y
+-CONFIG_LOG_BUF_SHIFT=14
++CONFIG_LOG_BUF_SHIFT=17
+ CONFIG_CGROUPS=y
+ CONFIG_BLK_DEV_INITRD=y
+ CONFIG_CC_OPTIMIZE_FOR_SIZE=y
+@@ -504,3 +504,5 @@
+ CONFIG_SOFTLOCKUP_DETECTOR=y
+ CONFIG_BOOTPARAM_SOFTLOCKUP_PANIC=y
+ CONFIG_PANIC_TIMEOUT=5
++CONFIG_MAGIC_SYSRQ=y
++CONFIG_MAGIC_SYSRQ_DEFAULT_ENABLE=0x1

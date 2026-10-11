@@ -5,6 +5,24 @@ Terse, dated, factual record of real changes to this project. For the full narra
 
 ## 2026-10-11
 
+- **Board hangs: root cause localised by evidence, and fixed (option A).** New tooling first:
+  `yolo_supervisor` (static, memory-locked) owns the hardware watchdog and resets the board when the
+  stream server's heartbeat goes stale or a /userdata write+fsync stalls -- after dumping every task's
+  kernel stack (SysRq, `kernel-patches/0003`: SysRq + 128KB log buffer) and the eMMC controller
+  registers into the RAM crash log, which survives the warm reset. Hangs now self-recover in ~45s.
+  Crash logs from real hangs showed the same sequence every time: **~5.8s after the camera stream is
+  restarted, the eMMC stops completing writes** (`mmc0` re-initialised, `I/O error ... WRITE`,
+  journal aborted, every task blocked in `io_schedule`). Ruled out by test or data: NPU activity,
+  hardware JPEG, the server's own work, eMMC runtime PM (A/B), IR-cut switching, 3A writes to storage,
+  worn flash (EXT_CSD life 0-10%, pre-EOL normal). Restart stress results: long-running
+  rkaiq_3A_server across stream restarts **5 failures in ~25**; no 3A server **0/30**; fresh 3A
+  server started before every stream start (the boot-time order, which never failed in 12+ boots)
+  **0/30**. `yolo-app-start` now does the latter. The vendor 3A binary is closed source, so the
+  mechanism inside it isn't visible; the fix reproduces the configuration that never failed.
+- **Option C prepared, off by default:** `luckfox_video_hud_stream_rockit` -- Rockit VI capture with
+  in-process 3A (rk_aiq uAPI2), mirroring Rockchip's sample_vi. `LUCKFOX_PIPELINE=rockit` in
+  app.env selects it; default, unset, or safe mode = option A.
+
 - **Root filesystem survives power loss:** after repeated hard power cycles the board came up with
   a READ-ONLY root ("Couldn't remount RDWR because of unprocessed orphan inode list": stock Luckfox
   mounts root ro, then inittab remounts rw, which ext4 refuses while orphans are pending). Repaired

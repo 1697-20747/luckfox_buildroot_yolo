@@ -135,6 +135,18 @@ extern "C" {
  * (tools/build_app.sh defines LUCKFOX_HW_JPEG and links librockit); the
  * Ubuntu build keeps libjpeg-turbo, where the vendor media stack isn't
  * usable (raw MPP oopsed the kernel driver, see PROJECT_MEMORY.md). */
+#ifdef LUCKFOX_ROCKIT_VI
+/* Option C (2026-10-11): camera capture + 3A the way Rockchip's own RV1106
+ * software does it (rkipc, sample_vi) -- all in one process through Rockit's
+ * VI and in-process rkaiq (uAPI2) -- instead of raw V4L2 next to a separate
+ * rkaiq_3A_server, the mix implicated in the eMMC failures. Built as a
+ * separate binary (luckfox_video_hud_stream_rockit); selected with
+ * LUCKFOX_PIPELINE=rockit in app.env, falling back to the V4L2 build. */
+#include "rk_aiq_user_api2_sysctl.h"
+#include "rk_mpi_sys.h"
+#include "rk_mpi_mb.h"
+#include "rk_mpi_vi.h"
+#endif
 #ifdef LUCKFOX_HW_JPEG
 #include "rk_mpi_sys.h"
 #include "rk_mpi_mb.h"
@@ -659,6 +671,115 @@ static bool v4l2_capture_frame(V4L2Capture* cap, unsigned char* out_rgb) {
     return true;
 }
 
+#ifdef LUCKFOX_ROCKIT_VI
+/* Rockit VI + in-process 3A, mirroring media/samples/example/vi/sample_vi.c
+ * and common/{sample_comm_vi.c, isp3.x/sample_comm_isp.c}: 3A init+start
+ * first, then RK_MPI_SYS_Init and the VI device/pipe/channel; teardown in
+ * reverse (channel, device, SYS_Exit, then 3A stop+deinit last). */
+#define ROCKIT_CAM_ID 0
+#define ROCKIT_CHN_ID 0
+#define ROCKIT_IQ_DIR "/oem/usr/share/iqfiles"
+typedef struct {
+    rk_aiq_sys_ctx_t* aiq;
+    bool sys_init, dev_enabled, chn_enabled;
+    int width, height;
+    unsigned char* compact; /* NV12 without row padding, if the buffer has any */
+} RockitCam;
+
+static bool rockit_cam_open(RockitCam* c, int w, int h) {
+    memset(c, 0, sizeof(*c));
+    c->width = w; c->height = h;
+    setenv("HDR_MODE", "0", 1); /* normal (non-HDR), set before init as the sample does */
+    rk_aiq_static_info_t info;
+    memset(&info, 0, sizeof(info));
+    if (rk_aiq_uapi2_sysctl_enumStaticMetasByPhyId(ROCKIT_CAM_ID, &info) != XCAM_RETURN_NO_ERROR) {
+        printf("RESULT: AIQ_ENUM_FAIL\n"); return false;
+    }
+    printf("RESULT: AIQ_SENSOR %s\n", info.sensor_info.sensor_name);
+    rk_aiq_uapi2_sysctl_preInit_devBufCnt(info.sensor_info.sensor_name, "rkraw_rx", 2);
+    c->aiq = rk_aiq_uapi2_sysctl_init(info.sensor_info.sensor_name, ROCKIT_IQ_DIR, NULL, NULL);
+    if (!c->aiq) { printf("RESULT: AIQ_INIT_FAIL\n"); return false; }
+    if (rk_aiq_uapi2_sysctl_prepare(c->aiq, 0, 0, RK_AIQ_WORKING_MODE_NORMAL) != XCAM_RETURN_NO_ERROR) {
+        printf("RESULT: AIQ_PREPARE_FAIL\n"); return false;
+    }
+    if (rk_aiq_uapi2_sysctl_start(c->aiq) != XCAM_RETURN_NO_ERROR) { printf("RESULT: AIQ_START_FAIL\n"); return false; }
+
+    if (RK_MPI_SYS_Init() != RK_SUCCESS) { printf("RESULT: ROCKIT_SYS_INIT_FAIL\n"); return false; }
+    c->sys_init = true;
+
+    VI_DEV_ATTR_S dev_attr;
+    memset(&dev_attr, 0, sizeof(dev_attr));
+    RK_S32 r = RK_MPI_VI_GetDevAttr(ROCKIT_CAM_ID, &dev_attr);
+    if (r == RK_ERR_VI_NOT_CONFIG && RK_MPI_VI_SetDevAttr(ROCKIT_CAM_ID, &dev_attr) != RK_SUCCESS) {
+        printf("RESULT: VI_SET_DEV_ATTR_FAIL\n"); return false;
+    }
+    if (RK_MPI_VI_GetDevIsEnable(ROCKIT_CAM_ID) != RK_SUCCESS) {
+        if (RK_MPI_VI_EnableDev(ROCKIT_CAM_ID) != RK_SUCCESS) { printf("RESULT: VI_ENABLE_DEV_FAIL\n"); return false; }
+        c->dev_enabled = true;
+        VI_DEV_BIND_PIPE_S bind;
+        memset(&bind, 0, sizeof(bind));
+        bind.u32Num = 1;
+        bind.PipeId[0] = ROCKIT_CAM_ID;
+        if (RK_MPI_VI_SetDevBindPipe(ROCKIT_CAM_ID, &bind) != RK_SUCCESS) { printf("RESULT: VI_BIND_PIPE_FAIL\n"); return false; }
+    }
+    VI_CHN_ATTR_S chn;
+    memset(&chn, 0, sizeof(chn));
+    chn.stIspOpt.u32BufCount = 2;
+    chn.stIspOpt.enMemoryType = VI_V4L2_MEMORY_TYPE_DMABUF;
+    chn.u32Depth = 1; /* frames are fetched with GetChnFrame (no bound consumer) */
+    chn.enPixelFormat = RK_FMT_YUV420SP;
+    chn.enCompressMode = COMPRESS_MODE_NONE;
+    chn.stFrameRate.s32SrcFrameRate = -1;
+    chn.stFrameRate.s32DstFrameRate = -1;
+    chn.stSize.u32Width = w;
+    chn.stSize.u32Height = h;
+    if (RK_MPI_VI_SetChnAttr(ROCKIT_CAM_ID, ROCKIT_CHN_ID, &chn) != RK_SUCCESS) { printf("RESULT: VI_SET_CHN_ATTR_FAIL\n"); return false; }
+    if (RK_MPI_VI_EnableChn(ROCKIT_CAM_ID, ROCKIT_CHN_ID) != RK_SUCCESS) { printf("RESULT: VI_ENABLE_CHN_FAIL\n"); return false; }
+    c->chn_enabled = true;
+    printf("RESULT: ROCKIT_VI_READY %dx%d NV12 (in-process 3A, iq %s)\n", w, h, ROCKIT_IQ_DIR);
+    return true;
+}
+
+static bool rockit_cam_capture(RockitCam* c, unsigned char* out_rgb) {
+    VIDEO_FRAME_INFO_S f;
+    memset(&f, 0, sizeof(f));
+    if (RK_MPI_VI_GetChnFrame(ROCKIT_CAM_ID, ROCKIT_CHN_ID, &f, 1000) != RK_SUCCESS) {
+        printf("RESULT: VI_GET_FRAME_TIMEOUT\n");
+        return false;
+    }
+    RK_MPI_SYS_MmzFlushCache(f.stVFrame.pMbBlk, RK_TRUE); /* invalidate before the CPU reads the DMA buffer */
+    const unsigned char* nv12 = (const unsigned char*)RK_MPI_MB_Handle2VirAddr(f.stVFrame.pMbBlk);
+    int vw = f.stVFrame.u32VirWidth ? (int)f.stVFrame.u32VirWidth : c->width;
+    int vh = f.stVFrame.u32VirHeight ? (int)f.stVFrame.u32VirHeight : c->height;
+    if (vw == c->width && vh == c->height) {
+        nv12_to_rgb(nv12, c->width, c->height, out_rgb);
+    } else {
+        /* padded rows/planes: compact into a plain NV12 copy first */
+        if (!c->compact) c->compact = (unsigned char*)malloc((size_t)c->width * c->height * 3 / 2);
+        for (int y = 0; y < c->height; y++) memcpy(c->compact + (size_t)y * c->width, nv12 + (size_t)y * vw, c->width);
+        const unsigned char* uv = nv12 + (size_t)vw * vh;
+        unsigned char* uv_out = c->compact + (size_t)c->width * c->height;
+        for (int y = 0; y < c->height / 2; y++) memcpy(uv_out + (size_t)y * c->width, uv + (size_t)y * vw, c->width);
+        nv12_to_rgb(c->compact, c->width, c->height, out_rgb);
+    }
+    RK_MPI_VI_ReleaseChnFrame(ROCKIT_CAM_ID, ROCKIT_CHN_ID, &f);
+    return true;
+}
+
+static void rockit_cam_close(RockitCam* c) {
+    if (c->chn_enabled) RK_MPI_VI_DisableChn(ROCKIT_CAM_ID, ROCKIT_CHN_ID);
+    if (c->dev_enabled) RK_MPI_VI_DisableDev(ROCKIT_CAM_ID);
+    if (c->sys_init) RK_MPI_SYS_Exit();
+    if (c->aiq) {
+        rk_aiq_uapi2_sysctl_stop(c->aiq, false);
+        rk_aiq_uapi2_sysctl_deinit(c->aiq);
+    }
+    free(c->compact);
+    memset(c, 0, sizeof(*c));
+    printf("RESULT: ROCKIT_VI_CLOSED\n");
+}
+#endif
+
 /* Start time of the NPU job in flight (0 = none). A job that never finishes
  * means the NPU hung -- seen 2026-10-11: the worker stuck uninterruptibly in
  * rknpu_submit_ioctl while the main thread kept running, so a main-thread
@@ -935,6 +1056,20 @@ static volatile sig_atomic_t g_quit = 0;
  * kernel half-alive (USB networking dead, watchdog feeder still running),
  * with this process stuck; a stale heartbeat makes the health monitor stop
  * the watchdog feeder so the hardware watchdog resets the board. */
+/* Start-up / first-frame step markers written into the kernel log, so they
+ * line up with kernel messages (and survive in ramoops on a supervisor
+ * reset). Added 2026-10-11 after crash logs showed the eMMC failing ~5.75s
+ * after the camera stream starts on a server restart -- to see exactly which
+ * start-up step coincides with it instead of guessing. */
+static void step_mark(const char* step) {
+    static int fd = -2;
+    if (fd == -2) fd = open("/dev/kmsg", O_WRONLY | O_CLOEXEC);
+    if (fd < 0) return;
+    char line[160];
+    int n = snprintf(line, sizeof(line), "<6>yolo-server: %s\n", step);
+    if (write(fd, line, n) < 0) { /* best effort */ }
+}
+
 #define HEARTBEAT_FILE "/tmp/yolo-heartbeat"
 /* Hardware watchdog, fed by this process itself (2026-10-11). A separate
  * feeder + monitor failed in a real freeze: the kernel was half-alive, the
@@ -1706,11 +1841,27 @@ int main(int argc, char** argv) {
     }
 
     V4L2Capture v4l2_cap;
+#ifdef LUCKFOX_ROCKIT_VI
+    RockitCam rk_cam;
     if (live_camera) {
+        step_mark("start: opening Rockit VI camera (in-process 3A)");
+        if (!rockit_cam_open(&rk_cam, display_w, display_h)) {
+            rockit_cam_close(&rk_cam);
+            return 1;
+        }
+        v4l2_cap.width = display_w;
+        v4l2_cap.height = display_h;
+    }
+#else
+    if (live_camera) {
+        step_mark("start: opening V4L2 camera");
         if (!v4l2_open_and_configure(&v4l2_cap, video_path, display_w, display_h)) {
             printf("RESULT: V4L2_INIT_FAIL\n");
             return 1;
         }
+    }
+#endif
+    if (live_camera) {
         /* the driver may have negotiated a different real size than
          * requested (stepwise 32x32, 8px steps on this sensor) -- use
          * what it actually reports from here on, not the request */
@@ -1727,7 +1878,9 @@ int main(int argc, char** argv) {
 
     /* --- RKNN init, zero-copy I/O, ONCE --- */
     rknn_context ctx = 0;
+    step_mark("start: camera streaming; rknn_init (model load) begin");
     int ret = rknn_init(&ctx, (void*)model_path, 0, 0, NULL);
+    step_mark("start: rknn_init done");
     if (ret != RKNN_SUCC) { printf("RESULT: INIT_FAIL ret=%d\n", ret); return 1; }
 
     rknn_input_output_num io_num;
@@ -1747,6 +1900,7 @@ int main(int argc, char** argv) {
         rknn_query(ctx, RKNN_QUERY_NATIVE_NHWC_OUTPUT_ATTR, &output_attrs[i], sizeof(rknn_tensor_attr));
     }
 
+    step_mark("start: rknn_create_mem (NPU buffers) begin");
     rknn_tensor_mem* input_mem = rknn_create_mem(ctx, input_attr.size_with_stride);
     rknn_set_io_mem(ctx, input_mem, &input_attr);
     std::vector<rknn_tensor_mem*> output_mems(io_num.n_output);
@@ -1787,12 +1941,17 @@ int main(int argc, char** argv) {
         return 1;
     }
     printf("RESULT: MODEL_READY n_output=%d\n", io_num.n_output);
+    step_mark("start: NPU buffers + worker ready");
 
     if (http_start_server(http_port) != 0) return 1;
+    step_mark("start: HTTP listening, idle until a viewer/subscriber connects");
     heartbeat();
-    /* armed only now that start-up has fully succeeded: an early "return 1"
-     * (no camera, no model, port busy) must not leave the board rebooting */
-    watchdog_arm();
+    /* The hardware watchdog is owned by yolo_supervisor (started at boot), not
+     * this process: the server disarming it on exit, and then failing to
+     * restart, left a hung board unprotected (2026-10-11). The supervisor
+     * watches this process's heartbeat instead. watchdog_arm() stays only for
+     * running the server stand-alone without the supervisor. */
+    if (getenv("LUCKFOX_SERVER_OWNS_WATCHDOG")) watchdog_arm();
 
     AccelState accel;
     accel_discover(&accel);
@@ -1867,6 +2026,8 @@ int main(int argc, char** argv) {
             heartbeat();
             /* 1. hand the prepared frame to the NPU */
             if (ready_fb >= 0 && infl_fb < 0) {
+                static bool first_job_marked = false;
+                if (!first_job_marked) { step_mark("run: first NPU job submitted"); first_job_marked = true; }
                 npu_submit(&npu, fb_slot[ready_fb]);
                 infl_fb = ready_fb;
                 ready_fb = -1;
@@ -1884,7 +2045,11 @@ int main(int argc, char** argv) {
                 bool got_frame;
                 unsigned char* cap_frame = frames[fb];
                 if (live_camera) {
+#ifdef LUCKFOX_ROCKIT_VI
+                    got_frame = rockit_cam_capture(&rk_cam, cap_frame);
+#else
                     got_frame = v4l2_capture_frame(&v4l2_cap, cap_frame);
+#endif
                 } else {
                     size_t n = fread(cap_frame, 1, display_w * display_h * 3, ffmpeg_pipe);
                     got_frame = (n == (size_t)(display_w * display_h * 3));
@@ -2101,6 +2266,8 @@ int main(int argc, char** argv) {
             /* 4. wait for the NPU; that frame is displayed next iteration */
             if (infl_fb >= 0) {
                 npu_wait(&npu);
+                static bool first_done_marked = false;
+                if (!first_done_marked) { step_mark("run: first NPU job done"); first_done_marked = true; }
                 if (npu.ret[fb_slot[infl_fb]] != RKNN_SUCC) {
                     printf("RESULT: RUN_FAIL ret=%d\n", npu.ret[fb_slot[infl_fb]]);
                     break;
@@ -2125,12 +2292,16 @@ int main(int argc, char** argv) {
      * kernel locked up right after Rockit's vi_release -- while this
      * process's own V4L2 stream on the same ISP was still running. So the
      * V4L2 stream is fully stopped and closed before Rockit is torn down. */
+#ifdef LUCKFOX_ROCKIT_VI
+    if (live_camera) rockit_cam_close(&rk_cam);
+#else
     if (live_camera) {
         enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
         ioctl(v4l2_cap.fd, VIDIOC_STREAMOFF, &type);
         for (int i = 0; i < v4l2_cap.n_buffers; i++) munmap(v4l2_cap.buffers[i].start, v4l2_cap.buffers[i].length);
         close(v4l2_cap.fd);
     }
+#endif
 #ifdef LUCKFOX_HW_JPEG
     if (g_hwjpeg_blk) kmsg_mark("main: v4l2 stream closed, Rockit teardown next");
     hwjpeg_shutdown();

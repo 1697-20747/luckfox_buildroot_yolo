@@ -16,39 +16,79 @@ case "$1" in
 		# a deliberate stop is not a hang: clear the boot-loop guard too
 		# (killing this script also kills its 60s clear-the-guard timer)
 		rm -f $GUARD; sync
-		killall luckfox_video_hud_stream_cam rkaiq_3A_server 2>/dev/null
+		killall luckfox_video_hud_stream_cam luckfox_video_hud_stream_rockit rkaiq_3A_server 2>/dev/null
 		exit 0
 		;;
 esac
 export PATH=/oem/usr/bin:$PATH LD_LIBRARY_PATH=/oem/usr/lib:$LD_LIBRARY_PATH
 mkdir -p /var/log
-rkaiq_3A_server > /var/log/yolo-3a.log 2>&1 &
-# WiFi is off by default (web UI button turns it on); see /usr/bin/yolo-wifi
-/usr/bin/yolo-wifi boot-off > /dev/null 2>&1 &
-sleep 2
 
-# opt-in settings for the app, e.g. LUCKFOX_HW_JPEG=1
+# Fresh 3A server before EVERY stream-server start, in the boot-time order
+# (3A first, then the camera stream). Evidence, 2026-10-11 restart stress
+# tests with the supervisor's crash-log capture: with one long-running 3A
+# server that had to follow the camera stream being stopped and restarted,
+# the eMMC failed (writes stop completing ~5.8s after the stream restart;
+# card re-init doesn't recover; storage hangs) about 1 restart in 5 -- 5
+# failures in ~25 restarts. With no 3A server: 0 in 30. And the first stream
+# start after boot, which always runs against a freshly started 3A server,
+# never failed (12+ boots). The vendor 3A binary is closed source, so the
+# mechanism inside it isn't visible; this reproduces the configuration that
+# never failed.
+start_3a() {
+	killall rkaiq_3A_server 2>/dev/null
+	for i in 1 2 3 4 5 6 7 8 9 10; do
+		pidof rkaiq_3A_server > /dev/null || break
+		sleep 0.5
+	done
+	rkaiq_3A_server > /var/log/yolo-3a.log 2>&1 &
+	sleep 2
+}
+# opt-in settings for the app, e.g. LUCKFOX_PIPELINE=rockit
 # set -a: everything app.env assigns is exported to the app (e.g.
 # LUCKFOX_CAM_HFOV_DEG / LUCKFOX_CAM_VFOV_DEG for navigation bearings)
 set -a; [ -f $APP_DIR/app.env ] && . $APP_DIR/app.env; set +a
 if [ -f $GUARD ]; then
-	echo "$(date) previous boot did not clear $GUARD: safe mode (experimental options off)" >> /var/log/yolo-stream.log
-	unset LUCKFOX_HW_JPEG LUCKFOX_VENC_FMT
+	echo "$(date) previous boot did not clear $GUARD: safe mode (experimental options off, V4L2 pipeline)" >> /var/log/yolo-stream.log
+	unset LUCKFOX_HW_JPEG LUCKFOX_VENC_FMT LUCKFOX_PIPELINE
 	# and no hardware watchdog this boot: a hang that recurs at every start
 	# must not turn into an endless reset loop (one reset, then this)
 	export LUCKFOX_NO_WATCHDOG=1
 fi
 export LUCKFOX_HW_JPEG LUCKFOX_VENC_FMT
 
-if [ -x $APP_DIR/luckfox_video_hud_stream_cam ]; then
+# Pipeline (2026-10-11): "v4l2" (option A, default) = raw V4L2 capture + the
+# separate rkaiq_3A_server, restarted fresh before every server start;
+# "rockit" (option C, under test) = Rockit VI capture + in-process 3A, the way
+# Rockchip's own software runs -- no separate 3A server (two 3A instances on
+# one camera would conflict). Any problem with C: set LUCKFOX_PIPELINE=v4l2
+# (or remove it) in app.env; safe mode also forces v4l2.
+BIN=luckfox_video_hud_stream_cam
+if [ "${LUCKFOX_PIPELINE:-v4l2}" = rockit ] && [ -x $APP_DIR/luckfox_video_hud_stream_rockit ]; then
+	BIN=luckfox_video_hud_stream_rockit
+fi
+prepare_camera() {
+	if [ $BIN = luckfox_video_hud_stream_rockit ]; then
+		killall rkaiq_3A_server 2>/dev/null
+		sleep 2
+	else
+		start_3a
+	fi
+}
+echo "$(date) pipeline: $BIN" >> /var/log/yolo-stream.log
+prepare_camera
+# WiFi is off by default (web UI button turns it on); see /usr/bin/yolo-wifi
+/usr/bin/yolo-wifi boot-off > /dev/null 2>&1 &
+
+if [ -x $APP_DIR/$BIN ]; then
 	touch $GUARD; sync
 	( sleep 60; rm -f $GUARD; sync ) &
 	cd $APP_DIR
 	# restart if it ever exits (like systemd's Restart=on-failure on Ubuntu)
 	while true; do
-		./luckfox_video_hud_stream_cam yolov8n-optimized-rv1106-1.6.0.rknn /dev/video11 \
+		./$BIN yolov8n-optimized-rv1106-1.6.0.rknn /dev/video11 \
 			coco_80_labels_list.txt 8080 >> /var/log/yolo-stream.log 2>&1
-		echo "stream exited $?, restarting in 5s" >> /var/log/yolo-stream.log
-		sleep 5
+		echo "stream exited $?, restarting in ~5s" >> /var/log/yolo-stream.log
+		sleep 3
+		prepare_camera
 	done
 fi

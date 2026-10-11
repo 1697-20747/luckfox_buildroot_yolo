@@ -7,7 +7,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BOARD=root@172.32.0.70
 cd "$ROOT/build/app_src"
 # COPYFILE_DISABLE: stop macOS tar adding ._* AppleDouble files
-COPYFILE_DISABLE=1 tar -cf - luckfox_video_hud_stream_cam www app.env \
+COPYFILE_DISABLE=1 tar -cf - luckfox_video_hud_stream_cam luckfox_video_hud_stream_rockit yolo_supervisor www app.env \
     yolov8n-optimized-rv1106-1.6.0.rknn coco_80_labels_list.txt \
   | ssh "$BOARD" 'set -e
     # Unpack into a staging dir, then RENAME into place: never write over a
@@ -19,14 +19,20 @@ COPYFILE_DISABLE=1 tar -cf - luckfox_video_hud_stream_cam www app.env \
     rm -rf $NEW && mkdir -p $NEW $APP && tar -xf - -C $NEW && chown -R root:root $NEW
     [ -d $APP/www/docs ] && mv $APP/www/docs $NEW/www/docs   # docs site is deployed separately
     sync
-    for f in luckfox_video_hud_stream_cam app.env yolov8n-optimized-rv1106-1.6.0.rknn coco_80_labels_list.txt; do
+    for f in luckfox_video_hud_stream_cam luckfox_video_hud_stream_rockit yolo_supervisor app.env yolov8n-optimized-rv1106-1.6.0.rknn coco_80_labels_list.txt; do
         mv -f $NEW/$f $APP/$f
     done
     rm -rf $APP/lib   # libjpeg is linked statically now; old shared copy unused
     rm -rf $APP/www.old; [ -d $APP/www ] && mv $APP/www $APP/www.old; mv $NEW/www $APP/www; rm -rf $APP/www.old
     rm -rf $NEW; sync'
 # Stop the old server only after the new files are safely on disk; the
-# boot-time restart loop starts the new binary within 5s.
-ssh "$BOARD" 'killall luckfox_video_hud_stream_cam 2>/dev/null; true'
+# boot-time restart loop starts the new binary within 5s. NO_RESTART=1 leaves
+# the running server alone (the new files take effect at the next start or
+# reboot) -- e.g. when a reboot follows anyway.
+if [ "${NO_RESTART:-0}" = 1 ]; then
+    echo "NO_RESTART=1: files installed, running server left alone"
+    exit 0
+fi
+ssh "$BOARD" 'killall luckfox_video_hud_stream_cam luckfox_video_hud_stream_rockit 2>/dev/null; true'
 echo "Deployed. If yolo-app-start's restart loop is running it restarts the server within 5s;"
 echo "otherwise: ssh $BOARD /usr/bin/yolo-app-start &   (or reboot)"

@@ -20,7 +20,7 @@ if [ ! -f "$OUT/utils/image_drawing.c" ]; then
         pico/rknn_test/utils pico/rknn_test/3rdparty pico/rknn_test/rknn_api.h \
         pico/rknn_test/coco_80_labels_list.txt pico/rknn_test/yolov8n-optimized-rv1106-1.6.0.rknn
 fi
-cp "$ROOT"/scripts/luckfox_video_hud_stream_cam.c "$ROOT"/scripts/apex_hud_widgets.[ch] "$OUT"/
+cp "$ROOT"/scripts/luckfox_video_hud_stream_cam.c "$ROOT"/scripts/apex_hud_widgets.[ch] "$ROOT"/scripts/yolo_supervisor.c "$OUT"/
 rm -rf "$OUT/www" && cp -R "$ROOT/scripts/www" "$OUT/www"
 cp "$ROOT/scripts/app.env" "$OUT/app.env"
 
@@ -35,5 +35,18 @@ ${TC}-g++ -O2 -Wall -Wno-unused-function -Wno-unused-variable -Wno-comment \
   -I. -Iutils -I3rdparty/stb_image -I$M/include/rga -I$M/include -I/sdk/jpeg-turbo/include \
   -L$M/lib -Wl,-rpath-link,$M/lib -Wl,-rpath,/oem/usr/lib \
   -o luckfox_video_hud_stream_cam -lrknnmrt -lrga /sdk/jpeg-turbo/lib/libjpeg.a -lm -lpthread
+# Option C: the same server with Rockit VI capture + in-process 3A (see
+# LUCKFOX_ROCKIT_VI in the source); selected on the board by app.env
+# LUCKFOX_PIPELINE=rockit. Flags match the RV1106 sample Makefile in the SDK.
+AIQ=$M/include/rkaiq
+${TC}-g++ -O2 -Wall -Wno-unused-function -Wno-unused-variable -Wno-comment \
+  -DLUCKFOX_ROCKIT_VI -DISP_HW_V30 -DRV1106 -DUAPI2 \
+  luckfox_video_hud_stream_cam.c utils/image_drawing.c apex_hud_widgets.c \
+  -I. -Iutils -I3rdparty/stb_image -I$M/include/rga -I$M/include -I/sdk/jpeg-turbo/include \
+  -I$AIQ -I$AIQ/uAPI2 -I$AIQ/common -I$AIQ/xcore -I$AIQ/algos -I$AIQ/iq_parser -I$AIQ/iq_parser_v2 \
+  -L$M/lib -Wl,-rpath-link,$M/lib -Wl,-rpath,/oem/usr/lib \
+  -o luckfox_video_hud_stream_rockit -lrknnmrt -lrga -lrockit -lrkaiq /sdk/jpeg-turbo/lib/libjpeg.a -lm -lpthread
+# the watchdog supervisor: static, so it needs nothing from disk once running
+${TC}-gcc -O2 -Wall -static -o yolo_supervisor yolo_supervisor.c -lpthread
 '
-ls -la "$OUT/luckfox_video_hud_stream_cam"
+ls -la "$OUT/luckfox_video_hud_stream_cam" "$OUT/luckfox_video_hud_stream_rockit" "$OUT/yolo_supervisor"
