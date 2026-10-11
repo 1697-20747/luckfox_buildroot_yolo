@@ -5,6 +5,15 @@ Terse, dated, factual record of real changes to this project. For the full narra
 
 ## 2026-10-11
 
+- **Correction: option A is a mitigation, not a fix.** The 100-cycle soak hung at cycle 3 (same
+  signature), so A is about 1 failure in 33 restarts, against 1 in 5 with a persistent 3A server.
+  The eMMC controller state at the hang shows a write (CMD25) with 0 of 32 blocks moved, TXDR pending
+  and the FIFO empty while the card is idle: the controller's internal DMA stopped feeding it. No clock
+  rate changes across a restart. `yolo_supervisor` now maps the controller (/dev/mem 0xffa90000) at
+  start-up and dumps all its registers, including the IDMAC ones, on a storage fault.
+  `LUCKFOX_3A_RESTART=0` in app.env keeps one 3A server across restarts (experiments only).
+  Vendor report draft: docs/vendor-report-emmc-hang-on-camera-restart.md.
+
 - **Option C tested and rejected; board back on option A.** Rockit VI capture with in-process 3A
   started cleanly (correct exposure, 14.1fps, same as A) but hung in restart cycle 2 with the same
   signature: eMMC re-initialised 5.5s after the camera stream restart, write I/O error, journal
@@ -14,7 +23,7 @@ Terse, dated, factual record of real changes to this project. For the full narra
   app.env (LUCKFOX_PIPELINE removed). Also: S05watchdog now actually installed with its debugfs
   mount (an earlier tar transfer had failed), so storage faults capture the eMMC controller registers.
 
-- **Board hangs: root cause localised by evidence, and fixed (option A).** New tooling first:
+- **Board hangs: root cause localised by evidence; option A mitigation (see correction above).** New tooling first:
   `yolo_supervisor` (static, memory-locked) owns the hardware watchdog and resets the board when the
   stream server's heartbeat goes stale or a /userdata write+fsync stalls -- after dumping every task's
   kernel stack (SysRq, `kernel-patches/0003`: SysRq + 128KB log buffer) and the eMMC controller

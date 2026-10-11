@@ -66,9 +66,13 @@ BIN=luckfox_video_hud_stream_cam
 if [ "${LUCKFOX_PIPELINE:-v4l2}" = rockit ] && [ -x $APP_DIR/luckfox_video_hud_stream_rockit ]; then
 	BIN=luckfox_video_hud_stream_rockit
 fi
+# LUCKFOX_3A_RESTART=0 (experiments only): keep one 3A server across stream
+# restarts -- the configuration that triggers the eMMC hang most often.
 prepare_camera() {
 	if [ $BIN = luckfox_video_hud_stream_rockit ]; then
 		killall rkaiq_3A_server 2>/dev/null
+		sleep 2
+	elif [ "${LUCKFOX_3A_RESTART:-1}" = 0 ] && pidof rkaiq_3A_server > /dev/null; then
 		sleep 2
 	else
 		start_3a

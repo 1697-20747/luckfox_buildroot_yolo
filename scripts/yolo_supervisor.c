@@ -31,6 +31,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -116,6 +117,35 @@ static void dump_file_to_pmsg(const char* path) {
     if (g_pmsg >= 0 && write(g_pmsg, buf, n) < 0) { /* best effort */ }
 }
 
+/* eMMC controller (dw_mmc @ 0xffa90000) registers, mapped at start-up so a
+ * fault-time read needs no lookup. 2026-10-11 capture showed a write with 0
+ * of 32 blocks moved, TXDR pending and an empty FIFO -- the internal DMA
+ * never fed the FIFO. The IDMAC registers say why (IDSTS fatal-bus-error,
+ * current descriptor/buffer address, byte counters). Only meaningful while
+ * the controller is clocked (it is, mid-request). */
+#define EMMC_REG_BASE 0xffa90000UL
+static volatile uint32_t* g_emmc_regs = NULL;
+static void map_emmc_regs(void) {
+    int fd = open("/dev/mem", O_RDONLY | O_SYNC | O_CLOEXEC);
+    if (fd < 0) return;
+    void* p = mmap(NULL, 0x1000, PROT_READ, MAP_SHARED, fd, EMMC_REG_BASE);
+    close(fd);
+    if (p != MAP_FAILED) g_emmc_regs = (volatile uint32_t*)p;
+}
+static void dump_emmc_regs(void) {
+    if (!g_emmc_regs) { note(0, "eMMC registers not mapped"); return; }
+    static const struct { unsigned off; const char* name; } named[] = {
+        {0x00, "CTRL"}, {0x08, "CLKDIV"}, {0x10, "CLKENA"}, {0x14, "TMOUT"}, {0x18, "CTYPE"},
+        {0x1c, "BLKSIZ"}, {0x20, "BYTCNT"}, {0x24, "INTMASK"}, {0x28, "CMDARG"}, {0x2c, "CMD"},
+        {0x40, "MINTSTS"}, {0x44, "RINTSTS"}, {0x48, "STATUS"}, {0x4c, "FIFOTH"},
+        {0x5c, "TCBCNT"}, {0x60, "TBBCNT"}, {0x64, "DEBNCE"}, {0x80, "BMOD"}, {0x84, "PLDMND"},
+        {0x88, "DBADDR"}, {0x8c, "IDSTS"}, {0x90, "IDINTEN"}, {0x94, "DSCADDR"}, {0x98, "BUFADDR"},
+    };
+    note(0, "---- dw_mmc @ 0x%lx registers ----", EMMC_REG_BASE);
+    for (unsigned i = 0; i < sizeof(named) / sizeof(named[0]); i++)
+        note(0, "  %-8s (0x%02x) = 0x%08x", named[i].name, named[i].off, g_emmc_regs[named[i].off / 4]);
+}
+
 static void* io_checker(void* arg) {
     (void)arg;
     for (;;) {
@@ -136,6 +166,7 @@ int main(void) {
     g_kmsg = open("/dev/kmsg", O_WRONLY | O_CLOEXEC);
     g_pmsg = open("/dev/pmsg0", O_WRONLY | O_CLOEXEC);
     g_sysrq = open("/proc/sysrq-trigger", O_WRONLY | O_CLOEXEC); /* opened now: no lookup needed at fault time */
+    map_emmc_regs();
 
     int faults = read_fault_count();
     if (faults >= MAX_CONSECUTIVE_FAULTS) {
@@ -199,6 +230,7 @@ int main(void) {
             note(1, "FAULT: %s (%s) -- dumping task states, then stopping watchdog kicks (reset in ~%ds)",
                  fault, detail, t);
             if (strstr(fault, "storage")) {
+                dump_emmc_regs();
                 dump_file_to_pmsg("/sys/kernel/debug/mmc0/regs");
                 dump_file_to_pmsg("/sys/kernel/debug/mmc0/ios");
                 dump_file_to_pmsg("/sys/kernel/debug/mmc0/state");
