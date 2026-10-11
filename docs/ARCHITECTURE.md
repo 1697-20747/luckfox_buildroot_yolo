@@ -83,6 +83,7 @@ S21appinit    Rockchip's RkLunch.sh, with rkipc replaced by /usr/bin/yolo-app-st
 | Memory | about 127 MB free, flat |
 | Restart test | 100/100 server restarts clean with `yolo_camd` (before: 1 in 33 to 1 in 7 hung) |
 | Continuous run | 3 h with viewer + navigation subscriber: 0 resets, 13.1–14.1 fps, memory flat |
+| Hardware JPEG | 50/50 restarts clean (Rockit teardown every restart); JPEG 12 ms, CPU 75% (opt-in) |
 
 ## Tools
 

@@ -41,7 +41,7 @@ for n in $(seq 1 "$CYCLES"); do
     curl -s --max-time 12 "$URL/stream?id=rst$n" -o /dev/null &
     curl -s -N --max-time 12 "$URL/api/detections/stream" -o /dev/null &
     sleep $(( (RANDOM % 6) + 3 ))
-    out=$($SSH 'killall luckfox_video_hud_stream_cam luckfox_video_hud_stream_rockit 2>/dev/null; for i in 1 2 3 4 5 6 7 8; do sleep 1; pidof luckfox_video_hud_stream_cam luckfox_video_hud_stream_rockit >/dev/null || break; done; pidof luckfox_video_hud_stream_cam luckfox_video_hud_stream_rockit >/dev/null && echo STUCK || echo exited' 2>&1)
+    out=$($SSH 'killall luckfox_video_hud_stream_cam luckfox_video_hud_stream_rockit luckfox_video_hud_stream_hwjpeg 2>/dev/null; for i in 1 2 3 4 5 6 7 8; do sleep 1; pidof luckfox_video_hud_stream_cam luckfox_video_hud_stream_rockit luckfox_video_hud_stream_hwjpeg >/dev/null || break; done; pidof luckfox_video_hud_stream_cam luckfox_video_hud_stream_rockit luckfox_video_hud_stream_hwjpeg >/dev/null && echo STUCK || echo exited' 2>&1)
     sleep 8   # restart loop brings it back within ~5s, then model load
     if curl -s -o /dev/null --max-time 3 "$URL/api/status" && [[ "$out" == exited* ]]; then
         clean=$((clean+1)); echo "cycle $n: clean" | tee -a "$LOGDIR/cycles.log"

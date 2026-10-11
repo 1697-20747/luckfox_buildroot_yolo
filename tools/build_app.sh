@@ -5,8 +5,8 @@
 #   luckfox_video_hud_stream_cam (libjpeg-turbo linked statically -- build it
 #   first with tools/build_jpeg_turbo.sh), the yolov8n model + labels (from
 #   board_backup/), www/ (the web UI).
-# Hardware JPEG (Rockit VENC, -DLUCKFOX_HW_JPEG -lrockit) is deliberately not
-# built: it froze the board intermittently (2026-10-11, see CHANGELOG).
+# Hardware JPEG (Rockit VENC) is built as a separate opt-in binary,
+# luckfox_video_hud_stream_hwjpeg (re-test on the yolo_camd base, 2026-10-11).
 # Then deploy with tools/deploy_app.sh.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -46,9 +46,18 @@ ${TC}-g++ -O2 -Wall -Wno-unused-function -Wno-unused-variable -Wno-comment \
   -I$AIQ -I$AIQ/uAPI2 -I$AIQ/common -I$AIQ/xcore -I$AIQ/algos -I$AIQ/iq_parser -I$AIQ/iq_parser_v2 \
   -L$M/lib -Wl,-rpath-link,$M/lib -Wl,-rpath,/oem/usr/lib \
   -o luckfox_video_hud_stream_rockit -lrknnmrt -lrga -lrockit -lrkaiq /sdk/jpeg-turbo/lib/libjpeg.a -lm -lpthread
+# Hardware JPEG re-test (2026-10-11, on the yolo_camd base): Rockit VENC
+# encode, opt-in binary selected by LUCKFOX_PIPELINE=hwjpeg + LUCKFOX_HW_JPEG=1
+# in app.env. Software JPEG stays the default.
+${TC}-g++ -O2 -Wall -Wno-unused-function -Wno-unused-variable -Wno-comment \
+  -DLUCKFOX_HW_JPEG \
+  luckfox_video_hud_stream_cam.c utils/image_drawing.c apex_hud_widgets.c \
+  -I. -Iutils -I3rdparty/stb_image -I$M/include/rga -I$M/include -I/sdk/jpeg-turbo/include \
+  -L$M/lib -Wl,-rpath-link,$M/lib -Wl,-rpath,/oem/usr/lib \
+  -o luckfox_video_hud_stream_hwjpeg -lrknnmrt -lrga -lrockit /sdk/jpeg-turbo/lib/libjpeg.a -lm -lpthread
 # the watchdog supervisor: static, so it needs nothing from disk once running
 ${TC}-gcc -O2 -Wall -static -o yolo_supervisor yolo_supervisor.c -lpthread
 # the camera stream owner (scripts/yolo_camd.c): static for the same reason
 ${TC}-gcc -O2 -Wall -static -o yolo_camd yolo_camd.c
 '
-ls -la "$OUT/luckfox_video_hud_stream_cam" "$OUT/luckfox_video_hud_stream_rockit" "$OUT/yolo_supervisor" "$OUT/yolo_camd"
+ls -la "$OUT/luckfox_video_hud_stream_cam" "$OUT/luckfox_video_hud_stream_rockit" "$OUT/luckfox_video_hud_stream_hwjpeg" "$OUT/yolo_supervisor" "$OUT/yolo_camd"

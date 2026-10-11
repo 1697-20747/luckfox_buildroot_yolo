@@ -16,7 +16,7 @@ case "$1" in
 		# a deliberate stop is not a hang: clear the boot-loop guard too
 		# (killing this script also kills its 60s clear-the-guard timer)
 		rm -f $GUARD; sync
-		killall luckfox_video_hud_stream_cam luckfox_video_hud_stream_rockit yolo_camd rkaiq_3A_server 2>/dev/null
+		killall luckfox_video_hud_stream_cam luckfox_video_hud_stream_rockit luckfox_video_hud_stream_hwjpeg yolo_camd rkaiq_3A_server 2>/dev/null
 		exit 0
 		;;
 esac
@@ -65,6 +65,11 @@ export LUCKFOX_HW_JPEG LUCKFOX_VENC_FMT
 BIN=luckfox_video_hud_stream_cam
 if [ "${LUCKFOX_PIPELINE:-v4l2}" = rockit ] && [ -x $APP_DIR/luckfox_video_hud_stream_rockit ]; then
 	BIN=luckfox_video_hud_stream_rockit
+fi
+# "hwjpeg" (re-test, 2026-10-11): frames from yolo_camd as usual, JPEG encoded
+# by Rockit VENC; also needs LUCKFOX_HW_JPEG=1. Safe mode unsets both.
+if [ "${LUCKFOX_PIPELINE:-v4l2}" = hwjpeg ] && [ -x $APP_DIR/luckfox_video_hud_stream_hwjpeg ]; then
+	BIN=luckfox_video_hud_stream_hwjpeg
 fi
 # Camera stream owner (default, 2026-10-11): yolo_camd starts the stream once
 # and never stops it; the server takes frames from it, so a server restart no

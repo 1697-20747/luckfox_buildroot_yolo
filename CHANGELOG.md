@@ -5,6 +5,18 @@ Terse, dated, factual record of real changes to this project. For the full narra
 
 ## 2026-10-11
 
+- **3 h continuous run (yolo_camd, software JPEG):** viewer + navigation subscriber attached
+  throughout, 0 resets, 13.1–14.1 fps, free memory flat at 126–128 MB, one camera stream start
+  (`tools/continuous_soak.sh`).
+- **Hardware JPEG re-tested on the yolo_camd base: passes.** Opt-in binary
+  `luckfox_video_hud_stream_hwjpeg` (`LUCKFOX_PIPELINE=hwjpeg` + `LUCKFOX_HW_JPEG=1` in app.env).
+  - 50 of 50 server restarts clean, each one tearing down Rockit (VENC + `RK_MPI_SYS_Exit`) while
+    the camera stream kept running. The earlier "hardware JPEG freezes" were most likely the
+    camera-restart eMMC hang.
+  - JPEG 11.7 ms (vs 29), CPU 75% (vs 100%), 14.7 fps (vs 13.9). NPU-bound now.
+  - Software JPEG stays the repo default until a long continuous run with hardware JPEG.
+- **docs/ARCHITECTURE.md:** short install and architecture summary.
+
 - **Camera stream no longer restarts with the server (`yolo_camd`).** Every eMMC hang followed a
   camera stream restart, and the first stream start of a boot never failed. So `scripts/yolo_camd.c`
   (static, about 250 lines) now opens `/dev/video11` once at boot and never stops it. It exports the 4
