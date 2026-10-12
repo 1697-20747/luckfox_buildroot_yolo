@@ -34,7 +34,7 @@ while [ "$(date +%s)" -lt "$END" ]; do
     st=$(curl -s --max-time 3 "$URL/api/status" | python3 -c '
 import json,sys
 try:
-    d=json.load(sys.stdin); print("fps %s read %s infer %s jpeg %s mem %sMB temp %sC streaming %s" % (d["fps"],d["read_ms"],d["infer_ms"],d["jpeg_ms"],d["mem_avail_mb"],d["soc_temp_c"],d["streaming"]))
+    d=json.load(sys.stdin); print("fps %s det_hz %s read %s infer %s jpeg %s cpu %s mem %sMB temp %sC streaming %s" % (d["fps"],d.get("det_hz"),d["read_ms"],d["infer_ms"],d["jpeg_ms"],d["cpu_pct"],d["mem_avail_mb"],d["soc_temp_c"],d["streaming"]))
 except Exception: print("status unavailable")')
     if [ -z "$up" ]; then
         echo "$(date +%T) board not answering; $st" | tee -a "$LOGDIR/soak.log"

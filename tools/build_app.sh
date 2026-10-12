@@ -20,7 +20,7 @@ if [ ! -f "$OUT/utils/image_drawing.c" ]; then
         pico/rknn_test/utils pico/rknn_test/3rdparty pico/rknn_test/rknn_api.h \
         pico/rknn_test/coco_80_labels_list.txt pico/rknn_test/yolov8n-optimized-rv1106-1.6.0.rknn
 fi
-cp "$ROOT"/scripts/luckfox_video_hud_stream_cam.c "$ROOT"/scripts/apex_hud_widgets.[ch] "$ROOT"/scripts/yolo_supervisor.c "$ROOT"/scripts/yolo_camd.[ch] "$OUT"/
+cp "$ROOT"/scripts/luckfox_video_hud_stream_cam.c "$ROOT"/scripts/apex_hud_widgets.[ch] "$ROOT"/scripts/yolo_supervisor.c "$ROOT"/scripts/yolo_camd.[ch] "$ROOT"/scripts/rga_bench.c "$OUT"/
 rm -rf "$OUT/www" && cp -R "$ROOT/scripts/www" "$OUT/www"
 cp "$ROOT/scripts/app.env" "$OUT/app.env"
 # models made by tools/export_yolov8_rknn.sh (e.g. the 800x448 default)
@@ -59,6 +59,9 @@ ${TC}-g++ -O2 -Wall -Wno-unused-function -Wno-unused-variable -Wno-comment \
   -o luckfox_video_hud_stream_hwjpeg -lrknnmrt -lrga -lrockit /sdk/jpeg-turbo/lib/libjpeg.a -lm -lpthread
 # the watchdog supervisor: static, so it needs nothing from disk once running
 ${TC}-gcc -O2 -Wall -static -o yolo_supervisor yolo_supervisor.c -lpthread
+# RGA vs CPU colour-conversion benchmark (not deployed; copy to /tmp to run)
+${TC}-gcc -O2 -Wall rga_bench.c -I$M/include/rga -L$M/lib -Wl,-rpath-link,$M/lib -Wl,-rpath,/oem/usr/lib \
+  -o rga_bench -lrga -lpthread
 # the camera stream owner (scripts/yolo_camd.c): static for the same reason
 ${TC}-gcc -O2 -Wall -static -o yolo_camd yolo_camd.c
 '

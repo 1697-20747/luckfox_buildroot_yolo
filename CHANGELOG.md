@@ -5,6 +5,26 @@ Terse, dated, factual record of real changes to this project. For the full narra
 
 ## 2026-10-12
 
+- **Video at the camera's full 30 fps; detection 14.9 Hz alongside it (17.1 Hz navigation-only).**
+  - **RGA colour conversion (default with yolo_camd):** camd NV12 -> RGB 960x540 (1.1 ms vs 22 ms
+    CPU), NV12 -> 800x448 model input in the same RGA pass (replaces the CPU downscale), RGB -> NV12
+    straight into the hardware JPEG encoder's buffer (1 ms vs ~5). Quantise is NEON (x ^ 0x80).
+    Per frame: read 4.5 ms (was 16), quant 2 ms (was 5.7), JPEG 3 ms (was 12); CPU 33% (was 86%) at
+    16.7 fps. `scripts/rga_bench.c` measures it. `LUCKFOX_RGA=0`: CPU path.
+  - **Every RGA buffer is a DMA-BUF imported by fd** (CMA heap / camd buffers / VENC MB block). A
+    first benchmark gave the RGA plain virtual addresses: this RGA core has no IOMMU, the job was
+    rejected, and the driver's error path corrupted the process's mm accounting, so the process's
+    exit oopsed the kernel (panic + self-reboot; logs in `build/rga-crash-20261012`). Any RGA failure
+    now switches to the CPU path for good.
+  - **Decoupled display (default while a viewer watches):** each loop shows the newest camera frame
+    with the latest finished detection's boxes. Every frame is also resized and quantised into the
+    NPU's spare input tensor, which is submitted the moment the NPU finishes (checked every 2 ms
+    while waiting for the camera). Video 30 fps (was 16.7), detection 14.9 Hz, CPU 50%; boxes lag the
+    picture by one detection. Navigation-only clients keep the pipelined loop (17.1 Hz).
+    `LUCKFOX_DECOUPLED=0` turns it off. `/api/status` adds `det_hz`.
+  - 30/30 restarts clean on the RGA build and again on the decoupled build, with no RGA kernel
+    errors.
+
 - **Model input 800x448 (16:9) is the default, with hardware JPEG.** `tools/export_yolov8_rknn.sh 448 800`
   is a reproducible export: Rockchip's YOLOv8 fork to ONNX opset 12, letterboxed calibration images,
   then rknn-toolkit2 1.6.0. The server reads the input size from the model (`LUCKFOX_MODEL` in

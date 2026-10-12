@@ -109,6 +109,7 @@
 #include <vector>
 #include <algorithm>
 #include <set>
+#include <functional>
 
 extern "C" {
 #include "utils/image_drawing.h"
@@ -825,6 +826,138 @@ static void camd_close(CamdClient* c) {
     if (c->sock >= 0) close(c->sock);
 }
 
+/* --- RGA colour conversion (default with yolo_camd, 2026-10-12) ---
+ * The RV1106's 2D engine does the camera NV12 -> RGB conversion (1.1 ms vs
+ * 22 ms on the CPU), the NV12 -> model-size RGB resize in the same pass
+ * (replacing the CPU downscale), and RGB -> NV12 for the hardware JPEG
+ * encoder. Measured with scripts/rga_bench.c.
+ *
+ * Every buffer the RGA touches is a DMA-BUF (camd's capture buffers, CMA heap
+ * allocations here, the encoder's MB block), imported by fd -- NEVER a plain
+ * virtual address. This RGA core has no IOMMU; a virtual-address job is
+ * rejected and the driver's error path corrupted the process's memory
+ * accounting, so the process's exit oopsed the kernel (panic + reboot,
+ * 2026-10-12, build/rga-crash-20261012).
+ *
+ * Cache rules for buffers both the CPU and the RGA use: flush (SYNC_END)
+ * before the RGA writes or reads one, invalidate (SYNC_START) after the RGA
+ * writes one. Any RGA failure switches to the CPU path for good.
+ * LUCKFOX_RGA=0: CPU path. */
+struct rk_dma_heap_allocation_data { uint64_t len; uint32_t fd; uint32_t fd_flags; uint64_t heap_flags; };
+#define RK_DMA_HEAP_IOCTL_ALLOC _IOWR('R', 0x0, struct rk_dma_heap_allocation_data)
+typedef struct { int fd; size_t len; unsigned char* va; rga_buffer_handle_t h; } RgaBuf;
+static bool g_rga = false;
+static RgaBuf g_rga_frames[3], g_rga_small;
+static rga_buffer_handle_t g_rga_cam[CAMD_MAX_BUFFERS];
+static int g_rga_ncam = 0;
+
+static void dmabuf_sync(int fd, unsigned flags) {
+    struct dma_buf_sync s = { flags };
+    ioctl(fd, DMA_BUF_IOCTL_SYNC, &s);
+}
+
+static bool rga_alloc(int heap, RgaBuf* b, int w, int h, int fmt, size_t len) {
+    memset(b, 0, sizeof(*b));
+    b->fd = -1;
+    struct rk_dma_heap_allocation_data a = { len, 0, O_RDWR | O_CLOEXEC, 0 };
+    if (ioctl(heap, RK_DMA_HEAP_IOCTL_ALLOC, &a) < 0) { perror("rk dma heap alloc"); return false; }
+    b->fd = (int)a.fd;
+    b->len = len;
+    b->va = (unsigned char*)mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, b->fd, 0);
+    if (b->va == MAP_FAILED) { b->va = NULL; perror("mmap dma-buf"); return false; }
+    im_handle_param_t p = { (uint32_t)w, (uint32_t)h, (uint32_t)fmt };
+    b->h = importbuffer_fd(b->fd, &p);
+    return b->h != 0;
+}
+
+static RgaBuf* rga_frame_for(const unsigned char* p) {
+    for (int i = 0; i < 3; i++) if (g_rga_frames[i].va == p) return &g_rga_frames[i];
+    return NULL;
+}
+
+/* Allocates the 3 full-size RGB frames and the model-size frame as DMA-BUFs
+ * and imports camd's capture buffers. On success frames[] / *frame_small
+ * point at the DMA-BUF mappings. */
+static bool rga_init(CamdClient* camd, int w, int h, int mw, int mh, unsigned char* frames[3], unsigned char** frame_small) {
+    const char* opt = getenv("LUCKFOX_RGA");
+    if (opt && opt[0] == '0') { printf("RESULT: RGA off (LUCKFOX_RGA=0)\n"); return false; }
+    int heap = open("/dev/rk_dma_heap/rk-dma-heap-cma", O_RDWR | O_CLOEXEC);
+    if (heap < 0) { perror("open rk-dma-heap-cma"); return false; }
+    bool ok = true;
+    for (int i = 0; i < 3 && ok; i++) ok = rga_alloc(heap, &g_rga_frames[i], w, h, RK_FORMAT_RGB_888, (size_t)w * h * 3);
+    if (ok) ok = rga_alloc(heap, &g_rga_small, mw, mh, RK_FORMAT_RGB_888, (size_t)mw * mh * 3);
+    close(heap);
+    for (int i = 0; i < camd->n && ok; i++) {
+        im_handle_param_t p = { (uint32_t)w, (uint32_t)h, (uint32_t)RK_FORMAT_YCbCr_420_SP };
+        g_rga_cam[i] = importbuffer_fd(camd->buffers[i].fd, &p);
+        ok = g_rga_cam[i] != 0;
+        g_rga_ncam = i + 1;
+    }
+    if (!ok) { printf("RESULT: RGA setup failed, CPU colour conversion\n"); return false; }
+    for (int i = 0; i < 3; i++) frames[i] = g_rga_frames[i].va;
+    *frame_small = g_rga_small.va;
+    g_rga = true;
+    printf("RESULT: RGA colour conversion on (NV12->RGB %dx%d, NV12->RGB %dx%d, RGB->NV12 for VENC)\n", w, h, mw, mh);
+    return true;
+}
+
+static void rga_shutdown(void) {
+    for (int i = 0; i < g_rga_ncam; i++) if (g_rga_cam[i]) releasebuffer_handle(g_rga_cam[i]);
+    g_rga_ncam = 0;
+    RgaBuf* all[4] = { &g_rga_frames[0], &g_rga_frames[1], &g_rga_frames[2], &g_rga_small };
+    for (int i = 0; i < 4; i++) {
+        if (all[i]->h) releasebuffer_handle(all[i]->h);
+        if (all[i]->va) munmap(all[i]->va, all[i]->len);
+        if (all[i]->fd >= 0) close(all[i]->fd);
+        memset(all[i], 0, sizeof(RgaBuf));
+        all[i]->fd = -1;
+    }
+    g_rga = false;
+}
+
+/* Next camd frame -> full-size RGB in g_rga_frames[fb] and model-size RGB
+ * in g_rga_small, both on the RGA. Returns false on any failure; if the RGA
+ * itself failed, g_rga is cleared (caller falls back to the CPU path). */
+static bool camd_capture_frame_rga(CamdClient* c, int fb, int w, int h, int mw, int mh, bool want_small,
+                                   const std::function<void()>* while_waiting = NULL) {
+    char cmd = 'N';
+    CamdFrame f;
+    if (send(c->sock, &cmd, 1, MSG_NOSIGNAL) != 1) { perror("camd send"); return false; }
+    if (while_waiting) {
+        /* up to ~33 ms until the camera's next frame: keep checking (e.g. so a
+         * finished NPU job is followed by the next one at once) */
+        struct pollfd pw = { c->sock, POLLIN, 0 };
+        for (int waited = 0; waited < 3000 && poll(&pw, 1, 2) == 0; waited += 2) (*while_waiting)();
+    }
+    if (recv(c->sock, &f, sizeof(f), 0) != (ssize_t)sizeof(f) || f.index < 0 || f.index >= c->n || f.index >= g_rga_ncam) {
+        perror("camd recv");
+        return false;
+    }
+    RgaBuf* full = &g_rga_frames[fb];
+    dmabuf_sync(full->fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_RW);
+    dmabuf_sync(g_rga_small.fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_RW);
+    rga_buffer_t src = wrapbuffer_handle(g_rga_cam[f.index], w, h, RK_FORMAT_YCbCr_420_SP);
+    IM_STATUS st = imcvtcolor(src, wrapbuffer_handle(full->h, w, h, RK_FORMAT_RGB_888),
+                              RK_FORMAT_YCbCr_420_SP, RK_FORMAT_RGB_888, IM_YUV_TO_RGB_BT601_LIMIT);
+    if (want_small && (st == IM_STATUS_SUCCESS || st == IM_STATUS_NOERROR)) {
+        im_rect srect = { 0, 0, w, h }, drect = { 0, 0, mw, mh }, prect = { 0, 0, 0, 0 };
+        rga_buffer_t none;
+        memset(&none, 0, sizeof(none));
+        st = improcess(src, wrapbuffer_handle(g_rga_small.h, mw, mh, RK_FORMAT_RGB_888), none,
+                       srect, drect, prect, IM_SYNC | IM_YUV_TO_RGB_BT601_LIMIT);
+    }
+    cmd = 'R';
+    send(c->sock, &cmd, 1, MSG_NOSIGNAL);
+    if (st != IM_STATUS_SUCCESS && st != IM_STATUS_NOERROR) {
+        printf("RESULT: RGA_FAILED (%s), CPU colour conversion from now on\n", imStrError(st));
+        g_rga = false;
+        return false;
+    }
+    dmabuf_sync(full->fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_RW);
+    if (want_small) dmabuf_sync(g_rga_small.fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ);
+    return true;
+}
+
 #ifdef LUCKFOX_ROCKIT_VI
 /* Rockit VI + in-process 3A, mirroring media/samples/example/vi/sample_vi.c
  * and common/{sample_comm_vi.c, isp3.x/sample_comm_isp.c}: 3A init+start
@@ -1053,6 +1186,13 @@ static void npu_submit(NpuWorker* w, int idx) {
     w->job_done = false;
     pthread_cond_broadcast(&w->cond);
     pthread_mutex_unlock(&w->lock);
+}
+
+static bool npu_is_done(NpuWorker* w) {
+    pthread_mutex_lock(&w->lock);
+    bool done = w->job_done;
+    pthread_mutex_unlock(&w->lock);
+    return done;
 }
 
 static void npu_wait(NpuWorker* w) {
@@ -1306,7 +1446,7 @@ static const char* g_web_root = "www";
 static struct {
     int streaming;
     int frame;
-    double fps, infer_ms, jpeg_ms, read_ms;
+    double fps, infer_ms, jpeg_ms, read_ms, det_hz;
     int dets;
     float cpu_pct;
     int display_w, display_h;
@@ -1431,13 +1571,13 @@ static void http_send_status(int fd) {
     char body[1024];
     int len = snprintf(body, sizeof(body),
         "{\"streaming\":%s,\"viewer_ip\":\"%s\",\"viewer_id\":\"%s\",\"viewers_served\":%d,"
-        "\"frame\":%d,\"fps\":%.2f,\"infer_ms\":%.1f,\"jpeg_ms\":%.1f,\"read_ms\":%.1f,"
+        "\"frame\":%d,\"fps\":%.2f,\"det_hz\":%.2f,\"infer_ms\":%.1f,\"jpeg_ms\":%.1f,\"read_ms\":%.1f,"
         "\"dets\":%d,\"cpu_pct\":%.0f,\"mem_avail_mb\":%d,\"soc_temp_c\":%.1f,"
         "\"display_w\":%d,\"display_h\":%d,\"model_size\":%d,\"model_w\":%d,\"model_h\":%d,\"source\":\"%s\","
         "\"view\":\"%s\",\"session\":%d,\"session_s\":%.0f,\"objects_total\":%d,"
         "\"has_tilt\":%s,\"pitch\":%.1f,\"roll\":%.1f,\"nav_subscriber\":%s}",
         g_status.streaming ? "true" : "false", g_status.viewer_ip, g_status.viewer_id, g_status.viewers_served,
-        g_status.frame, g_status.fps, g_status.infer_ms, g_status.jpeg_ms, g_status.read_ms,
+        g_status.frame, g_status.fps, g_status.det_hz, g_status.infer_ms, g_status.jpeg_ms, g_status.read_ms,
         g_status.dets, g_status.cpu_pct, read_mem_available_mb(), read_soc_temp_c(),
         g_status.display_w, g_status.display_h, g_model_w, g_model_w, g_model_h, g_status.source ? g_status.source : "",
         g_view_hud ? "hud" : "plain", g_session.session_id,
@@ -1758,6 +1898,7 @@ static unsigned long jpeg_encode_turbo(unsigned char* rgb, int w, int h) {
 static bool g_hwjpeg = false;
 static bool g_hwjpeg_nv12 = false;
 static MB_BLK g_hwjpeg_blk = RK_NULL;
+static rga_buffer_handle_t g_hwjpeg_rga_h = 0;   /* RGA import of g_hwjpeg_blk */
 static VENC_STREAM_S g_hwjpeg_stream;
 
 /* Full-range BT.601 (JFIF's YCbCr, 0-255), which is what the JPEG encoder
@@ -1861,9 +2002,40 @@ static void hwjpeg_init(int w, int h) {
  * buffer until hwjpeg_release(). */
 static bool hwjpeg_encode(const unsigned char* rgb, int w, int h, unsigned char** data, unsigned int* len) {
     unsigned char* dst = (unsigned char*)RK_MPI_MB_Handle2VirAddr(g_hwjpeg_blk);
-    if (g_hwjpeg_nv12) rgb_to_nv12(rgb, w, h, dst);
-    else memcpy(dst, rgb, (size_t)w * h * 3);
-    RK_MPI_SYS_MmzFlushCache(g_hwjpeg_blk, RK_FALSE);
+    /* RGB -> NV12 on the RGA when the frame is one of its DMA-BUFs (1 ms vs
+     * ~5 ms on the CPU), straight into the encoder's MB block (imported by
+     * fd once). The CPU never writes the MB block on this path, so there are
+     * no dirty cache lines to flush over the RGA's output. */
+    static bool mb_tried = false;
+    rga_buffer_handle_t& mb_h = g_hwjpeg_rga_h;
+    RgaBuf* fb = (g_rga && g_hwjpeg_nv12) ? rga_frame_for(rgb) : NULL;
+    if (fb && !mb_tried) {
+        mb_tried = true;
+        RK_MPI_SYS_MmzFlushCache(g_hwjpeg_blk, RK_FALSE);   /* nothing dirty left from the CPU path */
+        im_handle_param_t p = { (uint32_t)w, (uint32_t)h, (uint32_t)RK_FORMAT_YCbCr_420_SP };
+        int fd = RK_MPI_MB_Handle2Fd(g_hwjpeg_blk);
+        if (fd >= 0) mb_h = importbuffer_fd(fd, &p);
+        printf("RESULT: HWJPEG_INPUT %s\n", mb_h ? "RGA RGB->NV12" : "CPU RGB->NV12 (MB import failed)");
+    }
+    bool done = false;
+    if (fb && mb_h) {
+        dmabuf_sync(fb->fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_RW);   /* HUD drawing -> memory */
+        IM_STATUS st = imcvtcolor(wrapbuffer_handle(fb->h, w, h, RK_FORMAT_RGB_888),
+                                  wrapbuffer_handle(mb_h, w, h, RK_FORMAT_YCbCr_420_SP),
+                                  RK_FORMAT_RGB_888, RK_FORMAT_YCbCr_420_SP, IM_RGB_TO_YUV_BT601_LIMIT);
+        dmabuf_sync(fb->fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_RW);
+        if (st == IM_STATUS_SUCCESS || st == IM_STATUS_NOERROR) {
+            done = true;
+        } else {
+            printf("RESULT: RGA_FAILED in JPEG input (%s), CPU colour conversion from now on\n", imStrError(st));
+            g_rga = false;
+        }
+    }
+    if (!done) {
+        if (g_hwjpeg_nv12) rgb_to_nv12(rgb, w, h, dst);
+        else memcpy(dst, rgb, (size_t)w * h * 3);
+        RK_MPI_SYS_MmzFlushCache(g_hwjpeg_blk, RK_FALSE);
+    }
 
     VIDEO_FRAME_INFO_S frame;
     memset(&frame, 0, sizeof(frame));
@@ -1886,6 +2058,7 @@ static void hwjpeg_release(void) {
 
 static void hwjpeg_shutdown(void) {
     if (!g_hwjpeg_blk) return;
+    if (g_hwjpeg_rga_h) { releasebuffer_handle(g_hwjpeg_rga_h); g_hwjpeg_rga_h = 0; }
     kmsg_mark("shutdown: begin");
     RK_MPI_VENC_StopRecvFrame(HWJPEG_CHN);
     kmsg_mark("shutdown: StopRecvFrame done");
@@ -2183,6 +2356,15 @@ int main(int argc, char** argv) {
     for (int i = 0; i < 3; i++) frames[i] = (unsigned char*)malloc(display_w * display_h * 3);
     unsigned char* frame_full = frames[0];
     unsigned char* frame_small = (unsigned char*)malloc(g_model_w * g_model_h * 3);
+#ifndef LUCKFOX_ROCKIT_VI
+    unsigned char* malloc_frames[3] = { frames[0], frames[1], frames[2] };
+    unsigned char* malloc_small = frame_small;
+    if (use_camd && rga_init(&camd, display_w, display_h, g_model_w, g_model_h, frames, &frame_small)) {
+        for (int i = 0; i < 3; i++) free(malloc_frames[i]);
+        free(malloc_small);
+        use_rga_downscale = false;   /* the old DRM-buffer RGA downscale is not needed */
+    }
+#endif
     if (use_rga_downscale) {
         if (drm_init()) {
             g_drm_src = (unsigned char*)drm_alloc_contig(display_w, display_h, 3, &g_src_stride_px);
@@ -2196,6 +2378,253 @@ int main(int argc, char** argv) {
     float scale_x = (float)display_w / g_model_w;
     float scale_y = (float)display_h / g_model_h;
     printf("RESULT: DOWNSCALE_MODE %s\n", use_rga_downscale ? "RGA" : "CPU");
+
+    /* HUD drawing + JPEG + send for one frame, shared by the pipelined loop
+     * and the decoupled-display loop. Draws dets (in model coordinates) onto
+     * frame_full; does nothing without a viewer. */
+    auto hud_send = [&](unsigned char* frame_full, std::vector<Detection>& dets, double infer_ms,
+                        int frame_count, double fps, float cpu_pct, int has_tilt, float tilt_pitch,
+                        float tilt_roll, double& hud_ms, double& jpeg_ms, double& net_ms) {
+        image_buffer_t img;
+        memset(&img, 0, sizeof(img));
+        img.width = display_w; img.height = display_h;
+        img.width_stride = display_w; img.height_stride = display_h;
+        img.format = IMAGE_FORMAT_RGB888;
+        img.virt_addr = frame_full;
+        img.size = display_w * display_h * 3;
+        struct timespec t_hud0, t_hud1;
+        clock_gettime(CLOCK_MONOTONIC, &t_hud0);
+        if (client_fd >= 0) {
+
+        if (!g_view_hud) {
+            draw_plain_overlay(&img, dets, scale_x, scale_y);
+        } else {
+            /* apex_hud port (see PROJECT_MEMORY.md 2026-09-13) --
+             * CrosshairWidget (static), TrackBoxesWidget (real detections,
+             * reduced to bbox+class+confidence -- no azimuth/distance,
+             * that needs #32's mono-distance work), RadarMapWidget (honest
+             * grey stub, no real per-object x/y/z yet). */
+            apex_hud_draw_crosshair(&img);
+            {
+                std::vector<HudTrack> hud_tracks;
+                hud_tracks.reserve(dets.size());
+                for (auto& d : dets) {
+                    HudTrack t;
+                    t.x = d.x; t.y = d.y; t.w = d.w; t.h = d.h; t.score = d.score;
+                    t.class_name = class_names[d.cls_id];
+                    hud_tracks.push_back(t);
+                }
+                apex_hud_draw_track_boxes(&img, hud_tracks.data(), (int)hud_tracks.size(), scale_x, scale_y);
+            }
+            {
+                HudBounds radar_box;
+                radar_box.x1 = std::max((int)(display_w * 0.815f), 4);
+                radar_box.y1 = std::max((int)(display_h * 0.775f) + 4, 4);
+                radar_box.x2 = display_w - 4;
+                radar_box.y2 = std::min((int)(display_h * 0.93f), display_h - 4);
+                apex_hud_draw_radar_map_stub(&img, radar_box);
+            }
+            /* Neutral/grey stubs -- this board has no orientation/heading
+             * source (MPU-6050 raw accel only). Matches apex_hud's own
+             * real "no imu_reading" default for each of these, per
+             * PROJECT_MEMORY.md 2026-09-13 "apex_hud: full HUD pass". */
+            /* Pitch/roll from the MPU-6050's smoothed gravity vector
+             * (2026-10-11; previously grey stubs). Heading needs a
+             * magnetometer/gyro integration this board doesn't have, so
+             * the compass tape stays a stub. */
+            {
+                HudBounds cluster_box = apex_hud_cluster_bounds(&img);
+                apex_hud_draw_horizon(&img, cluster_box, has_tilt, tilt_pitch, tilt_roll);
+                apex_hud_draw_roll_ring(&img, cluster_box, has_tilt, tilt_roll);
+            }
+            {
+                HudBounds frame_box = apex_hud_frame_bounds(&img);
+                apex_hud_draw_compass_tape_stub(&img, frame_box, 0);
+                apex_hud_draw_attitude_readouts(&img, frame_box, has_tilt, tilt_pitch, tilt_roll);
+            }
+
+            /* always-visible HUD readout panel, top-left -- apex_hud's
+             * "always draw the instrument, neutral default when idle"
+             * convention, loosely */
+            int diag_fsz = apex_hud_font_size(&img, 7);
+            int diag_line_h = diag_fsz + 4;
+            int diag_panel_h = diag_line_h * 4 + 8;
+            int diag_panel_w = (int)(220 * img.height / 540.0f + 0.5f);
+            fill_rect(frame_full, display_w, display_h, 4, 4, diag_panel_w, diag_panel_h, 15, 15, 15);
+            char hud_line1[64], hud_line2[64], hud_line3[64], hud_line4[64];
+            snprintf(hud_line1, 64, "frame %d  fps %.1f", frame_count, fps);
+            snprintf(hud_line2, 64, "infer %.1fms  det %zu", infer_ms, dets.size());
+            snprintf(hud_line3, 64, "cpu %.0f%%", cpu_pct);
+            snprintf(hud_line4, 64, "LUCKFOX RV1106 / yolov8n @ %dx%d disp", display_w, display_h);
+            draw_text(&img, hud_line1, 8, 8, COLOR_WHITE, diag_fsz);
+            draw_text(&img, hud_line2, 8, 8 + diag_line_h, COLOR_YELLOW, diag_fsz);
+            draw_text(&img, hud_line3, 8, 8 + diag_line_h * 2, COLOR_ORANGE, diag_fsz);
+            draw_text(&img, hud_line4, 8, 8 + diag_line_h * 3, COLOR_GREEN, diag_fsz);
+
+            /* accelerometer readout panel, below the first -- always
+             * drawn (apex_hud convention), grey "not connected" text
+             * until a real MPU-6050 is actually found and reading */
+            {
+                HudBounds accel_box;
+                accel_box.x1 = 4;
+                accel_box.y1 = std::max((int)(display_h * 0.775f) + 4, 4);
+                accel_box.x2 = std::max((int)(display_w * 0.20f) - 4, 20);
+                accel_box.y2 = display_h - 4;
+                int has_accel = accel.found && accel.ema_initialized;
+                apex_hud_draw_accelerometer(&img, accel_box, has_accel,
+                                             accel.smoothed_x * 9.81f, accel.smoothed_y * 9.81f);
+            }
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &t_hud1);
+        hud_ms = (t_hud1.tv_sec - t_hud0.tv_sec) * 1000.0 + (t_hud1.tv_nsec - t_hud0.tv_nsec) / 1e6;
+        if (http_send_frame(frame_full, display_w, display_h, &jpeg_ms, &net_ms) < 0) {
+            printf("RESULT: CLIENT_DISCONNECTED after %d frames\n", frame_count);
+            close(client_fd);
+            client_fd = -1;
+            g_status.streaming = 0;
+            session_reset(); /* per-session object log is wiped on disconnect */
+        } else {
+            g_status.jpeg_ms = roll_add(&g_roll_jpeg, jpeg_ms);
+        }
+        } /* client_fd >= 0: HUD + JPEG only when someone is watching */
+    };
+
+#ifndef LUCKFOX_ROCKIT_VI
+    /* Decoupled display (2026-10-12), used while a viewer is watching and the
+     * RGA path is on: every iteration shows the NEWEST camera frame (paced by
+     * camd, i.e. the camera), with the boxes from the latest finished
+     * detection. Whenever the NPU is idle, the same frame is also resized by
+     * the RGA and submitted as the next detection, without waiting for it.
+     * Video is then limited by the camera/CPU instead of the NPU's 58 ms; boxes
+     * lag the picture by one detection. The object log and navigation output
+     * update once per detection. Navigation-only clients keep the pipelined
+     * loop. LUCKFOX_DECOUPLED=0: pipelined loop for viewers too. */
+    const char* dec_env = getenv("LUCKFOX_DECOUPLED");
+    bool decoupled_ok = live_camera && use_camd && !(dec_env && dec_env[0] == '0');
+    auto run_decoupled = [&]() -> bool {   /* false: use the pipelined loop from now on */
+        printf("RESULT: DISPLAY_MODE decoupled (video at camera rate, detection at NPU rate)\n");
+        std::vector<Detection> shown;
+        std::vector<int> shown_ids;
+        /* run_slot: input tensor the NPU is working on; staged: the other
+         * tensor holds the newest frame, ready to go the moment the NPU is free */
+        bool job = false, staged = false, fresh = false;
+        int run_slot = 0, n_frames = 0, n_dets = 0;
+        double quant_ms = 0, npu_ms = 0, post_ms = 0;
+        bool run_failed = false;
+        struct timespec t_start, t_now;
+        clock_gettime(CLOCK_MONOTONIC, &t_start);
+        std::function<void()> collect = [&]() {
+            if (!job || !npu_is_done(&npu)) return;
+            npu_wait(&npu);
+            job = false;
+            if (npu.ret[run_slot] != RKNN_SUCC) { printf("RESULT: RUN_FAIL ret=%d\n", npu.ret[run_slot]); run_failed = true; return; }
+            shown = npu.dets[run_slot];
+            npu_ms = npu.npu_ms[run_slot];
+            post_ms = npu.post_ms[run_slot];
+            fresh = true;
+            n_dets++;
+            if (staged) {
+                run_slot ^= 1;
+                npu_submit(&npu, run_slot);
+                job = true;
+                staged = false;
+            }
+        };
+        while (client_fd >= 0 && !g_quit) {
+            heartbeat();
+            collect();
+            struct timespec r0, r1;
+            clock_gettime(CLOCK_MONOTONIC, &r0);
+            if (!camd_capture_frame_rga(&camd, 0, display_w, display_h, g_model_w, g_model_h, true, &collect)) {
+                if (job) npu_wait(&npu);
+                return false;
+            }
+            if (run_failed) return false;
+            clock_gettime(CLOCK_MONOTONIC, &r1);
+            double read_ms = (r1.tv_sec - r0.tv_sec) * 1000.0 + (r1.tv_nsec - r0.tv_nsec) / 1e6;
+            {
+                /* the newest frame into the tensor the NPU isn't using */
+                struct timespec q0, q1;
+                clock_gettime(CLOCK_MONOTONIC, &q0);
+                const int slot = job ? (run_slot ^ 1) : run_slot;
+                int8_t* in_buf = (int8_t*)npu.input_mems[slot]->virt_addr;
+                const uint8x16_t k80 = vdupq_n_u8(0x80);
+                for (int y = 0; y < g_model_h; y++) {
+                    const unsigned char* src_row = g_rga_small.va + (size_t)y * g_model_w * 3;
+                    uint8_t* dst_row = (uint8_t*)in_buf + (size_t)y * model_row_stride;
+                    const int n = g_model_w * 3;
+                    int i = 0;
+                    for (; i + 16 <= n; i += 16) vst1q_u8(dst_row + i, veorq_u8(vld1q_u8(src_row + i), k80));
+                    for (; i < n; i++) dst_row[i] = src_row[i] ^ 0x80;
+                }
+                clock_gettime(CLOCK_MONOTONIC, &q1);
+                quant_ms = (q1.tv_sec - q0.tv_sec) * 1000.0 + (q1.tv_nsec - q0.tv_nsec) / 1e6;
+                if (job) {
+                    staged = true;
+                } else {
+                    npu_submit(&npu, run_slot);
+                    job = true;
+                }
+            }
+
+            accel_update(&accel);
+            int has_tilt = accel.found && accel.ema_initialized;
+            float tilt_pitch = 0, tilt_roll = 0;
+            if (has_tilt) {
+                float ax = accel.smoothed_x, ay = accel.smoothed_y, az = accel.smoothed_z;
+                tilt_roll = atan2f(ay, az) * 180.0f / (float)M_PI;
+                tilt_pitch = atan2f(-ax, sqrtf(ay * ay + az * az)) * 180.0f / (float)M_PI;
+            }
+            if (fresh) {
+                fresh = false;
+                session_update(shown, &shown_ids);
+                g_last_det_json = build_det_json(n_dets, shown, shown_ids, display_w, display_h,
+                                                 has_tilt, tilt_pitch, tilt_roll);
+                if (g_nav_fd >= 0) {
+                    std::string ev = "data: " + g_last_det_json + "\n\n";
+                    if (send_all(g_nav_fd, ev.data(), ev.size()) < 0) {
+                        printf("RESULT: NAV_SUBSCRIBER_DISCONNECTED\n");
+                        close(g_nav_fd);
+                        g_nav_fd = -1;
+                    }
+                }
+            }
+
+            n_frames++;
+            clock_gettime(CLOCK_MONOTONIC, &t_now);
+            double elapsed = (t_now.tv_sec - t_start.tv_sec) + (t_now.tv_nsec - t_start.tv_nsec) / 1e9;
+            double fps = elapsed > 0 ? n_frames / elapsed : 0;
+            double det_hz = elapsed > 0 ? n_dets / elapsed : 0;
+            double infer_ms = quant_ms + npu_ms + post_ms;
+            float cpu_pct = read_cpu_percent();
+            g_status.frame = n_frames;
+            g_status.fps = fps;
+            g_status.det_hz = det_hz;
+            g_status.infer_ms = roll_add(&g_roll_infer, infer_ms);
+            g_status.read_ms = roll_add(&g_roll_read, read_ms);
+            g_status.dets = (int)shown.size();
+            g_status.cpu_pct = cpu_pct;
+            g_status.has_tilt = has_tilt;
+            g_status.pitch = tilt_pitch;
+            g_status.roll = tilt_roll;
+            g_status.streaming = client_fd >= 0;
+
+            double hud_ms = 0, jpeg_ms = 0, net_ms = 0;
+            hud_send(frames[0], shown, infer_ms, n_frames, fps, cpu_pct, has_tilt, tilt_pitch, tilt_roll,
+                     hud_ms, jpeg_ms, net_ms);
+            http_poll_requests();
+            if (n_frames % 30 == 0) {
+                printf("decoupled frame=%d fps=%.1f det_hz=%.1f read_ms=%.1f quant=%.1f npu=%.1f post=%.1f "
+                       "hud_ms=%.1f jpeg_ms=%.1f net_ms=%.1f dets=%zu\n",
+                       n_frames, fps, det_hz, read_ms, quant_ms, npu_ms, post_ms, hud_ms, jpeg_ms, net_ms, shown.size());
+                fflush(stdout);
+            }
+        }
+        if (job) npu_wait(&npu);
+        return true;
+    };
+#endif
 
     while (!g_quit) {
         http_wait_for_client();
@@ -2231,6 +2660,19 @@ int main(int argc, char** argv) {
 
         while ((client_fd >= 0 || g_nav_fd >= 0) && !g_quit) {
             heartbeat();
+#ifndef LUCKFOX_ROCKIT_VI
+            if (decoupled_ok && g_rga && client_fd >= 0) {
+                /* a viewer is watching: drain the pipelined loop, then run the
+                 * decoupled one until the viewer leaves */
+                if (infl_fb >= 0) npu_wait(&npu);
+                ready_fb = infl_fb = disp_fb = -1;
+                if (!run_decoupled()) {
+                    printf("RESULT: DISPLAY_MODE pipelined (decoupled loop stopped)\n");
+                    decoupled_ok = false;
+                }
+                continue;
+            }
+#endif
             /* 1. hand the prepared frame to the NPU */
             if (ready_fb >= 0 && infl_fb < 0) {
                 static bool first_job_marked = false;
@@ -2249,14 +2691,20 @@ int main(int argc, char** argv) {
                 const int slot = (infl_fb >= 0) ? (fb_slot[infl_fb] ^ 1) : 0;
                 struct timespec t_read_start, t_read_end;
                 clock_gettime(CLOCK_MONOTONIC, &t_read_start);
-                bool got_frame;
+                bool got_frame = false;
+                bool small_from_rga = false;   /* RGA already made frame_small */
                 unsigned char* cap_frame = frames[fb];
                 if (live_camera) {
 #ifdef LUCKFOX_ROCKIT_VI
                     got_frame = rockit_cam_capture(&rk_cam, cap_frame);
 #else
-                    got_frame = use_camd ? camd_capture_frame(&camd, display_w, display_h, cap_frame)
-                                         : v4l2_capture_frame(&v4l2_cap, cap_frame);
+                    if (use_camd && g_rga) {
+                        got_frame = camd_capture_frame_rga(&camd, fb, display_w, display_h, g_model_w, g_model_h, true);
+                        small_from_rga = got_frame;
+                    }
+                    if (!small_from_rga)
+                        got_frame = use_camd ? camd_capture_frame(&camd, display_w, display_h, cap_frame)
+                                             : v4l2_capture_frame(&v4l2_cap, cap_frame);
 #endif
                 } else {
                     size_t n = fread(cap_frame, 1, display_w * display_h * 3, ffmpeg_pipe);
@@ -2272,7 +2720,9 @@ int main(int argc, char** argv) {
 
                 struct timespec t_ds_start, t_ds_end;
                 clock_gettime(CLOCK_MONOTONIC, &t_ds_start);
-                if (use_rga_downscale) {
+                if (small_from_rga) {
+                    /* done by the RGA during capture (counted in read_ms) */
+                } else if (use_rga_downscale) {
                     if (!downscale_for_inference_rga(cap_frame, display_w, display_h, frame_small, g_model_w, g_model_h)) {
                         fprintf(stderr, "RESULT: RGA_DOWNSCALE_FAILED, falling back to CPU downscale for this and all future frames\n");
                         use_rga_downscale = false;
@@ -2287,10 +2737,16 @@ int main(int argc, char** argv) {
                 struct timespec t_q0, t_q1;
                 clock_gettime(CLOCK_MONOTONIC, &t_q0);
                 int8_t* in_buf = (int8_t*)npu.input_mems[slot]->virt_addr;
+                /* uint8 -> int8 with zero point -128: x - 128 has the same bits
+                 * as x ^ 0x80, 16 bytes per NEON instruction */
+                const uint8x16_t k80 = vdupq_n_u8(0x80);
                 for (int y = 0; y < g_model_h; y++) {
                     const unsigned char* src_row = frame_small + (size_t)y * g_model_w * 3;
-                    int8_t* dst_row = in_buf + (size_t)y * model_row_stride;
-                    for (int i = 0; i < g_model_w * 3; i++) dst_row[i] = (int8_t)((int)src_row[i] - 128);
+                    uint8_t* dst_row = (uint8_t*)in_buf + (size_t)y * model_row_stride;
+                    const int n = g_model_w * 3;
+                    int i = 0;
+                    for (; i + 16 <= n; i += 16) vst1q_u8(dst_row + i, veorq_u8(vld1q_u8(src_row + i), k80));
+                    for (; i < n; i++) dst_row[i] = src_row[i] ^ 0x80;
                 }
                 clock_gettime(CLOCK_MONOTONIC, &t_q1);
                 fb_read_ms[fb] = read_ms;
@@ -2317,13 +2773,6 @@ int main(int argc, char** argv) {
             /* --- draw HUD overlay onto the FULL-res frame -- box
              * coordinates rescaled from MODEL_SIZE space up to
              * display_w x display_h --- */
-            image_buffer_t img;
-            memset(&img, 0, sizeof(img));
-            img.width = display_w; img.height = display_h;
-            img.width_stride = display_w; img.height_stride = display_h;
-            img.format = IMAGE_FORMAT_RGB888;
-            img.virt_addr = frame_full;
-            img.size = display_w * display_h * 3;
 
             frame_count++;
             clock_gettime(CLOCK_MONOTONIC, &now);
@@ -2332,6 +2781,7 @@ int main(int argc, char** argv) {
             float cpu_pct = read_cpu_percent();
             g_status.frame = frame_count;
             g_status.fps = fps;
+            g_status.det_hz = fps;   /* pipelined loop: one detection per displayed frame */
             g_status.infer_ms = roll_add(&g_roll_infer, infer_ms);
             g_status.read_ms = roll_add(&g_roll_read, read_ms);
             g_status.dets = (int)dets.size();
@@ -2367,102 +2817,8 @@ int main(int argc, char** argv) {
             }
 
             double jpeg_ms = 0, net_ms = 0, hud_ms = 0;
-            struct timespec t_hud0, t_hud1;
-            clock_gettime(CLOCK_MONOTONIC, &t_hud0);
-            if (client_fd >= 0) {
-
-            if (!g_view_hud) {
-                draw_plain_overlay(&img, dets, scale_x, scale_y);
-            } else {
-                /* apex_hud port (see PROJECT_MEMORY.md 2026-09-13) --
-                 * CrosshairWidget (static), TrackBoxesWidget (real detections,
-                 * reduced to bbox+class+confidence -- no azimuth/distance,
-                 * that needs #32's mono-distance work), RadarMapWidget (honest
-                 * grey stub, no real per-object x/y/z yet). */
-                apex_hud_draw_crosshair(&img);
-                {
-                    std::vector<HudTrack> hud_tracks;
-                    hud_tracks.reserve(dets.size());
-                    for (auto& d : dets) {
-                        HudTrack t;
-                        t.x = d.x; t.y = d.y; t.w = d.w; t.h = d.h; t.score = d.score;
-                        t.class_name = class_names[d.cls_id];
-                        hud_tracks.push_back(t);
-                    }
-                    apex_hud_draw_track_boxes(&img, hud_tracks.data(), (int)hud_tracks.size(), scale_x, scale_y);
-                }
-                {
-                    HudBounds radar_box;
-                    radar_box.x1 = std::max((int)(display_w * 0.815f), 4);
-                    radar_box.y1 = std::max((int)(display_h * 0.775f) + 4, 4);
-                    radar_box.x2 = display_w - 4;
-                    radar_box.y2 = std::min((int)(display_h * 0.93f), display_h - 4);
-                    apex_hud_draw_radar_map_stub(&img, radar_box);
-                }
-                /* Neutral/grey stubs -- this board has no orientation/heading
-                 * source (MPU-6050 raw accel only). Matches apex_hud's own
-                 * real "no imu_reading" default for each of these, per
-                 * PROJECT_MEMORY.md 2026-09-13 "apex_hud: full HUD pass". */
-                /* Pitch/roll from the MPU-6050's smoothed gravity vector
-                 * (2026-10-11; previously grey stubs). Heading needs a
-                 * magnetometer/gyro integration this board doesn't have, so
-                 * the compass tape stays a stub. */
-                {
-                    HudBounds cluster_box = apex_hud_cluster_bounds(&img);
-                    apex_hud_draw_horizon(&img, cluster_box, has_tilt, tilt_pitch, tilt_roll);
-                    apex_hud_draw_roll_ring(&img, cluster_box, has_tilt, tilt_roll);
-                }
-                {
-                    HudBounds frame_box = apex_hud_frame_bounds(&img);
-                    apex_hud_draw_compass_tape_stub(&img, frame_box, 0);
-                    apex_hud_draw_attitude_readouts(&img, frame_box, has_tilt, tilt_pitch, tilt_roll);
-                }
-
-                /* always-visible HUD readout panel, top-left -- apex_hud's
-                 * "always draw the instrument, neutral default when idle"
-                 * convention, loosely */
-                int diag_fsz = apex_hud_font_size(&img, 7);
-                int diag_line_h = diag_fsz + 4;
-                int diag_panel_h = diag_line_h * 4 + 8;
-                int diag_panel_w = (int)(220 * img.height / 540.0f + 0.5f);
-                fill_rect(frame_full, display_w, display_h, 4, 4, diag_panel_w, diag_panel_h, 15, 15, 15);
-                char hud_line1[64], hud_line2[64], hud_line3[64], hud_line4[64];
-                snprintf(hud_line1, 64, "frame %d  fps %.1f", frame_count, fps);
-                snprintf(hud_line2, 64, "infer %.1fms  det %zu", infer_ms, dets.size());
-                snprintf(hud_line3, 64, "cpu %.0f%%", cpu_pct);
-                snprintf(hud_line4, 64, "LUCKFOX RV1106 / yolov8n @ %dx%d disp", display_w, display_h);
-                draw_text(&img, hud_line1, 8, 8, COLOR_WHITE, diag_fsz);
-                draw_text(&img, hud_line2, 8, 8 + diag_line_h, COLOR_YELLOW, diag_fsz);
-                draw_text(&img, hud_line3, 8, 8 + diag_line_h * 2, COLOR_ORANGE, diag_fsz);
-                draw_text(&img, hud_line4, 8, 8 + diag_line_h * 3, COLOR_GREEN, diag_fsz);
-
-                /* accelerometer readout panel, below the first -- always
-                 * drawn (apex_hud convention), grey "not connected" text
-                 * until a real MPU-6050 is actually found and reading */
-                {
-                    HudBounds accel_box;
-                    accel_box.x1 = 4;
-                    accel_box.y1 = std::max((int)(display_h * 0.775f) + 4, 4);
-                    accel_box.x2 = std::max((int)(display_w * 0.20f) - 4, 20);
-                    accel_box.y2 = display_h - 4;
-                    int has_accel = accel.found && accel.ema_initialized;
-                    apex_hud_draw_accelerometer(&img, accel_box, has_accel,
-                                                 accel.smoothed_x * 9.81f, accel.smoothed_y * 9.81f);
-                }
-            }
-
-            clock_gettime(CLOCK_MONOTONIC, &t_hud1);
-            hud_ms = (t_hud1.tv_sec - t_hud0.tv_sec) * 1000.0 + (t_hud1.tv_nsec - t_hud0.tv_nsec) / 1e6;
-            if (http_send_frame(frame_full, display_w, display_h, &jpeg_ms, &net_ms) < 0) {
-                printf("RESULT: CLIENT_DISCONNECTED after %d frames\n", frame_count);
-                close(client_fd);
-                client_fd = -1;
-                g_status.streaming = 0;
-                session_reset(); /* per-session object log is wiped on disconnect */
-            } else {
-                g_status.jpeg_ms = roll_add(&g_roll_jpeg, jpeg_ms);
-            }
-            } /* client_fd >= 0: HUD + JPEG only when someone is watching */
+            hud_send(frame_full, dets, infer_ms, frame_count, fps, cpu_pct, has_tilt, tilt_pitch, tilt_roll,
+                     hud_ms, jpeg_ms, net_ms);
             http_poll_requests();
 
             if (frame_count % 10 == 0) {
@@ -2508,6 +2864,7 @@ int main(int argc, char** argv) {
     if (live_camera) rockit_cam_close(&rk_cam);
 #else
     if (use_camd) {
+        rga_shutdown();      /* release RGA imports of camd's buffers first */
         camd_close(&camd);   /* the stream itself keeps running in yolo_camd */
     } else if (live_camera) {
         enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
