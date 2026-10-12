@@ -1,6 +1,6 @@
 # Software install and architecture (short version)
 
-This is the state as of 2026-10-12. `CHANGELOG.md` is the dated record, and `PROJECT_MEMORY.md` has
+This is the state as of 2026-10-12 (evening). `CHANGELOG.md` is the dated record, and `PROJECT_MEMORY.md` has
 the full story.
 
 ## Board and image
@@ -37,8 +37,11 @@ S21appinit    Rockchip's RkLunch.sh, with rkipc replaced by /usr/bin/yolo-app-st
 ```
  camera ─ ISP ─ /dev/video11 ──► yolo_camd ──(DMA-BUF fds over \0yolo-camd)──► stream server
                     ▲                                                            │
-            rkaiq_3A_server                    NV12→RGB → 800x448 int8 → NPU (YOLOv8n, RKNN 1.6)
-                                               3-stage pipeline: capture | NPU | HUD + JPEG
+            rkaiq_3A_server     RGA: NV12→RGB 960x540 (display) + NV12→RGB 800x448 (model)
+                                NEON int8 → NPU (YOLOv8n, RKNN 1.6) in a worker thread
+                                viewer: newest frame every loop + latest boxes (30 fps / 15 Hz)
+                                nav only: pipelined capture | NPU | output (17 Hz)
+                                HUD → RGA RGB→NV12 → hardware JPEG
                                                                                  │
                                     HTTP :8080  /  /stream (MJPEG, one viewer)  /api/status
                                                 /api/detections(/stream)  /api/objects  /api/wifi
@@ -77,12 +80,13 @@ S21appinit    Rockchip's RkLunch.sh, with rkipc replaced by /usr/bin/yolo-app-st
 | | |
 |---|---|
 | Model | YOLOv8n, 800x448 input (16:9, matches the camera), int8; 640x640 as fallback |
-| Video with HUD | 16.2 fps (hardware JPEG, default) |
-| Navigation only | 16.7 Hz |
-| Per frame | NPU 58 ms; downscale 6 ms; decode 1.8 ms; JPEG 12 ms (hardware) |
+| Video with HUD | 30 fps (camera rate), detection 14.9 Hz alongside |
+| Navigation only | 17.1 Hz |
+| Per frame | NPU 58 ms; RGA conversions ~1 ms each; quantise 2 ms (NEON); decode 1.8 ms; HUD 4–5 ms; JPEG 3 ms |
+| CPU | 50% while streaming 30 fps (was 86% at 16 fps before the RGA) |
 | Accuracy vs 640x640 | recall 84% vs 61%, precision 92% vs 94% (`tools/compare_models.py`) |
 | Memory | about 126 MB free, flat |
-| Restart test | 100/100 clean with `yolo_camd`; 50/50 with hardware JPEG; 30/30 with the 800x448 build |
+| Restart test | 100/100 clean with `yolo_camd`; 50/50 with hardware JPEG; 30/30 each on the 800x448, RGA and decoupled builds |
 | Continuous run | 3 h software JPEG and 3 h hardware JPEG: 0 resets, memory flat |
 
 ## Tools
