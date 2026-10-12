@@ -49,7 +49,7 @@ start_3a() {
 set -a; [ -f $APP_DIR/app.env ] && . $APP_DIR/app.env; set +a
 if [ -f $GUARD ]; then
 	echo "$(date) previous boot did not clear $GUARD: safe mode (experimental options off, V4L2 pipeline)" >> /var/log/yolo-stream.log
-	unset LUCKFOX_HW_JPEG LUCKFOX_VENC_FMT LUCKFOX_PIPELINE
+	unset LUCKFOX_HW_JPEG LUCKFOX_VENC_FMT LUCKFOX_PIPELINE LUCKFOX_MODEL
 	# and no hardware watchdog this boot: a hang that recurs at every start
 	# must not turn into an endless reset loop (one reset, then this)
 	export LUCKFOX_NO_WATCHDOG=1
@@ -101,7 +101,11 @@ prepare_camera() {
 		start_3a
 	fi
 }
-echo "$(date) pipeline: $BIN" >> /var/log/yolo-stream.log
+# Model (2026-10-11): LUCKFOX_MODEL in app.env, e.g. the 16:9 800x448 export;
+# the original 640x640 model if unset or missing (and in safe mode).
+MODEL=${LUCKFOX_MODEL:-yolov8n-optimized-rv1106-1.6.0.rknn}
+[ -f $APP_DIR/$MODEL ] || MODEL=yolov8n-optimized-rv1106-1.6.0.rknn
+echo "$(date) pipeline: $BIN model: $MODEL" >> /var/log/yolo-stream.log
 prepare_camera
 # WiFi is off by default (web UI button turns it on); see /usr/bin/yolo-wifi
 /usr/bin/yolo-wifi boot-off > /dev/null 2>&1 &
@@ -112,7 +116,7 @@ if [ -x $APP_DIR/$BIN ]; then
 	cd $APP_DIR
 	# restart if it ever exits (like systemd's Restart=on-failure on Ubuntu)
 	while true; do
-		./$BIN yolov8n-optimized-rv1106-1.6.0.rknn /dev/video11 \
+		./$BIN $MODEL /dev/video11 \
 			coco_80_labels_list.txt 8080 >> /var/log/yolo-stream.log 2>&1
 		echo "stream exited $?, restarting in ~5s" >> /var/log/yolo-stream.log
 		sleep 3

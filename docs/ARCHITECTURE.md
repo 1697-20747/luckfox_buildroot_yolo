@@ -1,6 +1,6 @@
 # Software install and architecture (short version)
 
-This is the state as of 2026-10-11. `CHANGELOG.md` is the dated record, and `PROJECT_MEMORY.md` has
+This is the state as of 2026-10-12. `CHANGELOG.md` is the dated record, and `PROJECT_MEMORY.md` has
 the full story.
 
 ## Board and image
@@ -31,13 +31,13 @@ S05watchdog   yolo_supervisor (static, mlocked) owns /dev/watchdog; yolo-healthl
 S21appinit    Rockchip's RkLunch.sh, with rkipc replaced by /usr/bin/yolo-app-start:
                 rkaiq_3A_server       auto exposure / white balance (sensor IQ file)
                 yolo_camd             opens the camera stream ONCE, never stops it
-                luckfox_video_hud_stream_cam   (restart loop)
+                luckfox_video_hud_stream_hwjpeg   (restart loop; _cam = software JPEG)
 ```
 
 ```
  camera ─ ISP ─ /dev/video11 ──► yolo_camd ──(DMA-BUF fds over \0yolo-camd)──► stream server
                     ▲                                                            │
-            rkaiq_3A_server                    NV12→RGB → 640x640 int8 → NPU (YOLOv8n, RKNN 1.6)
+            rkaiq_3A_server                    NV12→RGB → 800x448 int8 → NPU (YOLOv8n, RKNN 1.6)
                                                3-stage pipeline: capture | NPU | HUD + JPEG
                                                                                  │
                                     HTTP :8080  /  /stream (MJPEG, one viewer)  /api/status
@@ -57,8 +57,7 @@ S21appinit    Rockchip's RkLunch.sh, with rkipc replaced by /usr/bin/yolo-app-st
   - `LUCKFOX_CAMD=0` captures directly instead.
 - **Stream server** (`scripts/luckfox_video_hud_stream_cam.c`)
   - Detection on the NPU in a worker thread; HUD with live tilt from the MPU-6050.
-  - JPEG with static libjpeg-turbo. Hardware JPEG through Rockit VENC is the opt-in binary
-    `..._hwjpeg`.
+  - JPEG through Rockit VENC (hardware, default binary `..._hwjpeg`), or static libjpeg-turbo.
   - Navigation output: object centres, bearings and an SSE stream.
   - Web UI and object log.
   - Runs only while someone is watching or subscribed.
@@ -73,17 +72,18 @@ S21appinit    Rockchip's RkLunch.sh, with rkipc replaced by /usr/bin/yolo-app-st
     experimental options off.
   - Settings come from `/root/rknn_test/app.env`.
 
-## Performance and stability (2026-10-11)
+## Performance and stability (2026-10-12)
 
 | | |
 |---|---|
-| Video with HUD | 13.9–14.2 fps (software JPEG), 14.7 fps (hardware JPEG) |
-| Navigation only | 15 Hz |
-| Per frame | NPU about 62 ms inside an 83 ms pipeline stage; JPEG 27–29 ms software / 12 ms hardware |
-| Memory | about 127 MB free, flat |
-| Restart test | 100/100 server restarts clean with `yolo_camd` (before: 1 in 33 to 1 in 7 hung) |
-| Continuous run | 3 h with viewer + navigation subscriber: 0 resets, 13.1–14.1 fps, memory flat |
-| Hardware JPEG | 50/50 restarts clean (Rockit teardown every restart); JPEG 12 ms, CPU 75% (opt-in) |
+| Model | YOLOv8n, 800x448 input (16:9, matches the camera), int8; 640x640 as fallback |
+| Video with HUD | 16.2 fps (hardware JPEG, default) |
+| Navigation only | 16.7 Hz |
+| Per frame | NPU 58 ms; downscale 6 ms; decode 1.8 ms; JPEG 12 ms (hardware) |
+| Accuracy vs 640x640 | recall 84% vs 61%, precision 92% vs 94% (`tools/compare_models.py`) |
+| Memory | about 126 MB free, flat |
+| Restart test | 100/100 clean with `yolo_camd`; 50/50 with hardware JPEG; 30/30 with the 800x448 build |
+| Continuous run | 3 h software JPEG and 3 h hardware JPEG: 0 resets, memory flat |
 
 ## Tools
 
@@ -91,4 +91,6 @@ S21appinit    Rockchip's RkLunch.sh, with rkipc replaced by /usr/bin/yolo-app-st
 |---|---|
 | `tools/restart_stress.sh` | Server restart cycles; saves crash logs after any self-reset |
 | `tools/continuous_soak.sh` | Multi-hour run with per-minute stats |
+| `tools/export_yolov8_rknn.sh H W` | Reproducible YOLOv8n → RKNN export at any input size |
+| `tools/compare_models.py` | Simulator accuracy comparison of two input sizes |
 | `tools/backup_emmc.sh`, `restore_emmc.sh`, `flash_buildroot.sh` | Whole-board backup and restore |

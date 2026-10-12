@@ -3,6 +3,31 @@
 Terse, dated, factual record of real changes to this project. For the full narrative/discovery log
 (why, what was tried, what failed), see `PROJECT_MEMORY.md` — this file is the short version.
 
+## 2026-10-12
+
+- **Model input 800x448 (16:9) is the default, with hardware JPEG.** `tools/export_yolov8_rknn.sh 448 800`
+  is a reproducible export: Rockchip's YOLOv8 fork to ONNX opset 12, letterboxed calibration images,
+  then rknn-toolkit2 1.6.0. The server reads the input size from the model (`LUCKFOX_MODEL` in
+  app.env; missing file or safe mode falls back to 640x640).
+  - **Before:** the 640x640 model got the 960x540 frame *stretched*: rows duplicated, objects 1.78x
+    too tall.
+  - **Speed:** NPU 58 ms (vs 63.5); video 16.2 fps (vs 15.2); navigation only 16.7 Hz (vs 15).
+  - **Accuracy:** both int8 models in the simulator on 40 bikes.mp4 frames, against float YOLOv8n at
+    960 (`tools/compare_models.py`): recall 84% vs 61%, precision 92% vs 94%.
+  - **Restart test:** 30/30 clean on the new build.
+- **Two CPU regressions found and fixed on the way:**
+  - The downscale did a hardware divide per pixel once the size was no longer a compile-time
+    constant: 27 ms. A column lookup table fixed it: 6 ms.
+  - The decode checked all 80 classes per cell through `std::set` lookups (588k per frame) once
+    the score-sum pre-filter stopped rejecting cells; that sum's no-object floor (0.27) is above
+    the 0.25 threshold on this model. Checking only the allowed classes from an array fixed it:
+    20.5 ms down to 1.8 ms. A NEON 80-class quick reject covers an empty class list.
+  - Diagnostics kept: per-output layout/quant log at start-up, `LUCKFOX_DUMP_OUTPUTS=1` (one-shot
+    raw output dump), `post_cpu` and `copy` timings in the per-frame log.
+- **Hardware JPEG is the default** (`LUCKFOX_PIPELINE=hwjpeg`, `LUCKFOX_HW_JPEG=1`) after a 3 h
+  continuous run: 0 resets, 13.8–14.9 fps, memory flat.
+- **`/api/status` timings are 30-frame rolling averages** (were single-frame values).
+
 ## 2026-10-11
 
 - **3 h continuous run (yolo_camd, software JPEG):** viewer + navigation subscriber attached

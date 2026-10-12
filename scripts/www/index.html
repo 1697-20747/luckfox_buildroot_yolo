@@ -264,7 +264,7 @@
       ? 'P ' + (s.pitch > 0 ? '+' : '') + s.pitch.toFixed(0) + '°  R ' + (s.roll > 0 ? '+' : '') + s.roll.toFixed(0) + '°'
       : '–';
     $('res').textContent = s.display_w + '×' + s.display_h;
-    $('model').textContent = s.model_size + '×' + s.model_size;
+    $('model').textContent = (s.model_w || s.model_size) + '×' + (s.model_h || s.model_size);
     $('src').textContent = s.source;
     $('viewer').textContent = s.streaming ? (mine ? 'you (' + s.viewer_ip + ')' : s.viewer_ip) : 'none';
     $('frames').textContent = s.streaming ? s.frame : '–';

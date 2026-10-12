@@ -23,6 +23,8 @@ fi
 cp "$ROOT"/scripts/luckfox_video_hud_stream_cam.c "$ROOT"/scripts/apex_hud_widgets.[ch] "$ROOT"/scripts/yolo_supervisor.c "$ROOT"/scripts/yolo_camd.[ch] "$OUT"/
 rm -rf "$OUT/www" && cp -R "$ROOT/scripts/www" "$OUT/www"
 cp "$ROOT/scripts/app.env" "$OUT/app.env"
+# models made by tools/export_yolov8_rknn.sh (e.g. the 800x448 default)
+cp "$ROOT"/build/models/*.rknn "$OUT"/ 2>/dev/null || true
 
 docker run --rm --platform linux/amd64 -v luckfox-sdk:/sdk -v "$OUT":/src luckfox-sdk bash -c '
 set -e

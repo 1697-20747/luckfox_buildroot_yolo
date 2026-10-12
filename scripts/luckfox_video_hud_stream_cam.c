@@ -100,6 +100,7 @@
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <linux/videodev2.h>
+#include <arm_neon.h>
 #include <linux/dma-buf.h>
 #include <sys/un.h>
 #include <stddef.h>
@@ -161,7 +162,23 @@ extern "C" {
 #define NUM_SCALES 3
 #define BOX_THRESH 0.25f
 #define NMS_THRESH 0.45f
-#define MODEL_SIZE 640
+#define MODEL_SIZE 640   /* fallback only: the real input size is read from the model */
+/* Model input size, from the .rknn's own input tensor at start-up. A 16:9
+ * model (e.g. 800x448, tools/export_yolov8_rknn.sh) sees the camera frame with
+ * its proportions intact; the original 640x640 model gets it stretched. */
+static int g_model_w = MODEL_SIZE, g_model_h = MODEL_SIZE;
+
+/* Rolling average over the last ROLL_N frames for /api/status: a single
+ * frame's timing is noisy on this one-core board (a frame preempted by
+ * another thread can take 2-3x the typical time). */
+#define ROLL_N 30
+typedef struct { double v[ROLL_N]; int n, i; double sum; } RollAvg;
+static double roll_add(RollAvg* r, double x) {
+    if (r->n == ROLL_N) r->sum -= r->v[r->i]; else r->n++;
+    r->v[r->i] = x; r->sum += x; r->i = (r->i + 1) % ROLL_N;
+    return r->sum / r->n;
+}
+static RollAvg g_roll_infer, g_roll_read, g_roll_jpeg;
 #define HTTP_PORT_DEFAULT 8080
 
 static const int STRIDES[NUM_SCALES] = {8, 16, 32};
@@ -173,6 +190,10 @@ static const int STRIDES[NUM_SCALES] = {8, 16, 32};
  * decode loop cuts real CPU work per grid cell -- edit this set to
  * widen/narrow what gets detected. */
 static std::set<int> ALLOWED_CLASSES = {0, 1, 2, 3, 5, 7};
+/* The same list as a plain array for the per-cell decode loop: 80 std::set
+ * lookups per grid cell cost ~20 ms per frame on the 800x448 model, where the
+ * score-sum pre-filter no longer skips most cells. */
+static const int ALLOWED_LIST[] = {0, 1, 2, 3, 5, 7};
 
 /* --- MPU-6050 accelerometer via Linux IIO sysfs, with EMA smoothing --- */
 
@@ -369,11 +390,32 @@ static void decode_scale(int8_t* box_t, int32_t box_zp, float box_scale,
             int max_class_id = -1;
             int8_t max_score = -128;
             int score_offset = offset * OBJ_CLASS_NUM;
-            for (int c = 0; c < OBJ_CLASS_NUM; c++) {
-                if (!ALLOWED_CLASSES.empty() && ALLOWED_CLASSES.find(c) == ALLOWED_CLASSES.end()) continue;
-                if (score_t[score_offset + c] > score_thres_i8 && score_t[score_offset + c] > max_score) {
-                    max_score = score_t[score_offset + c];
-                    max_class_id = c;
+            /* Quick reject with NEON: the max over all 80 class scores, 16 per
+             * instruction. The score-sum pre-filter above can't reject on its
+             * own when the sum's no-object floor is already over the threshold
+             * (800x448 model, stride 8: 80 tiny class scores add up to ~0.27),
+             * and the scalar scan of every cell then cost ~20 ms per frame. */
+            if (ALLOWED_CLASSES.empty() && OBJ_CLASS_NUM == 80) {
+                const int8_t* sp = score_t + score_offset;
+                int8x16_t m = vmaxq_s8(vmaxq_s8(vld1q_s8(sp), vld1q_s8(sp + 16)),
+                                       vmaxq_s8(vmaxq_s8(vld1q_s8(sp + 32), vld1q_s8(sp + 48)), vld1q_s8(sp + 64)));
+                int8x8_t m8 = vpmax_s8(vget_low_s8(m), vget_high_s8(m));
+                m8 = vpmax_s8(m8, m8); m8 = vpmax_s8(m8, m8); m8 = vpmax_s8(m8, m8);
+                if (vget_lane_s8(m8, 0) <= score_thres_i8) continue;
+            }
+            if (!ALLOWED_CLASSES.empty()) {
+                for (int c : ALLOWED_LIST) {
+                    if (score_t[score_offset + c] > score_thres_i8 && score_t[score_offset + c] > max_score) {
+                        max_score = score_t[score_offset + c];
+                        max_class_id = c;
+                    }
+                }
+            } else {
+                for (int c = 0; c < OBJ_CLASS_NUM; c++) {
+                    if (score_t[score_offset + c] > score_thres_i8 && score_t[score_offset + c] > max_score) {
+                        max_score = score_t[score_offset + c];
+                        max_class_id = c;
+                    }
                 }
             }
             if (max_score <= score_thres_i8) continue;
@@ -421,12 +463,25 @@ static std::vector<Detection> nms(std::vector<Detection>& dets) {
  * keeps inference cost constant regardless of display/stream
  * resolution (1697-20747: "full resolution can go to streaming output and
  * hud, with reduced resolution for inference on chip"). */
+/* Nearest-neighbour, with the source column offsets computed once per size:
+ * with the model size known only at run time (read from the .rknn), the old
+ * per-pixel x * src_w / dst_w became a real hardware divide per pixel --
+ * 27 ms per 800x448 frame on the A7 instead of ~10 ms. */
 static void downscale_for_inference(unsigned char* src, int src_w, int src_h, unsigned char* dst, int dst_w, int dst_h) {
+    static int* xoff = NULL;
+    static int lut_src_w = 0, lut_dst_w = 0;
+    if (lut_src_w != src_w || lut_dst_w != dst_w) {
+        free(xoff);
+        xoff = (int*)malloc(sizeof(int) * dst_w);
+        for (int x = 0; x < dst_w; x++) xoff[x] = (x * src_w / dst_w) * 3;
+        lut_src_w = src_w; lut_dst_w = dst_w;
+    }
     for (int y = 0; y < dst_h; y++) {
-        int sy = y * src_h / dst_h;
-        for (int x = 0; x < dst_w; x++) {
-            int sx = x * src_w / dst_w;
-            for (int c = 0; c < 3; c++) dst[(y * dst_w + x) * 3 + c] = src[(sy * src_w + sx) * 3 + c];
+        const unsigned char* src_row = src + (size_t)(y * src_h / dst_h) * src_w * 3;
+        unsigned char* d = dst + (size_t)y * dst_w * 3;
+        for (int x = 0; x < dst_w; x++, d += 3) {
+            const unsigned char* p = src_row + xoff[x];
+            d[0] = p[0]; d[1] = p[1]; d[2] = p[2];
         }
     }
 }
@@ -909,7 +964,7 @@ typedef struct {
     bool quit;
     /* results, per input slot */
     std::vector<Detection> dets[2];
-    double npu_ms[2], post_ms[2];
+    double npu_ms[2], post_ms[2], copy_ms[2], post_cpu_ms[2];
     int ret[2];
 } NpuWorker;
 
@@ -924,9 +979,12 @@ static void* npu_worker_main(void* arg) {
 
         struct timespec t0, t1, t2;
         clock_gettime(CLOCK_MONOTONIC, &t0);
+        w->copy_ms[idx] = 0;
         int ret = rknn_set_io_mem(w->ctx, w->input_mems[idx], &w->input_attr);
         if (ret == RKNN_SUCC) ret = rknn_run(w->ctx, NULL);
         clock_gettime(CLOCK_MONOTONIC, &t1);
+        struct timespec c1, c2;   /* this thread's own CPU time, vs wall time */
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &c1);
         std::vector<Detection> all_dets;
         if (ret == RKNN_SUCC) {
             std::vector<rknn_tensor_attr>& oa = *w->output_attrs;
@@ -936,11 +994,39 @@ static void* npu_worker_main(void* arg) {
                 rknn_tensor_attr& score_attr = oa[s * 3 + 1];
                 rknn_tensor_attr& sum_attr = oa[s * 3 + 2];
                 int grid_h = box_attr.dims[1], grid_w = box_attr.dims[2], dfl_len = box_attr.dims[3] / 4;
+                /* The class-score tensor is copied into cached RAM in one bulk
+                 * memcpy before the decode scans it: the NPU output buffers
+                 * from rknn_create_mem are read slowly by the CPU byte by
+                 * byte, which cost ~20 ms per frame once the score-sum
+                 * pre-filter stopped rejecting cells (800x448 model). */
+                static std::vector<int8_t> score_copy[3];
+                score_copy[s].resize(score_attr.size);
+                struct timespec tc0, tc1;
+                clock_gettime(CLOCK_MONOTONIC, &tc0);
+                memcpy(score_copy[s].data(), om[s * 3 + 1]->virt_addr, score_attr.size);
+                clock_gettime(CLOCK_MONOTONIC, &tc1);
+                w->copy_ms[idx] += (tc1.tv_sec - tc0.tv_sec) * 1000.0 + (tc1.tv_nsec - tc0.tv_nsec) / 1e6;
                 decode_scale((int8_t*)om[s * 3 + 0]->virt_addr, box_attr.zp, box_attr.scale,
-                             (int8_t*)om[s * 3 + 1]->virt_addr, score_attr.zp, score_attr.scale,
+                             score_copy[s].data(), score_attr.zp, score_attr.scale,
                              (int8_t*)om[s * 3 + 2]->virt_addr, sum_attr.zp, sum_attr.scale,
                              grid_h, grid_w, STRIDES[s], dfl_len, all_dets);
             }
+        }
+        /* LUCKFOX_DUMP_OUTPUTS=1: write the raw output buffers (size_with_stride
+         * bytes each) of the 30th inference to /tmp once, to check the real
+         * memory layout of a model's outputs. */
+        static int dump_countdown = getenv("LUCKFOX_DUMP_OUTPUTS") ? 30 : -1;
+        if (ret == RKNN_SUCC && dump_countdown > 0 && --dump_countdown == 0) {
+            for (size_t k = 0; k < w->output_attrs->size(); k++) {
+                char path[64];
+                snprintf(path, sizeof(path), "/tmp/rknn-out%zu.bin", k);
+                FILE* fp = fopen(path, "wb");
+                if (fp) {
+                    fwrite((*w->output_mems)[k]->virt_addr, 1, (*w->output_attrs)[k].size_with_stride, fp);
+                    fclose(fp);
+                }
+            }
+            printf("RESULT: OUTPUTS_DUMPED /tmp/rknn-out*.bin\n");
         }
         std::vector<Detection> dets = nms(all_dets);
         clock_gettime(CLOCK_MONOTONIC, &t2);
@@ -950,6 +1036,8 @@ static void* npu_worker_main(void* arg) {
         w->ret[idx] = ret;
         w->npu_ms[idx] = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
         w->post_ms[idx] = (t2.tv_sec - t1.tv_sec) * 1000.0 + (t2.tv_nsec - t1.tv_nsec) / 1e6;
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &c2);
+        w->post_cpu_ms[idx] = (c2.tv_sec - c1.tv_sec) * 1000.0 + (c2.tv_nsec - c1.tv_nsec) / 1e6;
         w->job_idx = -1;
         w->job_done = true;
         pthread_cond_broadcast(&w->cond);
@@ -1102,7 +1190,7 @@ static std::string build_det_json(int frame, const std::vector<Detection>& dets,
     std::string j = tmp;
     for (size_t i = 0; i < dets.size(); i++) {
         const Detection& d = dets[i];
-        float bx = d.x / MODEL_SIZE, by = d.y / MODEL_SIZE, bw = d.w / MODEL_SIZE, bh = d.h / MODEL_SIZE;
+        float bx = d.x / g_model_w, by = d.y / g_model_h, bw = d.w / g_model_w, bh = d.h / g_model_h;
         float cx = bx + bw / 2, cy = by + bh / 2;
         snprintf(tmp, sizeof(tmp),
                  "%s{\"id\":%d,\"cls\":\"%s\",\"score\":%.2f,\"cx\":%.4f,\"cy\":%.4f,"
@@ -1345,13 +1433,13 @@ static void http_send_status(int fd) {
         "{\"streaming\":%s,\"viewer_ip\":\"%s\",\"viewer_id\":\"%s\",\"viewers_served\":%d,"
         "\"frame\":%d,\"fps\":%.2f,\"infer_ms\":%.1f,\"jpeg_ms\":%.1f,\"read_ms\":%.1f,"
         "\"dets\":%d,\"cpu_pct\":%.0f,\"mem_avail_mb\":%d,\"soc_temp_c\":%.1f,"
-        "\"display_w\":%d,\"display_h\":%d,\"model_size\":%d,\"source\":\"%s\","
+        "\"display_w\":%d,\"display_h\":%d,\"model_size\":%d,\"model_w\":%d,\"model_h\":%d,\"source\":\"%s\","
         "\"view\":\"%s\",\"session\":%d,\"session_s\":%.0f,\"objects_total\":%d,"
         "\"has_tilt\":%s,\"pitch\":%.1f,\"roll\":%.1f,\"nav_subscriber\":%s}",
         g_status.streaming ? "true" : "false", g_status.viewer_ip, g_status.viewer_id, g_status.viewers_served,
         g_status.frame, g_status.fps, g_status.infer_ms, g_status.jpeg_ms, g_status.read_ms,
         g_status.dets, g_status.cpu_pct, read_mem_available_mb(), read_soc_temp_c(),
-        g_status.display_w, g_status.display_h, MODEL_SIZE, g_status.source ? g_status.source : "",
+        g_status.display_w, g_status.display_h, g_model_w, g_model_w, g_model_h, g_status.source ? g_status.source : "",
         g_view_hud ? "hud" : "plain", g_session.session_id,
         g_status.streaming ? session_elapsed_s() : 0.0, g_session.total,
         g_status.has_tilt ? "true" : "false", g_status.pitch, g_status.roll, g_nav_fd >= 0 ? "true" : "false");
@@ -1976,7 +2064,7 @@ int main(int argc, char** argv) {
         display_w = v4l2_cap.width;
         display_h = v4l2_cap.height;
     }
-    printf("RESULT: DISPLAY_RES %dx%d (inference stays %dx%d)\n", display_w, display_h, MODEL_SIZE, MODEL_SIZE);
+    printf("RESULT: DISPLAY_RES %dx%d (inference size comes from the model)\n", display_w, display_h);
     g_status.display_w = display_w;
     g_status.display_h = display_h;
     g_status.source = video_path;
@@ -2000,12 +2088,23 @@ int main(int argc, char** argv) {
     rknn_query(ctx, RKNN_QUERY_NATIVE_INPUT_ATTR, &input_attr, sizeof(input_attr));
     input_attr.type = RKNN_TENSOR_INT8;
     input_attr.fmt = RKNN_TENSOR_NHWC;
+    /* native input is NHWC: dims = {1, H, W, 3} */
+    if (input_attr.n_dims == 4 && input_attr.dims[1] > 0 && input_attr.dims[2] > 0) {
+        g_model_h = (int)input_attr.dims[1];
+        g_model_w = (int)input_attr.dims[2];
+    }
+    const int model_row_stride = (input_attr.w_stride ? (int)input_attr.w_stride : g_model_w) * 3;
+    printf("RESULT: MODEL_INPUT %dx%d (row stride %d px)\n", g_model_w, g_model_h, model_row_stride / 3);
 
     std::vector<rknn_tensor_attr> output_attrs(io_num.n_output);
     memset(output_attrs.data(), 0, sizeof(rknn_tensor_attr) * io_num.n_output);
     for (uint32_t i = 0; i < io_num.n_output; i++) {
         output_attrs[i].index = i;
         rknn_query(ctx, RKNN_QUERY_NATIVE_NHWC_OUTPUT_ATTR, &output_attrs[i], sizeof(rknn_tensor_attr));
+        const rknn_tensor_attr& o = output_attrs[i];
+        printf("RESULT: OUTPUT %u dims %ux%ux%ux%u zp %d scale %.6f fmt %d n_elems %u size %u size_with_stride %u w_stride %u h_stride %u\n", i,
+               o.dims[0], o.dims[1], o.dims[2], o.dims[3], o.zp, o.scale, (int)o.fmt, o.n_elems, o.size,
+               o.size_with_stride, o.w_stride, o.h_stride);
     }
 
     step_mark("start: rknn_create_mem (NPU buffers) begin");
@@ -2083,19 +2182,19 @@ int main(int argc, char** argv) {
     unsigned char* frames[3];
     for (int i = 0; i < 3; i++) frames[i] = (unsigned char*)malloc(display_w * display_h * 3);
     unsigned char* frame_full = frames[0];
-    unsigned char* frame_small = (unsigned char*)malloc(MODEL_SIZE * MODEL_SIZE * 3);
+    unsigned char* frame_small = (unsigned char*)malloc(g_model_w * g_model_h * 3);
     if (use_rga_downscale) {
         if (drm_init()) {
             g_drm_src = (unsigned char*)drm_alloc_contig(display_w, display_h, 3, &g_src_stride_px);
-            g_drm_dst = (unsigned char*)drm_alloc_contig(MODEL_SIZE, MODEL_SIZE, 3, &g_dst_stride_px);
+            g_drm_dst = (unsigned char*)drm_alloc_contig(g_model_w, g_model_h, 3, &g_dst_stride_px);
         }
         if (!g_drm_src || !g_drm_dst) {
             printf("RESULT: DRM_ALLOC_FAILED, falling back to CPU downscale\n");
             use_rga_downscale = false;
         }
     }
-    float scale_x = (float)display_w / MODEL_SIZE;
-    float scale_y = (float)display_h / MODEL_SIZE;
+    float scale_x = (float)display_w / g_model_w;
+    float scale_y = (float)display_h / g_model_h;
     printf("RESULT: DOWNSCALE_MODE %s\n", use_rga_downscale ? "RGA" : "CPU");
 
     while (!g_quit) {
@@ -2174,13 +2273,13 @@ int main(int argc, char** argv) {
                 struct timespec t_ds_start, t_ds_end;
                 clock_gettime(CLOCK_MONOTONIC, &t_ds_start);
                 if (use_rga_downscale) {
-                    if (!downscale_for_inference_rga(cap_frame, display_w, display_h, frame_small, MODEL_SIZE, MODEL_SIZE)) {
+                    if (!downscale_for_inference_rga(cap_frame, display_w, display_h, frame_small, g_model_w, g_model_h)) {
                         fprintf(stderr, "RESULT: RGA_DOWNSCALE_FAILED, falling back to CPU downscale for this and all future frames\n");
                         use_rga_downscale = false;
-                        downscale_for_inference(cap_frame, display_w, display_h, frame_small, MODEL_SIZE, MODEL_SIZE);
+                        downscale_for_inference(cap_frame, display_w, display_h, frame_small, g_model_w, g_model_h);
                     }
                 } else {
-                    downscale_for_inference(cap_frame, display_w, display_h, frame_small, MODEL_SIZE, MODEL_SIZE);
+                    downscale_for_inference(cap_frame, display_w, display_h, frame_small, g_model_w, g_model_h);
                 }
                 clock_gettime(CLOCK_MONOTONIC, &t_ds_end);
                 double downscale_ms = (t_ds_end.tv_sec - t_ds_start.tv_sec) * 1000.0 +
@@ -2188,7 +2287,11 @@ int main(int argc, char** argv) {
                 struct timespec t_q0, t_q1;
                 clock_gettime(CLOCK_MONOTONIC, &t_q0);
                 int8_t* in_buf = (int8_t*)npu.input_mems[slot]->virt_addr;
-                for (int i = 0; i < MODEL_SIZE * MODEL_SIZE * 3; i++) in_buf[i] = (int8_t)((int)frame_small[i] - 128);
+                for (int y = 0; y < g_model_h; y++) {
+                    const unsigned char* src_row = frame_small + (size_t)y * g_model_w * 3;
+                    int8_t* dst_row = in_buf + (size_t)y * model_row_stride;
+                    for (int i = 0; i < g_model_w * 3; i++) dst_row[i] = (int8_t)((int)src_row[i] - 128);
+                }
                 clock_gettime(CLOCK_MONOTONIC, &t_q1);
                 fb_read_ms[fb] = read_ms;
                 fb_ds_ms[fb] = downscale_ms;
@@ -2229,8 +2332,8 @@ int main(int argc, char** argv) {
             float cpu_pct = read_cpu_percent();
             g_status.frame = frame_count;
             g_status.fps = fps;
-            g_status.infer_ms = infer_ms;
-            g_status.read_ms = read_ms;
+            g_status.infer_ms = roll_add(&g_roll_infer, infer_ms);
+            g_status.read_ms = roll_add(&g_roll_read, read_ms);
             g_status.dets = (int)dets.size();
             g_status.cpu_pct = cpu_pct;
             std::vector<int> det_ids;
@@ -2357,16 +2460,16 @@ int main(int argc, char** argv) {
                 g_status.streaming = 0;
                 session_reset(); /* per-session object log is wiped on disconnect */
             } else {
-                g_status.jpeg_ms = jpeg_ms;
+                g_status.jpeg_ms = roll_add(&g_roll_jpeg, jpeg_ms);
             }
             } /* client_fd >= 0: HUD + JPEG only when someone is watching */
             http_poll_requests();
 
             if (frame_count % 10 == 0) {
-                printf("frame=%d fps=%.1f read_ms=%.1f downscale_ms=%.1f infer_ms=%.1f (quant=%.1f npu=%.1f post=%.1f) "
+                printf("frame=%d fps=%.1f read_ms=%.1f downscale_ms=%.1f infer_ms=%.1f (quant=%.1f npu=%.1f post=%.1f post_cpu=%.1f copy=%.1f) "
                        "hud_ms=%.1f jpeg_ms=%.1f net_ms=%.1f dets=%zu\n",
                        frame_count, fps, read_ms, downscale_ms, infer_ms, quant_ms, npu_ms,
-                       infer_ms - quant_ms - npu_ms - downscale_ms, hud_ms, jpeg_ms, net_ms, dets.size());
+                       infer_ms - quant_ms - npu_ms - downscale_ms, npu.post_cpu_ms[dslot], npu.copy_ms[dslot], hud_ms, jpeg_ms, net_ms, dets.size());
                 fflush(stdout);
             }
             disp_fb = -1;

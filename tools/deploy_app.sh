@@ -8,7 +8,7 @@ BOARD=root@172.32.0.70
 cd "$ROOT/build/app_src"
 # COPYFILE_DISABLE: stop macOS tar adding ._* AppleDouble files
 COPYFILE_DISABLE=1 tar -cf - luckfox_video_hud_stream_cam luckfox_video_hud_stream_rockit luckfox_video_hud_stream_hwjpeg yolo_supervisor yolo_camd www app.env \
-    yolov8n-optimized-rv1106-1.6.0.rknn coco_80_labels_list.txt \
+    yolov8n-optimized-rv1106-1.6.0.rknn $(ls yolov8n-*x*-rv1106-1.6.0.rknn 2>/dev/null) coco_80_labels_list.txt \
   | ssh "$BOARD" 'set -e
     # Unpack into a staging dir, then RENAME into place: never write over a
     # file the running server has mapped (its binary, libjpeg). All four
@@ -19,7 +19,7 @@ COPYFILE_DISABLE=1 tar -cf - luckfox_video_hud_stream_cam luckfox_video_hud_stre
     rm -rf $NEW && mkdir -p $NEW $APP && tar -xf - -C $NEW && chown -R root:root $NEW
     [ -d $APP/www/docs ] && mv $APP/www/docs $NEW/www/docs   # docs site is deployed separately
     sync
-    for f in luckfox_video_hud_stream_cam luckfox_video_hud_stream_rockit luckfox_video_hud_stream_hwjpeg yolo_supervisor yolo_camd app.env yolov8n-optimized-rv1106-1.6.0.rknn coco_80_labels_list.txt; do
+    for f in luckfox_video_hud_stream_cam luckfox_video_hud_stream_rockit luckfox_video_hud_stream_hwjpeg yolo_supervisor yolo_camd app.env yolov8n-optimized-rv1106-1.6.0.rknn coco_80_labels_list.txt $(cd $NEW && ls yolov8n-*x*-rv1106-1.6.0.rknn 2>/dev/null); do
         mv -f $NEW/$f $APP/$f
     done
     rm -rf $APP/lib   # libjpeg is linked statically now; old shared copy unused
