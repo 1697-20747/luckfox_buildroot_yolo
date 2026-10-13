@@ -5,6 +5,12 @@ Terse, dated, factual record of real changes to this project. For the full narra
 
 ## 2026-10-13
 
+- **Fix: `/api/wifi` restored** (the web UI's WiFi button). Adding `/api/time` (1d25fe4)
+  replaced the `/api/wifi` route line instead of inserting before it, so `/api/wifi` returned "not
+  found" and `/api/time` also ran the WiFi handler after its own reply. Found while checking the
+  rewritten README against the code; all 11 endpoints now answer 200.
+- **README rewritten** for the current project (was mostly Ubuntu-era).
+
 - **6-position accelerometer calibration (web UI: Tilt row -> Calibrate).**
   - The unit rests on each of its six faces in turn and **Capture** records it. The board picks the
     face from the dominant axis and its sign. A capture is refused while the unit moves (jitter of

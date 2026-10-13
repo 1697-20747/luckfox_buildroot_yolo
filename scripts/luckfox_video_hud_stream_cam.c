@@ -2068,6 +2068,7 @@ static bool http_handle_connection(int fd, const char* ipstr) {
         char body[96];
         snprintf(body, sizeof(body), "{\"set\":%s,\"board_ms\":%lld}", set ? "true" : "false", board_ms);
         http_send_simple(fd, "200 OK", "application/json", body, strlen(body));
+    } else if (!strcmp(target, "/api/wifi")) {
         http_send_wifi(fd, query);
     } else if (!strcmp(target, "/api/objects/reset")) {
         session_reset(); /* clears the object log and per-class counts; track ids restart */
