@@ -83,11 +83,11 @@ S21appinit    Rockchip's RkLunch.sh, with rkipc replaced by /usr/bin/yolo-app-st
 | Video with HUD | 30 fps (camera rate), detection 14.9 Hz alongside |
 | Navigation only | 17.1 Hz |
 | Per frame | NPU 58 ms; RGA conversions ~1 ms each; quantise 2 ms (NEON); decode 1.8 ms; HUD 4–5 ms; JPEG 3 ms |
-| CPU | 50% while streaming 30 fps (was 86% at 16 fps before the RGA) |
+| CPU | ~73% average while streaming 30 fps (was 86% at 16 fps before the RGA) |
 | Accuracy vs 640x640 | recall 84% vs 61%, precision 92% vs 94% (`tools/compare_models.py`) |
 | Memory | about 126 MB free, flat |
 | Restart test | 100/100 clean with `yolo_camd`; 50/50 with hardware JPEG; 30/30 each on the 800x448, RGA and decoupled builds |
-| Continuous run | 3 h software JPEG and 3 h hardware JPEG: 0 resets, memory flat |
+| Continuous run | 3 h each: software JPEG, hardware JPEG, and RGA + decoupled (30.0 fps / 14.9 Hz throughout): 0 resets, memory flat |
 
 ## Tools
 

@@ -19,11 +19,14 @@ Terse, dated, factual record of real changes to this project. For the full narra
   - **Decoupled display (default while a viewer watches):** each loop shows the newest camera frame
     with the latest finished detection's boxes. Every frame is also resized and quantised into the
     NPU's spare input tensor, which is submitted the moment the NPU finishes (checked every 2 ms
-    while waiting for the camera). Video 30 fps (was 16.7), detection 14.9 Hz, CPU 50%; boxes lag the
+    while waiting for the camera). Video 30 fps (was 16.7), detection 14.9 Hz, CPU ~73% average; boxes lag the
     picture by one detection. Navigation-only clients keep the pipelined loop (17.1 Hz).
     `LUCKFOX_DECOUPLED=0` turns it off. `/api/status` adds `det_hz`.
   - 30/30 restarts clean on the RGA build and again on the decoupled build, with no RGA kernel
     errors.
+  - 3 h continuous run (viewer + navigation client): 0 resets, video 30.0 fps and detection
+    14.9 Hz in every streaming sample, CPU ~73% average, memory flat at 130–132 MB, 60 °C, no RGA
+    kernel errors, one camera stream start.
 
 - **Model input 800x448 (16:9) is the default, with hardware JPEG.** `tools/export_yolov8_rknn.sh 448 800`
   is a reproducible export: Rockchip's YOLOv8 fork to ONNX opset 12, letterboxed calibration images,
