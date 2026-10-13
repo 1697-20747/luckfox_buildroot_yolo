@@ -276,6 +276,47 @@ static bool accel_read_raw_axis(const char* device_path, const char* axis, float
 /* Reads real x/y/z, applies the EMA filter, and tracks real achieved
  * sample rate (printed every 30 successful reads -- report the real
  * number once hardware exists, don't assume one). */
+/* --- 6-position accelerometer calibration (2026-10-13) ---
+ * The 2026-10-13 range log showed this MPU-6050 module reading ~12.5 m/s^2
+ * at rest (~1.27 g) and up to 1.44 g on one axis: offset and scale error per
+ * axis. The web UI's calibration captures the unit resting on each of its six
+ * faces (the board works out which face from the dominant axis), then per
+ * axis: offset = (up + down) / 2, scale = 2 g / (up - down). Applied to every
+ * raw reading before the EMA, so HUD, navigation output and status all get
+ * corrected values. Saved to /userdata/accel-cal.conf, loaded at start-up.
+ * Values are m/s^2 (the IIO scale). */
+#define CAL_FILE "/userdata/accel-cal.conf"
+#define STD_G 9.80665f
+static bool g_cal_set = false;
+static float g_cal_off[3] = { 0, 0, 0 }, g_cal_scale[3] = { 1, 1, 1 };
+/* captures, index axis*2 + (0 = axis pointing up, 1 = down) */
+static float g_cal_cap[6][3];
+static bool g_cal_have[6];
+/* uncorrected readings, smoothed, and how much they jump between samples */
+static float g_raw_ema[3];
+static float g_raw_jitter = 99.0f;
+static bool g_raw_ema_init = false;
+
+static void cal_track_raw(const float raw[3]) {
+    if (!g_raw_ema_init) {
+        for (int i = 0; i < 3; i++) g_raw_ema[i] = raw[i];
+        g_raw_ema_init = true;
+        return;
+    }
+    float d2 = 0;
+    for (int i = 0; i < 3; i++) {
+        float d = raw[i] - g_raw_ema[i];
+        d2 += d * d;
+        g_raw_ema[i] += 0.2f * d;
+    }
+    g_raw_jitter += 0.2f * (sqrtf(d2) - g_raw_jitter);
+}
+
+static void cal_apply(float v[3]) {
+    for (int i = 0; i < 3; i++) v[i] = (v[i] - g_cal_off[i]) * g_cal_scale[i];
+}
+
+
 static void accel_update(AccelState* st) {
     if (!st->found) return;
     float x, y, z;
@@ -287,6 +328,12 @@ static void accel_update(AccelState* st) {
         return;
     }
     st->reads_ok++;
+    {
+        float v[3] = { x, y, z };
+        cal_track_raw(v);   /* uncorrected, for calibration captures */
+        cal_apply(v);       /* 6-position offset/scale correction */
+        x = v[0]; y = v[1]; z = v[2];
+    }
     if (!st->ema_initialized) {
         st->smoothed_x = x; st->smoothed_y = y; st->smoothed_z = z;
         st->ema_initialized = true;
@@ -1698,6 +1745,116 @@ static float read_soc_temp_c(void) {
     return ok == 1 ? milli / 1000.0f : -1;
 }
 
+static void cal_load(void) {
+    FILE* f = fopen(CAL_FILE, "r");
+    if (!f) return;
+    float o[3], sc[3];
+    if (fscanf(f, "%f %f %f %f %f %f", &o[0], &o[1], &o[2], &sc[0], &sc[1], &sc[2]) == 6 &&
+        sc[0] > 0.5f && sc[0] < 2 && sc[1] > 0.5f && sc[1] < 2 && sc[2] > 0.5f && sc[2] < 2) {
+        memcpy(g_cal_off, o, sizeof(o));
+        memcpy(g_cal_scale, sc, sizeof(sc));
+        g_cal_set = true;
+        printf("RESULT: ACCEL_CAL_LOADED offset (%.3f, %.3f, %.3f) scale (%.4f, %.4f, %.4f)\n",
+               o[0], o[1], o[2], sc[0], sc[1], sc[2]);
+    }
+    fclose(f);
+}
+
+static bool cal_write_file(const char* text) {
+    const char* tmp = CAL_FILE ".tmp";
+    FILE* f = fopen(tmp, "w");
+    if (!f) return false;
+    fputs(text, f);
+    fflush(f);
+    fsync(fileno(f));
+    fclose(f);
+    if (rename(tmp, CAL_FILE) != 0) return false;
+    int d = open("/userdata", O_RDONLY | O_CLOEXEC);
+    if (d >= 0) { fsync(d); close(d); }
+    return true;
+}
+
+/* Capture the current resting reading as one face. Returns a message. */
+static const char* cal_capture(bool* ok) {
+    *ok = false;
+    if (!g_raw_ema_init) return "no accelerometer reading";
+    if (g_raw_jitter > 0.6f) return "the unit is moving -- hold it still and try again";
+    float* r = g_raw_ema;
+    float n = sqrtf(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
+    int k = 0;
+    for (int i = 1; i < 3; i++) if (fabsf(r[i]) > fabsf(r[k])) k = i;
+    if (fabsf(r[k]) < 0.9f * n) return "not flat on a face -- rest it squarely on one side";
+    int idx = k * 2 + (r[k] > 0 ? 0 : 1);
+    memcpy(g_cal_cap[idx], r, sizeof(float) * 3);
+    g_cal_have[idx] = true;
+    *ok = true;
+    return "captured";
+}
+
+static const char* cal_save(bool* ok) {
+    *ok = false;
+    for (int i = 0; i < 6; i++) if (!g_cal_have[i]) return "capture all six faces first";
+    float o[3], sc[3];
+    for (int k = 0; k < 3; k++) {
+        float up = g_cal_cap[k * 2][k], down = g_cal_cap[k * 2 + 1][k];
+        float span = up - down;
+        if (!(up > 0 && down < 0) || span < 2 * STD_G * 0.6f || span > 2 * STD_G * 1.6f)
+            return "the captured faces don't look like plus and minus 1 g -- reset and capture again";
+        o[k] = (up + down) / 2;
+        sc[k] = 2 * STD_G / span;
+    }
+    char text[160];
+    snprintf(text, sizeof(text), "%.5f %.5f %.5f %.6f %.6f %.6f\n", o[0], o[1], o[2], sc[0], sc[1], sc[2]);
+    if (!cal_write_file(text)) return "could not save to /userdata";
+    memcpy(g_cal_off, o, sizeof(o));
+    memcpy(g_cal_scale, sc, sizeof(sc));
+    g_cal_set = true;
+    /* the stored level was measured with the old calibration */
+    level_clear();
+    unlink(LEVEL_FILE);
+    if (g_accel) g_accel->ema_initialized = false;
+    printf("RESULT: ACCEL_CAL_SAVED offset (%.3f, %.3f, %.3f) scale (%.4f, %.4f, %.4f)\n",
+           o[0], o[1], o[2], sc[0], sc[1], sc[2]);
+    *ok = true;
+    return "calibration saved -- now stand the unit level and press Set level";
+}
+
+static void cal_clear(void) {
+    for (int i = 0; i < 3; i++) { g_cal_off[i] = 0; g_cal_scale[i] = 1; }
+    g_cal_set = false;
+    unlink(CAL_FILE);
+    level_clear();
+    unlink(LEVEL_FILE);
+    if (g_accel) g_accel->ema_initialized = false;
+}
+
+static void http_send_accelcal(int fd, const char* query) {
+    bool ok = true;
+    const char* msg = "";
+    if (query && strstr(query, "capture=1")) msg = cal_capture(&ok);
+    else if (query && strstr(query, "save=1")) msg = cal_save(&ok);
+    else if (query && strstr(query, "reset=1")) { memset(g_cal_have, 0, sizeof(g_cal_have)); msg = "captures reset"; }
+    else if (query && strstr(query, "clear=1")) { cal_clear(); msg = "calibration and level cleared"; }
+    static const char* names[6] = { "+X", "-X", "+Y", "-Y", "+Z", "-Z" };
+    char faces[64] = "";
+    for (int i = 0; i < 6; i++) {
+        if (!g_cal_have[i]) continue;
+        if (faces[0]) strcat(faces, ",");
+        strcat(faces, "\"");
+        strcat(faces, names[i]);
+        strcat(faces, "\"");
+    }
+    float n = sqrtf(g_raw_ema[0] * g_raw_ema[0] + g_raw_ema[1] * g_raw_ema[1] + g_raw_ema[2] * g_raw_ema[2]);
+    char body[512];
+    int len = snprintf(body, sizeof(body),
+        "{\"ok\":%s,\"msg\":\"%s\",\"cal_set\":%s,\"faces\":[%s],\"still\":%s,\"raw_g\":%.2f,"
+        "\"offset\":[%.3f,%.3f,%.3f],\"scale\":[%.4f,%.4f,%.4f]}",
+        ok ? "true" : "false", msg, g_cal_set ? "true" : "false", faces,
+        g_raw_jitter <= 0.6f ? "true" : "false", n / STD_G,
+        g_cal_off[0], g_cal_off[1], g_cal_off[2], g_cal_scale[0], g_cal_scale[1], g_cal_scale[2]);
+    http_send_simple(fd, "200 OK", "application/json", body, (size_t)len);
+}
+
 static void http_send_status(int fd) {
     char body[1024];
     int len = snprintf(body, sizeof(body),
@@ -1706,14 +1863,14 @@ static void http_send_status(int fd) {
         "\"dets\":%d,\"cpu_pct\":%.0f,\"mem_avail_mb\":%d,\"soc_temp_c\":%.1f,"
         "\"display_w\":%d,\"display_h\":%d,\"model_size\":%d,\"model_w\":%d,\"model_h\":%d,\"source\":\"%s\","
         "\"view\":\"%s\",\"session\":%d,\"session_s\":%.0f,\"objects_total\":%d,"
-        "\"has_tilt\":%s,\"level_set\":%s,\"pitch\":%.1f,\"roll\":%.1f,\"nav_subscriber\":%s}",
+        "\"has_tilt\":%s,\"level_set\":%s,\"cal_set\":%s,\"pitch\":%.1f,\"roll\":%.1f,\"nav_subscriber\":%s}",
         g_status.streaming ? "true" : "false", g_status.viewer_ip, g_status.viewer_id, g_status.viewers_served,
         g_status.frame, g_status.fps, g_status.det_hz, g_status.infer_ms, g_status.jpeg_ms, g_status.read_ms,
         g_status.dets, g_status.cpu_pct, read_mem_available_mb(), read_soc_temp_c(),
         g_status.display_w, g_status.display_h, g_model_w, g_model_w, g_model_h, g_status.source ? g_status.source : "",
         g_view_hud ? "hud" : "plain", g_session.session_id,
         g_status.streaming ? session_elapsed_s() : 0.0, g_session.total,
-        g_status.has_tilt ? "true" : "false", g_level_set ? "true" : "false", g_status.pitch, g_status.roll,
+        g_status.has_tilt ? "true" : "false", g_level_set ? "true" : "false", g_cal_set ? "true" : "false", g_status.pitch, g_status.roll,
         g_nav_fd >= 0 ? "true" : "false");
     http_send_simple(fd, "200 OK", "application/json", body, (size_t)len);
 }
@@ -1863,6 +2020,8 @@ static bool http_handle_connection(int fd, const char* ipstr) {
     }
     if (!strcmp(target, "/api/status")) {
         http_send_status(fd);
+    } else if (!strcmp(target, "/api/accelcal")) {
+        http_send_accelcal(fd, query);
     } else if (!strcmp(target, "/api/level")) {
         /* ?set=1: the unit is standing level now -- store the gravity
          * direction as the reference. ?clear=1: forget it. */
@@ -2518,6 +2677,7 @@ int main(int argc, char** argv) {
     AccelState accel;
     accel_discover(&accel);
     g_accel = &accel;
+    cal_load();     /* 6-position calibration, before the level that was set on top of it */
     level_load();   /* mounting calibration from the web UI's Set level button */
 
     /* env-controlled, not a new CLI arg. Defaults OFF: real, measured

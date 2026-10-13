@@ -5,6 +5,20 @@ Terse, dated, factual record of real changes to this project. For the full narra
 
 ## 2026-10-13
 
+- **6-position accelerometer calibration (web UI: Tilt row -> Calibrate).**
+  - The unit rests on each of its six faces in turn and **Capture** records it. The board picks the
+    face from the dominant axis and its sign. A capture is refused while the unit moves (jitter of
+    the raw readings) or isn't flat on a face (dominant axis under 90% of the total).
+  - **Save** computes per axis: offset = (up + down) / 2, scale = 2 g / (up - down).
+  - Applied to every raw reading before the EMA, so HUD, navigation output and status all get
+    corrected values.
+  - Saved to `/userdata/accel-cal.conf` (tmp + fsync + rename) and loaded at start-up, before the
+    level reference. Saving a new calibration clears the stored level, which was measured with the
+    old one.
+  - `/api/accelcal?capture=1|save=1|reset=1|clear=1`; `cal_set` in `/api/status`.
+  - Tested on the board: status (1.28 g, still), capture (+Z), save refused before six faces,
+    reset. The full six-face run needs someone to turn the unit.
+
 - **Accelerometer "Set level" button (web UI, Tilt row).** The MPU-6050 gives pitch/roll relative to
   gravity, with no drift, but in the sensor's own frame.
   - With the unit standing level, the button stores the gravity direction. Later readings are

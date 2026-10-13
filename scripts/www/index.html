@@ -78,6 +78,14 @@
   #objList .empty { color: var(--dim); border: 0; display: block; padding: 8px 0; }
   .objfoot { display: flex; align-items: center; gap: 6px; margin-top: 8px; font-size: 12px; color: var(--dim); }
   .small-link { margin-left: 0; font-size: 12px; padding: 2px 8px; }
+  dialog#calDlg { background: var(--panel); color: var(--text); border: 1px solid var(--line);
+    border-radius: 10px; max-width: 420px; width: calc(100% - 32px); }
+  dialog#calDlg::backdrop { background: rgba(0,0,0,.55); }
+  .faces { display: grid; grid-template-columns: repeat(6, 1fr); gap: 6px; margin: 12px 0; }
+  .faces span { text-align: center; padding: 6px 0; border: 1px solid var(--line); border-radius: 6px; color: var(--dim); }
+  .faces span.done { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+  .calrow { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  #calMsg { min-height: 1.4em; color: var(--warn); }
 </style>
 </head>
 <body>
@@ -140,7 +148,7 @@
         <dt>CPU</dt><dd id="cpu">–</dd>
         <dt>SoC temp</dt><dd id="temp">–</dd>
         <dt>Mem available</dt><dd id="mem">–</dd>
-        <dt>Tilt</dt><dd><span id="tilt">–</span> <button id="levelBtn" class="small" title="With the unit standing level and still, store this as level (saved on the board)">Set level</button> <button id="levelClear" class="small" hidden>Clear</button></dd>
+        <dt>Tilt</dt><dd><span id="tilt">–</span> <button id="levelBtn" class="small" title="With the unit standing level and still, store this as level (saved on the board)">Set level</button> <button id="levelClear" class="small" hidden>Clear</button> <button id="calOpen" class="small" title="6-position accelerometer calibration">Calibrate</button></dd>
         <dt>WiFi</dt><dd><span id="wifiState">–</span> <button id="wifiBtn" class="small" disabled>…</button></dd>
       </dl>
     </div>
@@ -234,6 +242,33 @@
     const r = await fetch('/api/level?set=1', { cache: 'no-store' }).then((x) => x.json()).catch(() => null);
     if (!r || !r.ok) alert('Not set: ' + (r ? r.msg : 'no answer from the board'));
   });
+  // 6-position calibration: per-axis offset and scale from the unit resting on each face.
+  let calTimer = null;
+  async function cal(query) {
+    const r = await fetch('/api/accelcal' + (query || ''), { cache: 'no-store' }).then((x) => x.json()).catch(() => null);
+    if (!r) { $('calMsg').textContent = 'no answer from the board'; return; }
+    document.querySelectorAll('.faces span').forEach((el) => el.classList.toggle('done', r.faces.includes(el.dataset.f)));
+    $('calG').textContent = r.raw_g.toFixed(2);
+    $('calStill').textContent = r.still ? 'still' : 'moving';
+    $('calState').textContent = r.cal_set ? 'calibrated' : 'not calibrated';
+    $('calSave').disabled = r.faces.length < 6;
+    if (query) $('calMsg').textContent = r.msg;
+  }
+  $('calOpen').addEventListener('click', () => {
+    $('calMsg').textContent = '';
+    $('calDlg').showModal();
+    cal();
+    calTimer = setInterval(() => cal(), 700);
+  });
+  $('calDlg').addEventListener('close', () => { clearInterval(calTimer); calTimer = null; });
+  $('calClose').addEventListener('click', () => $('calDlg').close());
+  $('calCapture').addEventListener('click', () => cal('?capture=1'));
+  $('calSave').addEventListener('click', () => cal('?save=1'));
+  $('calReset').addEventListener('click', () => cal('?reset=1'));
+  $('calClear').addEventListener('click', () => {
+    if (confirm('Remove the saved calibration and level?')) cal('?clear=1');
+  });
+
   $('levelClear').addEventListener('click', async () => {
     if (!confirm('Forget the stored level (back to the sensor\'s own frame)?')) return;
     await fetch('/api/level?clear=1', { cache: 'no-store' }).catch(() => {});
@@ -278,7 +313,7 @@
     $('mem').textContent = fmt(s.mem_avail_mb, 0, ' MB');
     $('tilt').textContent = s.has_tilt
       ? 'P ' + (s.pitch > 0 ? '+' : '') + s.pitch.toFixed(0) + '°  R ' + (s.roll > 0 ? '+' : '') + s.roll.toFixed(0) + '°'
-        + (s.level_set ? '  (levelled)' : '  (sensor frame)')
+        + (s.level_set ? '  (levelled)' : '  (sensor frame)') + (s.cal_set ? ' cal' : '')
       : '–';
     $('levelBtn').disabled = !s.has_tilt;
     $('levelClear').hidden = !s.level_set;
@@ -361,5 +396,21 @@
   setInterval(poll, 1000);
 })();
 </script>
+<dialog id="calDlg">
+  <h2>Accelerometer calibration</h2>
+  <p>Rest the unit flat on each of its <b>six faces</b> in turn &mdash; top, bottom and the four
+    sides &mdash; hold it still, and press <b>Capture</b>. The board works out which face it is on.
+    When all six are ticked, press <b>Save</b>, then stand the unit level and use <b>Set level</b>.</p>
+  <div class="faces"><span data-f="+X">+X</span><span data-f="-X">&minus;X</span><span data-f="+Y">+Y</span><span data-f="-Y">&minus;Y</span><span data-f="+Z">+Z</span><span data-f="-Z">&minus;Z</span></div>
+  <div class="mono">Reading <span id="calG">&ndash;</span> g &middot; <span id="calStill">&ndash;</span> &middot; <span id="calState">&ndash;</span></div>
+  <div id="calMsg"></div>
+  <div class="calrow">
+    <button id="calCapture" class="primary">Capture</button>
+    <button id="calSave" disabled>Save</button>
+    <button id="calReset">Reset</button>
+    <button id="calClear" title="Remove the saved calibration (and level)">Clear calibration</button>
+    <button id="calClose">Close</button>
+  </div>
+</dialog>
 </body>
 </html>
