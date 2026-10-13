@@ -5,7 +5,13 @@ Terse, dated, factual record of real changes to this project. For the full narra
 
 ## 2026-10-13
 
-- **Fix: `/api/wifi` restored** (the web UI's WiFi button). Adding `/api/time` (1d25fe4)
+- **Git history rewritten to remove the owner's name.** All commits now have author and committer
+  `1697-20747 <1697-20747@users.noreply.github.com>`. The name was also replaced in commit
+  messages and in files across every commit: `PROJECT_MEMORY.md`, code comments, the SSH key
+  label, PNG metadata, and same-length path overwrites in the `.blend` files. Every commit ID
+  changed; this file's references are updated. The old history is backed up outside the repo.
+
+- **Fix: `/api/wifi` restored** (the web UI's WiFi button). Adding `/api/time` (71e9ff7)
   replaced the `/api/wifi` route line instead of inserting before it, so `/api/wifi` returned "not
   found" and `/api/time` also ran the WiFi handler after its own reply. Found while checking the
   rewritten README against the code; all 11 endpoints now answer 200.
