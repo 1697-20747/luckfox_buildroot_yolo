@@ -223,6 +223,10 @@
 
   const fmt = (v, digits, unit) => (v == null || v < 0) ? '–' : v.toFixed(digits) + (unit || '');
 
+  // The board has no clock battery: give it this browser's time on load
+  // (it only changes its clock if it is more than 2 s off).
+  fetch('/api/time?epoch_ms=' + Date.now(), { cache: 'no-store' }).catch(() => {});
+
   async function poll() {
     let s;
     try {

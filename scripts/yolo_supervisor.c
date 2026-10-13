@@ -190,12 +190,16 @@ int main(void) {
          t, HEARTBEAT_STALE_S, RESTART_GRACE_S, IO_STALE_S);
 
     time_t hb_missing_since = 0;
+    /* Heartbeat age on the MONOTONIC clock: when the file's mtime last
+     * changed. The wall clock can jump (no RTC; the web UI sets it from the
+     * browser, 2026-10-13): wall - mtime would then look years stale. */
+    struct timespec hb_seen_mtime = { 0, 0 };
+    time_t hb_changed_at = mono_s();
     time_t last_status = 0;
     time_t started = mono_s();
     int counted_healthy = (faults == 0);
     for (;;) {
         time_t now = mono_s();
-        time_t wall = time(NULL);
         const char* fault = NULL;
         char detail[96] = "";
 
@@ -203,7 +207,11 @@ int main(void) {
         long hb_age = -1;
         if (stat(HEARTBEAT_FILE, &st) == 0) {
             hb_missing_since = 0;
-            hb_age = (long)(wall - st.st_mtime);
+            if (st.st_mtim.tv_sec != hb_seen_mtime.tv_sec || st.st_mtim.tv_nsec != hb_seen_mtime.tv_nsec) {
+                hb_seen_mtime = st.st_mtim;
+                hb_changed_at = now;
+            }
+            hb_age = (long)(now - hb_changed_at);
             if (hb_age > HEARTBEAT_STALE_S) { fault = "stream server heartbeat stale"; snprintf(detail, sizeof(detail), "%lds old", hb_age); }
         } else {
             if (!hb_missing_since) hb_missing_since = now;

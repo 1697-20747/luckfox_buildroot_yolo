@@ -8,6 +8,14 @@
 # (no pidof/ps, which read /proc/<pid>/cmdline).
 LOG=/userdata/healthlog.txt
 MAX=524288
+# No RTC: restore the last saved wall-clock time at boot (it starts in 2021
+# otherwise), and save it every 5 min once it is plausible. The web UI sets
+# the real time from the browser (/api/time).
+TIMEFILE=/userdata/.last-time
+if [ -f $TIMEFILE ] && [ "$(date +%s)" -lt "$(cat $TIMEFILE)" ]; then
+	date -s "@$(cat $TIMEFILE)" > /dev/null 2>&1
+fi
+n=0
 echo "=== boot $(cat /proc/sys/kernel/random/boot_id) ===" >> $LOG
 while true; do
 	[ -f $LOG ] && [ $(wc -c < $LOG) -gt $MAX ] && mv -f $LOG $LOG.1
@@ -22,6 +30,10 @@ while true; do
 	hb="none"
 	[ -f /tmp/yolo-heartbeat ] && hb=$(( $(date +%s) - $(cat /tmp/yolo-heartbeat) ))s
 	echo "up=$up load=$l1 avail=${avail}kB udc=$udc usb0[$usb] hb_age=$hb" >> $LOG
+	n=$((n + 1))
+	if [ $((n % 60)) -eq 0 ] && [ "$(date +%s)" -gt 1767225600 ]; then
+		date +%s > $TIMEFILE   # after 2026-01-01 only: never save the 2021 boot clock
+	fi
 	sync
 	sleep 5
 done

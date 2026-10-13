@@ -94,6 +94,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <linux/watchdog.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -1071,6 +1072,12 @@ static void rockit_cam_close(RockitCam* c) {
  * means the NPU hung -- seen 2026-10-11: the worker stuck uninterruptibly in
  * rknpu_submit_ioctl while the main thread kept running, so a main-thread
  * heartbeat alone hid the hang. heartbeat() skips beats while a job is >10s overdue. */
+/* monotonic seconds (the wall clock can jump when the browser sets it) */
+static time_t mono_now_s(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec;
+}
 static volatile time_t g_npu_job_started = 0;
 
 /* --- NPU worker thread (2026-10-11 optimisation) ---
@@ -1085,7 +1092,7 @@ static volatile time_t g_npu_job_started = 0;
  * right after the run, before the next run can overwrite them. */
 typedef struct {
     rknn_context ctx;
-    rknn_tensor_mem* input_mems[2];
+    rknn_tensor_mem* input_mems[3];   /* 0/1: pipelined loop; 0-2: decoupled loop */
     rknn_tensor_attr input_attr;
     std::vector<rknn_tensor_attr>* output_attrs;
     std::vector<rknn_tensor_mem*>* output_mems;
@@ -1093,12 +1100,15 @@ typedef struct {
     pthread_mutex_t lock;
     pthread_cond_t cond;
     int job_idx;       /* -1 = no job queued */
+    int next_idx;      /* staged job the worker starts by itself when job_idx finishes; -1 = none */
     bool job_done;
     bool quit;
+    unsigned done_seq; /* jobs finished so far; last_done = slot of the newest */
+    int last_done;
     /* results, per input slot */
-    std::vector<Detection> dets[2];
-    double npu_ms[2], post_ms[2], copy_ms[2], post_cpu_ms[2];
-    int ret[2];
+    std::vector<Detection> dets[3];
+    double npu_ms[3], post_ms[3], copy_ms[3], post_cpu_ms[3];
+    int ret[3];
 } NpuWorker;
 
 static void* npu_worker_main(void* arg) {
@@ -1108,6 +1118,7 @@ static void* npu_worker_main(void* arg) {
         while (w->job_idx < 0 && !w->quit) pthread_cond_wait(&w->cond, &w->lock);
         if (w->quit) { pthread_mutex_unlock(&w->lock); break; }
         int idx = w->job_idx;
+        g_npu_job_started = mono_now_s();   /* per job, for heartbeat()'s NPU-hang check */
         pthread_mutex_unlock(&w->lock);
 
         struct timespec t0, t1, t2;
@@ -1171,8 +1182,18 @@ static void* npu_worker_main(void* arg) {
         w->post_ms[idx] = (t2.tv_sec - t1.tv_sec) * 1000.0 + (t2.tv_nsec - t1.tv_nsec) / 1e6;
         clock_gettime(CLOCK_THREAD_CPUTIME_ID, &c2);
         w->post_cpu_ms[idx] = (c2.tv_sec - c1.tv_sec) * 1000.0 + (c2.tv_nsec - c1.tv_nsec) / 1e6;
-        w->job_idx = -1;
-        w->job_done = true;
+        w->done_seq++;
+        w->last_done = idx;
+        if (w->next_idx >= 0) {
+            /* a frame is staged: start it now, without waiting for the main
+             * thread to notice (decoupled display) */
+            w->job_idx = w->next_idx;
+            w->next_idx = -1;
+        } else {
+            w->job_idx = -1;
+            w->job_done = true;
+            g_npu_job_started = 0;
+        }
         pthread_cond_broadcast(&w->cond);
         pthread_mutex_unlock(&w->lock);
     }
@@ -1180,12 +1201,37 @@ static void* npu_worker_main(void* arg) {
 }
 
 static void npu_submit(NpuWorker* w, int idx) {
-    g_npu_job_started = time(NULL);
+    g_npu_job_started = mono_now_s();
     pthread_mutex_lock(&w->lock);
     w->job_idx = idx;
     w->job_done = false;
     pthread_cond_broadcast(&w->cond);
     pthread_mutex_unlock(&w->lock);
+}
+
+/* Decoupled loop: run slot idx now if the NPU is idle, else make it the job
+ * the worker starts next (replacing any older staged frame). */
+static void npu_stage(NpuWorker* w, int idx) {
+    pthread_mutex_lock(&w->lock);
+    if (w->job_idx < 0) {
+        w->job_idx = idx;
+        w->job_done = false;
+        g_npu_job_started = mono_now_s();
+        pthread_cond_broadcast(&w->cond);
+    } else {
+        w->next_idx = idx;
+    }
+    pthread_mutex_unlock(&w->lock);
+}
+
+/* Waits until the worker is idle with nothing staged. */
+static void npu_drain(NpuWorker* w) {
+    pthread_mutex_lock(&w->lock);
+    w->next_idx = -1;
+    while (w->job_idx >= 0) pthread_cond_wait(&w->cond, &w->lock);
+    w->job_done = true;
+    pthread_mutex_unlock(&w->lock);
+    g_npu_job_started = 0;
 }
 
 static bool npu_is_done(NpuWorker* w) {
@@ -1429,7 +1475,7 @@ static void heartbeat(void) {
     time_t now = time(NULL);
     if (now == last) return;
     time_t job = g_npu_job_started;
-    if (job && now - job > 10) return;
+    if (job && mono_now_s() - job > 10) return;   /* NPU job stuck: stop kicking */
     if (g_wdt_fd >= 0 && write(g_wdt_fd, "k", 1) < 0) { /* best effort */ }
     last = now;
     int fd = open(HEARTBEAT_FILE, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
@@ -1731,7 +1777,29 @@ static bool http_handle_connection(int fd, const char* ipstr) {
     }
     if (!strcmp(target, "/api/status")) {
         http_send_status(fd);
-    } else if (!strcmp(target, "/api/wifi")) {
+    } else if (!strcmp(target, "/api/time")) {
+        /* The board has no RTC and no network time: the web UI sends the
+         * browser's clock (?epoch_ms=) when it loads, and the board takes it
+         * if its own is more than 2 s off. */
+        const char* q = query ? strstr(query, "epoch_ms=") : NULL;
+        bool set = false;
+        struct timeval now_tv;
+        gettimeofday(&now_tv, NULL);
+        long long board_ms = (long long)now_tv.tv_sec * 1000 + now_tv.tv_usec / 1000;
+        if (q) {
+            long long ms = atoll(q + 9);
+            if (ms > 1700000000000LL && llabs(ms - board_ms) > 2000) {
+                struct timeval tv = { (time_t)(ms / 1000), (suseconds_t)((ms % 1000) * 1000) };
+                set = settimeofday(&tv, NULL) == 0;
+                if (set) {
+                    printf("RESULT: CLOCK_SET from browser (was off by %llds)\n", (ms - board_ms) / 1000);
+                    board_ms = ms;
+                }
+            }
+        }
+        char body[96];
+        snprintf(body, sizeof(body), "{\"set\":%s,\"board_ms\":%lld}", set ? "true" : "false", board_ms);
+        http_send_simple(fd, "200 OK", "application/json", body, strlen(body));
         http_send_wifi(fd, query);
     } else if (!strcmp(target, "/api/objects/reset")) {
         session_reset(); /* clears the object log and per-class counts; track ids restart */
@@ -2289,18 +2357,23 @@ int main(int argc, char** argv) {
         rknn_set_io_mem(ctx, output_mems[i], &output_attrs[i]);
     }
     rknn_tensor_mem* input_mem2 = rknn_create_mem(ctx, input_attr.size_with_stride);
+    rknn_tensor_mem* input_mem3 = rknn_create_mem(ctx, input_attr.size_with_stride);
     NpuWorker npu;
     npu.ctx = ctx;
     npu.input_mems[0] = input_mem;
     npu.input_mems[1] = input_mem2;
+    npu.input_mems[2] = input_mem3;
     npu.input_attr = input_attr;
     npu.output_attrs = &output_attrs;
     npu.output_mems = &output_mems;
     pthread_mutex_init(&npu.lock, NULL);
     pthread_cond_init(&npu.cond, NULL);
     npu.job_idx = -1;
+    npu.next_idx = -1;
     npu.job_done = true;
     npu.quit = false;
+    npu.done_seq = 0;
+    npu.last_done = -1;
     /* The worker must never take a signal: SIGTERM (killall, deploy,
      * reboot) can be delivered to any thread that doesn't block it, and one
      * landing on the worker interrupts its wait inside the NPU driver --
@@ -2506,48 +2579,57 @@ int main(int argc, char** argv) {
         printf("RESULT: DISPLAY_MODE decoupled (video at camera rate, detection at NPU rate)\n");
         std::vector<Detection> shown;
         std::vector<int> shown_ids;
-        /* run_slot: input tensor the NPU is working on; staged: the other
-         * tensor holds the newest frame, ready to go the moment the NPU is free */
-        bool job = false, staged = false, fresh = false;
-        int run_slot = 0, n_frames = 0, n_dets = 0;
+        /* Three NPU input tensors: the worker runs one, may have one staged
+         * (it starts that itself the moment the running job ends), and this
+         * loop writes the newest frame into the third, then stages it. */
+        bool fresh = false;
+        int n_frames = 0, n_dets = 0;
         double quant_ms = 0, npu_ms = 0, post_ms = 0;
         bool run_failed = false;
+        pthread_mutex_lock(&npu.lock);
+        unsigned seen_seq = npu.done_seq;
+        pthread_mutex_unlock(&npu.lock);
         struct timespec t_start, t_now;
         clock_gettime(CLOCK_MONOTONIC, &t_start);
         std::function<void()> collect = [&]() {
-            if (!job || !npu_is_done(&npu)) return;
-            npu_wait(&npu);
-            job = false;
-            if (npu.ret[run_slot] != RKNN_SUCC) { printf("RESULT: RUN_FAIL ret=%d\n", npu.ret[run_slot]); run_failed = true; return; }
-            shown = npu.dets[run_slot];
-            npu_ms = npu.npu_ms[run_slot];
-            post_ms = npu.post_ms[run_slot];
-            fresh = true;
-            n_dets++;
-            if (staged) {
-                run_slot ^= 1;
-                npu_submit(&npu, run_slot);
-                job = true;
-                staged = false;
+            pthread_mutex_lock(&npu.lock);
+            if (npu.done_seq != seen_seq) {
+                n_dets += (int)(npu.done_seq - seen_seq);
+                seen_seq = npu.done_seq;
+                const int d = npu.last_done;
+                if (npu.ret[d] != RKNN_SUCC) {
+                    printf("RESULT: RUN_FAIL ret=%d\n", npu.ret[d]);
+                    run_failed = true;
+                } else {
+                    shown = npu.dets[d];
+                    npu_ms = npu.npu_ms[d];
+                    post_ms = npu.post_ms[d];
+                    fresh = true;
+                }
             }
+            pthread_mutex_unlock(&npu.lock);
         };
         while (client_fd >= 0 && !g_quit) {
             heartbeat();
             collect();
+            if (run_failed) { npu_drain(&npu); return false; }
             struct timespec r0, r1;
             clock_gettime(CLOCK_MONOTONIC, &r0);
             if (!camd_capture_frame_rga(&camd, 0, display_w, display_h, g_model_w, g_model_h, true, &collect)) {
-                if (job) npu_wait(&npu);
+                npu_drain(&npu);
                 return false;
             }
-            if (run_failed) return false;
             clock_gettime(CLOCK_MONOTONIC, &r1);
             double read_ms = (r1.tv_sec - r0.tv_sec) * 1000.0 + (r1.tv_nsec - r0.tv_nsec) / 1e6;
             {
-                /* the newest frame into the tensor the NPU isn't using */
+                /* the newest frame into the tensor that is neither running nor staged */
+                pthread_mutex_lock(&npu.lock);
+                const int busy = npu.job_idx, queued = npu.next_idx;
+                pthread_mutex_unlock(&npu.lock);
+                int slot = 0;
+                while (slot == busy || slot == queued) slot++;
                 struct timespec q0, q1;
                 clock_gettime(CLOCK_MONOTONIC, &q0);
-                const int slot = job ? (run_slot ^ 1) : run_slot;
                 int8_t* in_buf = (int8_t*)npu.input_mems[slot]->virt_addr;
                 const uint8x16_t k80 = vdupq_n_u8(0x80);
                 for (int y = 0; y < g_model_h; y++) {
@@ -2560,12 +2642,7 @@ int main(int argc, char** argv) {
                 }
                 clock_gettime(CLOCK_MONOTONIC, &q1);
                 quant_ms = (q1.tv_sec - q0.tv_sec) * 1000.0 + (q1.tv_nsec - q0.tv_nsec) / 1e6;
-                if (job) {
-                    staged = true;
-                } else {
-                    npu_submit(&npu, run_slot);
-                    job = true;
-                }
+                npu_stage(&npu, slot);
             }
 
             accel_update(&accel);
@@ -2621,7 +2698,7 @@ int main(int argc, char** argv) {
                 fflush(stdout);
             }
         }
-        if (job) npu_wait(&npu);
+        npu_drain(&npu);
         return true;
     };
 #endif
@@ -2887,6 +2964,7 @@ int main(int argc, char** argv) {
     for (uint32_t i = 0; i < io_num.n_output; i++) rknn_destroy_mem(ctx, output_mems[i]);
     rknn_destroy_mem(ctx, input_mem);
     rknn_destroy_mem(ctx, input_mem2);
+    rknn_destroy_mem(ctx, input_mem3);
     rknn_destroy(ctx);
     unlink(HEARTBEAT_FILE); /* clean exit: not a hang */
     watchdog_disarm();      /* last of all: a teardown that hangs still resets the board */

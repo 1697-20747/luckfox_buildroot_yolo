@@ -3,6 +3,21 @@
 Terse, dated, factual record of real changes to this project. For the full narrative/discovery log
 (why, what was tried, what failed), see `PROJECT_MEMORY.md` — this file is the short version.
 
+## 2026-10-13
+
+- **Detection 16.0 Hz while a viewer watches (was 14.9), video still 30 fps.** The NPU worker starts
+  the staged frame itself the moment a job ends, instead of waiting for the main thread to notice.
+  There are three NPU input tensors: one running, one staged, and one the main loop writes the
+  newest frame into. Navigation events arrive at 16.1 Hz.
+- **Board clock set from the browser.** The board has no RTC or network time, so it booted in 2021.
+  The web UI now sends `Date.now()` to `/api/time` on load, and the board sets its clock if it is
+  more than 2 s off. `yolo-healthlog` saves the time to `/userdata/.last-time` every 5 min (only
+  once the clock is plausible) and restores it at boot.
+- **Supervisor heartbeat age is now measured on the monotonic clock** (time since the heartbeat
+  file's mtime last changed). It used to be wall clock minus mtime, so a forward clock jump looked
+  like a years-old heartbeat and triggered a watchdog reset. A manual clock test did exactly that
+  once (self-recovered in about 45 s). The server's NPU-hang timer is monotonic too.
+
 ## 2026-10-12
 
 - **Video at the camera's full 30 fps; detection 14.9 Hz alongside it (17.1 Hz navigation-only).**
