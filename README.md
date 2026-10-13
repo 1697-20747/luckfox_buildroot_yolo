@@ -4,6 +4,11 @@ Real-time YOLOv8n object detection on a **Luckfox Pico Ultra** (Rockchip RV1106G
 a live HUD video stream, navigation output and a web UI, all served from the board over USB. It runs
 on Luckfox's Buildroot image and is built and deployed entirely from a Mac.
 
+The project started on the board's Ubuntu 22.04 image, building on the device and streaming over
+WiFi. It moved to Buildroot on 2026-10-10 because Rockchip's camera tuning (3A auto-exposure),
+hardware JPEG and NPU runtime only work properly as the version-matched set in the vendor's own
+stack.
+
 **Docs:**
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): how it works.
 - [`CHANGELOG.md`](CHANGELOG.md): what changed, dated.
