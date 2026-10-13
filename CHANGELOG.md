@@ -5,6 +5,22 @@ Terse, dated, factual record of real changes to this project. For the full narra
 
 ## 2026-10-13
 
+- **Accelerometer "Set level" button (web UI, Tilt row).** The MPU-6050 gives pitch/roll relative to
+  gravity, with no drift, but in the sensor's own frame.
+  - With the unit standing level, the button stores the gravity direction. Later readings are
+    rotated so that direction is straight down, which stays correct for large mounting angles
+    (unlike subtracting angle offsets).
+  - Saved to `/userdata/accel-level.conf` (tmp + fsync + rename) and loaded at start-up. Never set
+    automatically at boot: a board switched on while tilted would call that tilt level.
+  - `/api/level?set=1` / `?clear=1`; `level_set` in `/api/status`. HUD, navigation output and
+    status all use the corrected values.
+  - Tested set (pitch/roll -> 0.0/0.0) and clear. Left cleared: calibrate once the sensor is fixed
+    in place.
+- **Accelerometer range log (sensor loose):** responds over the full range, but reads about
+  12.5 m/s^2 at rest (about 1.27 g) and up to 1.44 g per axis. This module has offset/scale error,
+  so angles are a few degrees off at large tilts. A 6-position calibration would fix it. Values are
+  in m/s^2 (IIO scale), despite the `smoothed_*` "g" naming.
+
 - **Detection 16.0 Hz while a viewer watches (was 14.9), video still 30 fps.** The NPU worker starts
   the staged frame itself the moment a job ends, instead of waiting for the main thread to notice.
   There are three NPU input tensors: one running, one staged, and one the main loop writes the

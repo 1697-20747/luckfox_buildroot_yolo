@@ -309,6 +309,91 @@ static void accel_update(AccelState* st) {
     }
 }
 
+/* --- mounting calibration: "Set level" (2026-10-13) ---
+ * The MPU-6050 gives tilt relative to gravity, absolute and drift-free, but in
+ * the SENSOR's own frame: mounted at an angle, "level" reads as that angle.
+ * The web UI's Set level button stores the gravity direction measured while
+ * the unit stands level; every later reading is rotated by the rotation that
+ * takes that stored direction onto straight down (+Z here), so pitch/roll are
+ * then the unit's own -- correct even for large mounting angles, unlike
+ * subtracting angle offsets. Saved to /userdata (tmp file + fsync + rename),
+ * loaded at start-up. Deliberately NOT done automatically at boot: a board
+ * switched on while tilted would call that tilt level. */
+#define LEVEL_FILE "/userdata/accel-level.conf"
+static bool g_level_set = false;
+static float g_level_R[3][3] = { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } };
+static AccelState* g_accel = NULL;   /* for the /api/level handler */
+
+static bool level_from_vector(float gx, float gy, float gz) {
+    float n = sqrtf(gx * gx + gy * gy + gz * gz);
+    /* readings are in m/s^2 (IIO scale), despite the smoothed_* "g" naming;
+     * only the direction is used. This module reads ~12.5 m/s^2 at rest (z
+     * offset), so the window is wide: it only rejects a unit being moved. */
+    if (n < 5.0f || n > 15.0f) return false;
+    float v[3] = { gx / n, gy / n, gz / n };
+    /* Rodrigues: rotate v onto t = (0, 0, 1); axis k = v x t */
+    float k[3] = { v[1], -v[0], 0.0f };
+    float sn = sqrtf(k[0] * k[0] + k[1] * k[1]);
+    float c = v[2];
+    float R[3][3] = { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } };
+    if (sn < 1e-6f) {
+        if (c < 0) { R[1][1] = -1; R[2][2] = -1; }   /* upside down: 180 deg about X */
+    } else {
+        float K[3][3] = { { 0, -k[2], k[1] }, { k[2], 0, -k[0] }, { -k[1], k[0], 0 } };
+        float f = (1 - c) / (sn * sn);
+        for (int a = 0; a < 3; a++)
+            for (int b = 0; b < 3; b++) {
+                float kk = 0;
+                for (int m = 0; m < 3; m++) kk += K[a][m] * K[m][b];
+                R[a][b] += K[a][b] + f * kk;
+            }
+    }
+    memcpy(g_level_R, R, sizeof(R));
+    g_level_set = true;
+    return true;
+}
+
+static void level_clear(void) {
+    float I[3][3] = { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } };
+    memcpy(g_level_R, I, sizeof(I));
+    g_level_set = false;
+}
+
+static void level_load(void) {
+    FILE* f = fopen(LEVEL_FILE, "r");
+    if (!f) return;
+    float x, y, z;
+    if (fscanf(f, "%f %f %f", &x, &y, &z) == 3 && level_from_vector(x, y, z))
+        printf("RESULT: LEVEL_LOADED gravity reference (%.3f, %.3f, %.3f) m/s^2\n", x, y, z);
+    fclose(f);
+}
+
+static bool level_save(float x, float y, float z) {
+    const char* tmp = LEVEL_FILE ".tmp";
+    FILE* f = fopen(tmp, "w");
+    if (!f) return false;
+    fprintf(f, "%.5f %.5f %.5f\n", x, y, z);
+    fflush(f);
+    fsync(fileno(f));
+    fclose(f);
+    if (rename(tmp, LEVEL_FILE) != 0) return false;
+    int d = open("/userdata", O_RDONLY | O_CLOEXEC);
+    if (d >= 0) { fsync(d); close(d); }
+    return true;
+}
+
+/* pitch/roll in degrees from the smoothed gravity vector, after the mounting
+ * correction */
+static void accel_tilt(const AccelState* a, int* has_tilt, float* pitch, float* roll) {
+    *has_tilt = a->found && a->ema_initialized;
+    *pitch = *roll = 0;
+    if (!*has_tilt) return;
+    float g[3] = { a->smoothed_x, a->smoothed_y, a->smoothed_z }, r[3];
+    for (int i = 0; i < 3; i++) r[i] = g_level_R[i][0] * g[0] + g_level_R[i][1] * g[1] + g_level_R[i][2] * g[2];
+    *roll = atan2f(r[1], r[2]) * 180.0f / (float)M_PI;
+    *pitch = atan2f(-r[0], sqrtf(r[1] * r[1] + r[2] * r[2])) * 180.0f / (float)M_PI;
+}
+
 /* Real system-wide CPU%, read from /proc/stat -- delta of (total-idle)
  * jiffies between calls, same standard technique `top` itself uses.
  * Returns 0.0 on the first call (no prior sample to delta against). */
@@ -1621,14 +1706,15 @@ static void http_send_status(int fd) {
         "\"dets\":%d,\"cpu_pct\":%.0f,\"mem_avail_mb\":%d,\"soc_temp_c\":%.1f,"
         "\"display_w\":%d,\"display_h\":%d,\"model_size\":%d,\"model_w\":%d,\"model_h\":%d,\"source\":\"%s\","
         "\"view\":\"%s\",\"session\":%d,\"session_s\":%.0f,\"objects_total\":%d,"
-        "\"has_tilt\":%s,\"pitch\":%.1f,\"roll\":%.1f,\"nav_subscriber\":%s}",
+        "\"has_tilt\":%s,\"level_set\":%s,\"pitch\":%.1f,\"roll\":%.1f,\"nav_subscriber\":%s}",
         g_status.streaming ? "true" : "false", g_status.viewer_ip, g_status.viewer_id, g_status.viewers_served,
         g_status.frame, g_status.fps, g_status.det_hz, g_status.infer_ms, g_status.jpeg_ms, g_status.read_ms,
         g_status.dets, g_status.cpu_pct, read_mem_available_mb(), read_soc_temp_c(),
         g_status.display_w, g_status.display_h, g_model_w, g_model_w, g_model_h, g_status.source ? g_status.source : "",
         g_view_hud ? "hud" : "plain", g_session.session_id,
         g_status.streaming ? session_elapsed_s() : 0.0, g_session.total,
-        g_status.has_tilt ? "true" : "false", g_status.pitch, g_status.roll, g_nav_fd >= 0 ? "true" : "false");
+        g_status.has_tilt ? "true" : "false", g_level_set ? "true" : "false", g_status.pitch, g_status.roll,
+        g_nav_fd >= 0 ? "true" : "false");
     http_send_simple(fd, "200 OK", "application/json", body, (size_t)len);
 }
 
@@ -1777,6 +1863,29 @@ static bool http_handle_connection(int fd, const char* ipstr) {
     }
     if (!strcmp(target, "/api/status")) {
         http_send_status(fd);
+    } else if (!strcmp(target, "/api/level")) {
+        /* ?set=1: the unit is standing level now -- store the gravity
+         * direction as the reference. ?clear=1: forget it. */
+        const char* msg = "ok";
+        bool ok = true;
+        if (query && strstr(query, "set=1")) {
+            if (!g_accel || !g_accel->found || !g_accel->ema_initialized) {
+                ok = false; msg = "no accelerometer reading";
+            } else {
+                float x = g_accel->smoothed_x, y = g_accel->smoothed_y, z = g_accel->smoothed_z;
+                if (!level_from_vector(x, y, z)) { ok = false; msg = "reading is not steady gravity -- keep the unit still"; }
+                else if (!level_save(x, y, z)) { msg = "levelled, but could not save to /userdata"; }
+                else printf("RESULT: LEVEL_SET gravity reference (%.3f, %.3f, %.3f) m/s^2\n", x, y, z);
+            }
+        } else if (query && strstr(query, "clear=1")) {
+            level_clear();
+            unlink(LEVEL_FILE);
+            printf("RESULT: LEVEL_CLEARED\n");
+        }
+        char body[160];
+        snprintf(body, sizeof(body), "{\"ok\":%s,\"level_set\":%s,\"msg\":\"%s\"}",
+                 ok ? "true" : "false", g_level_set ? "true" : "false", msg);
+        http_send_simple(fd, "200 OK", "application/json", body, strlen(body));
     } else if (!strcmp(target, "/api/time")) {
         /* The board has no RTC and no network time: the web UI sends the
          * browser's clock (?epoch_ms=) when it loads, and the board takes it
@@ -2408,6 +2517,8 @@ int main(int argc, char** argv) {
 
     AccelState accel;
     accel_discover(&accel);
+    g_accel = &accel;
+    level_load();   /* mounting calibration from the web UI's Set level button */
 
     /* env-controlled, not a new CLI arg. Defaults OFF: real, measured
      * result this session is that RGA-offloaded downscale, even in its
@@ -2646,13 +2757,9 @@ int main(int argc, char** argv) {
             }
 
             accel_update(&accel);
-            int has_tilt = accel.found && accel.ema_initialized;
-            float tilt_pitch = 0, tilt_roll = 0;
-            if (has_tilt) {
-                float ax = accel.smoothed_x, ay = accel.smoothed_y, az = accel.smoothed_z;
-                tilt_roll = atan2f(ay, az) * 180.0f / (float)M_PI;
-                tilt_pitch = atan2f(-ax, sqrtf(ay * ay + az * az)) * 180.0f / (float)M_PI;
-            }
+            int has_tilt;
+            float tilt_pitch, tilt_roll;
+            accel_tilt(&accel, &has_tilt, &tilt_pitch, &tilt_roll);
             if (fresh) {
                 fresh = false;
                 session_update(shown, &shown_ids);
@@ -2869,13 +2976,9 @@ int main(int argc, char** argv) {
             /* tilt from gravity: roll about the sensor X axis, pitch about Y
              * (standard accelerometer-only formulas; valid while the board
              * isn't accelerating hard -- the EMA smoothing helps there) */
-            int has_tilt = accel.found && accel.ema_initialized;
-            float tilt_pitch = 0, tilt_roll = 0;
-            if (has_tilt) {
-                float ax = accel.smoothed_x, ay = accel.smoothed_y, az = accel.smoothed_z;
-                tilt_roll = atan2f(ay, az) * 180.0f / (float)M_PI;
-                tilt_pitch = atan2f(-ax, sqrtf(ay * ay + az * az)) * 180.0f / (float)M_PI;
-            }
+            int has_tilt;
+            float tilt_pitch, tilt_roll;
+            accel_tilt(&accel, &has_tilt, &tilt_pitch, &tilt_roll);
             g_status.has_tilt = has_tilt;
             g_status.pitch = tilt_pitch;
             g_status.roll = tilt_roll;

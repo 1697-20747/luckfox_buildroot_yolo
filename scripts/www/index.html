@@ -140,7 +140,7 @@
         <dt>CPU</dt><dd id="cpu">–</dd>
         <dt>SoC temp</dt><dd id="temp">–</dd>
         <dt>Mem available</dt><dd id="mem">–</dd>
-        <dt>Tilt</dt><dd id="tilt">–</dd>
+        <dt>Tilt</dt><dd><span id="tilt">–</span> <button id="levelBtn" class="small" title="With the unit standing level and still, store this as level (saved on the board)">Set level</button> <button id="levelClear" class="small" hidden>Clear</button></dd>
         <dt>WiFi</dt><dd><span id="wifiState">–</span> <button id="wifiBtn" class="small" disabled>…</button></dd>
       </dl>
     </div>
@@ -227,6 +227,18 @@
   // (it only changes its clock if it is more than 2 s off).
   fetch('/api/time?epoch_ms=' + Date.now(), { cache: 'no-store' }).catch(() => {});
 
+  // Mounting calibration: the MPU-6050 reads tilt in its own frame, so a sensor
+  // mounted at an angle reads that angle when the unit is level.
+  $('levelBtn').addEventListener('click', async () => {
+    if (!confirm('Stand the unit level and keep it still, then press OK to store this as level.')) return;
+    const r = await fetch('/api/level?set=1', { cache: 'no-store' }).then((x) => x.json()).catch(() => null);
+    if (!r || !r.ok) alert('Not set: ' + (r ? r.msg : 'no answer from the board'));
+  });
+  $('levelClear').addEventListener('click', async () => {
+    if (!confirm('Forget the stored level (back to the sensor\'s own frame)?')) return;
+    await fetch('/api/level?clear=1', { cache: 'no-store' }).catch(() => {});
+  });
+
   async function poll() {
     let s;
     try {
@@ -266,7 +278,10 @@
     $('mem').textContent = fmt(s.mem_avail_mb, 0, ' MB');
     $('tilt').textContent = s.has_tilt
       ? 'P ' + (s.pitch > 0 ? '+' : '') + s.pitch.toFixed(0) + '°  R ' + (s.roll > 0 ? '+' : '') + s.roll.toFixed(0) + '°'
+        + (s.level_set ? '  (levelled)' : '  (sensor frame)')
       : '–';
+    $('levelBtn').disabled = !s.has_tilt;
+    $('levelClear').hidden = !s.level_set;
     $('res').textContent = s.display_w + '×' + s.display_h;
     $('model').textContent = (s.model_w || s.model_size) + '×' + (s.model_h || s.model_size);
     $('src').textContent = s.source;
