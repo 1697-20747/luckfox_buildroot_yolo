@@ -3,6 +3,23 @@
 Terse, dated, factual record of real changes to this project. For the full narrative/discovery log
 (why, what was tried, what failed), see `PROJECT_MEMORY.md` — this file is the short version.
 
+## 2026-10-16
+
+- **Enclosure redesign (`drawings/LuckFox BOX/`), checked against Luckfox's official Pico Ultra W
+  STEP model, now in the `.blend` and placed in the base on its corner posts.**
+  - Lid: +X edge widened 0.595 mm, so the lid is 65.00 x 55.00 mm like the base. GPIO slots
+    re-cut over both 2x13 headers with 0.5 mm clearance; old notch/slot filled. Camera ribbon slot
+    moved to the FPC connector's cable side. Plate 1.5 mm thicker (top at 7.0 mm); internal hex
+    pockets rebuilt with 1.5 mm skins and walls. Underside lip runs along the outer wall only; posts
+    have square inner edges, a 0.55 mm outer-corner radius and flat bottoms. 0.5 mm fillets on all
+    top edges; 1.0 mm radius on slot corners.
+  - Base: wall openings re-centred on the Ethernet/USB-A, USB-C and side part; the two button
+    openings are now Ø3.0 mm round holes on the switch actuators. Floor defects around the -X
+    posts repaired (mesh is now watertight).
+  - STLs re-exported. `LuckFox Lid.stl` is in print orientation, flat top on the bed.
+    `RaspiCam Holder A.stl` is unchanged (not in the current assembly).
+  - New exploded-view renders (`Exploded` scene in the `.blend`).
+
 ## 2026-10-13
 
 - **Git history rewritten to remove the owner's name.** All commits now have author and committer
