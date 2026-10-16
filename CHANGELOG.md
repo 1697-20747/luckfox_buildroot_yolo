@@ -16,6 +16,10 @@ Terse, dated, factual record of real changes to this project. For the full narra
   - Base: wall openings re-centred on the Ethernet/USB-A, USB-C and side part; the two button
     openings are now Ø3.0 mm round holes on the switch actuators. Floor defects around the -X
     posts repaired (mesh is now watertight).
+  - Base follow-ups: four domed feet on the bottom (Ø4 x 2.5 mm, 10 mm in from each corner;
+    the box is now 23.5 mm tall). The USB-C slot is re-centred on the port's shell front, 0.5 mm
+    higher than before (0.53 mm side / 0.42 mm top-bottom clearance). The square opening for the
+    light on the -Y wall is now a Ø2 mm hole with a 0.5 mm round-over outside.
   - STLs re-exported. `LuckFox Lid.stl` is in print orientation, flat top on the bed.
     `RaspiCam Holder A.stl` is unchanged (not in the current assembly).
   - New exploded-view renders (`Exploded` scene in the `.blend`).
