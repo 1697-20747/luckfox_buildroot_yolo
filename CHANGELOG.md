@@ -3,6 +3,13 @@
 Terse, dated, factual record of real changes to this project. For the full narrative/discovery log
 (why, what was tried, what failed), see `PROJECT_MEMORY.md` — this file is the short version.
 
+## 2026-10-17
+
+- **Enclosure base floor thickened to 5.5 mm** (same as the lid plate) by extending it 2.5 mm
+  down. The bottom is now at z -2.5 (box 65 x 55 x 23.5 mm); the interior is unchanged. 145
+  internal hex pockets (3.0 mm hexes, 4.5 mm pitch, 1.5 mm skins and walls). Foot pin holes
+  re-cut 3.2 mm deep from the new bottom, all blind now. `LuckFox Box.stl` re-exported.
+
 ## 2026-10-16
 
 - **Enclosure redesign (`drawings/LuckFox BOX/`), checked against Luckfox's official Pico Ultra W
