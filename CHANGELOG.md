@@ -3,6 +3,30 @@
 Terse, dated, factual record of real changes to this project. For the full narrative/discovery log
 (why, what was tried, what failed), see `PROJECT_MEMORY.md` — this file is the short version.
 
+## 2026-10-24
+
+- **Enclosure revision (`drawings/LuckFox BOX/`).**
+  - Base: -X wall grown outward to 7.0 mm (matches the +X wall's -Y end); box now 69.8 x 55 mm,
+    interior unchanged. All four vertical corner chamfers 1.429 mm. Four Ø2.0 x 13.3 mm corner
+    screw holes, each 3.5 mm in from the end face and 4.1 mm from the side face. Floor solid (hex
+    pockets removed). Round feet and their pin holes removed; four moulded L feet instead (6 mm
+    legs, 3 mm thick, 2 mm tall, 3 mm in from the outer faces, 1.8 mm root fillet, 0.5 mm end
+    radius). Recessed side panels made identical (1.0 mm deep, 1.965 mm bevels, 2.0 mm corner
+    chamfers, 2.51 mm setback). New Ø1.5 mm LED window beside the USB-C opening; 0.5 mm outer
+    round-over on all +Y openings, and the -Y hole's round-over restored.
+  - Lid: extended 4.8 mm to match the base, corners and top-edge radius matched to the base.
+    Interior plane flattened and the hex pockets removed (print artifacts on the inside face).
+    Lip cut back to the post edge where it hit the Ethernet/USB-A ports. Four Ø2.0 mm screw holes
+    over the base's corner holes (0.5 mm top round-over); two Ø3 mm locating pins (3 mm long) into
+    the end walls, Ø3.3 x 3.3 mm holes in the base.
+  - New parts: `LuckFox Box tripod.stl`, a base variant with a Ø24 mm boss (2 mm root fillet),
+    1/4"-20 UNC thread (Ø5.35 core, Ø6.55 major, 6.2 mm full thread, blind) and feet 0.5 mm below
+    the boss face. `LuckFox Lid GPIO plug (print 2).stl` covers an unused GPIO slot (0.1 mm per side
+    clearance, 1 mm lip, 0.5 mm top round-over).
+  - `LuckFox Box feet (print 4).stl` removed. `LuckFox Box.stl` and `LuckFox Lid.stl` re-exported;
+    holder STLs unchanged. New assembled renders for both bases (`Assembled` and
+    `Assembled Tripod` scenes in the `.blend`); the exploded view is not re-rendered.
+
 ## 2026-10-17
 
 - **Enclosure base floor thickened to 5.5 mm** (same as the lid plate) by extending it 2.5 mm
