@@ -26,6 +26,12 @@ Terse, dated, factual record of real changes to this project. For the full narra
   - `LuckFox Box feet (print 4).stl` removed. `LuckFox Box.stl` and `LuckFox Lid.stl` re-exported;
     holder STLs unchanged. New assembled renders for both bases (`Assembled` and
     `Assembled Tripod` scenes in the `.blend`); the exploded view is not re-rendered.
+- **All STLs now in print orientation**, centred on the origin with the bed face at z 0 (the
+  `.blend` parts keep their assembly positions). Bases and lid unchanged in rotation: bases
+  upright (only the hidden floor underside needs support, 2 mm / 6.5 mm from the bed; rim-down
+  would leave the inside floor as a ~63 x 48 mm roof), lid top-down, GPIO plugs cap-down. Holder B
+  post, B pan arm and C flipped 180° (post now stands on its shaft end instead of the round
+  knuckle); D unchanged; obsolete A laid on its side. Exploded view re-rendered.
 
 ## 2026-10-17
 
