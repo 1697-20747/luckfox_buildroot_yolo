@@ -15,6 +15,10 @@ Terse, dated, factual record of real changes to this project. For the full narra
   under the camera PCB, ≥4 mm under its rear connector. Watertight, prints top-down with no
   supports (ElegooSlicer, Centauri Carbon 0.4 mm: 24 min, 13.1 g). Dimensions from the
   Raspberry Pi product brief (±0.2 mm); LuckFox support for the 15-pin FPC / IMX708 not checked.
+- **Part sources added (`drawings/LuckFox BOX/src/`)**: the manifold3d CSG scripts for all lids
+  and bases, their inputs, and `to_stl.py` for print-oriented STLs. A fresh build matches the
+  committed STLs' volumes exactly (they differ only by Blender's sliver clean-up). `*.blend1`
+  backups are no longer tracked.
 
 ## 2026-10-27
 
