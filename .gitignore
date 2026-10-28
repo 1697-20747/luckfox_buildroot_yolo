@@ -11,3 +11,4 @@ build/
 local/
 docs-site/
 drawings/_superseded/
+*.blend1
