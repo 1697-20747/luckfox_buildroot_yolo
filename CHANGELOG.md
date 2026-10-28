@@ -19,6 +19,11 @@ Terse, dated, factual record of real changes to this project. For the full narra
   and bases, their inputs, and `to_stl.py` for print-oriented STLs. A fresh build matches the
   committed STLs' volumes exactly (they differ only by Blender's sliver clean-up). `*.blend1`
   backups are no longer tracked.
+- **`.blend` cleaned up**: 76 hidden `_pre…` backups and superseded holder/cutter objects deleted
+  (still in git history), `RaspiCam_Holder_A_prejoin` renamed `RaspiCam_Holder_A`, `Scene` sorted
+  into collections (bases, lids, plugs, board, camera holder, SC3336, hardware, CM3 Wide
+  reference); 32.0 -> 15.9 MB. Every lid and base mesh checked identical to its STL.
+  `LuckFox Box exploded options.png` re-rendered with the Camera Module 3 Wide lid and camera.
 
 ## 2026-10-27
 
