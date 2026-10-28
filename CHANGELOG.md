@@ -3,6 +3,19 @@
 Terse, dated, factual record of real changes to this project. For the full narrative/discovery log
 (why, what was tried, what failed), see `PROJECT_MEMORY.md` — this file is the short version.
 
+## 2026-10-28
+
+- **New lid `LuckFox Lid_cm3_wide.stl` for a Raspberry Pi Camera Module 3 Wide**
+  (`drawings/LuckFox BOX/`). The plain lid with every slot removed (corner holes, pins, posts
+  and lips kept), plus inner mounts: four Ø4.4 x 3.4 mm standoffs on the module's 21 x 12.5 mm
+  pattern with Ø1.8 mm blind pilot holes (M2 x 6 self-tappers, 0.3 mm lead-in), a 12 x 12 x
+  1.7 mm housing recess and a Ø8 mm lens hole (0.5 mm top round-over); lens front 0.6 mm below
+  the top face. Lens centred in X, 5.2 mm towards +Y; FPC edge faces +Y. Fit checked in the
+  `Assembled` scene against a simple camera model (`CM3W_*` objects): ≥5.4 mm to the board
+  under the camera PCB, ≥4 mm under its rear connector. Watertight, prints top-down with no
+  supports (ElegooSlicer, Centauri Carbon 0.4 mm: 24 min, 13.1 g). Dimensions from the
+  Raspberry Pi product brief (±0.2 mm); LuckFox support for the 15-pin FPC / IMX708 not checked.
+
 ## 2026-10-27
 
 - **Enclosure lids and bases rebuilt as clean solids (`drawings/LuckFox BOX/`).** Both lids and
