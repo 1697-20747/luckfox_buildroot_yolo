@@ -146,6 +146,11 @@ def build(tripod, antenna_poly):
     for f in ('-X','+X','-Y','+Y'): s=s-recess(f)
     s=s-box(-94.76,-44.154,-40.803,9.803,3.0,22+DZ)
     s=s-box(-44.154,-38.957,-38.938,-20.756,5.0,22+DZ)
+    # GPIO connector pockets: 0.5 deep into the -X/+X inner walls beside the two 2x13 headers (y -28.81..3.81),
+    # 1 mm past each header end, from 0.5 below the header plastic top (z 6.6) up through the rim.
+    GY0,GY1,GZ=-28.81-1.0,3.81+1.0,6.6-0.5
+    s=s-box(-94.76-0.5,-94.76+0.1,GY0,GY1,GZ,22+DZ)
+    s=s-box(-44.154-0.1,-44.154+0.5,GY0,GY1,GZ,22+DZ)
     # -Y USB opening: one straight-sided cut (no step) with the 0.5 round-over on the outer face (y -43; outside
     # the recess). Open through the rim when DZ==0; closed over at the old rim height (a window) when DZ>0.
     zu=ZT if DZ>0 else ZT+3.0
