@@ -7,7 +7,7 @@ lid/base frames of the `Scene` scene in `../LuckFox Lid.blend`.
 |---|---|---|
 | `build_lid.py` | `lid_std_csg.json`, `lid_plain_csg.json` | lid with camera-holder holes; plain lid |
 | `build_lid_cm3.py` | `lid_cm3w_csg.json` | slotless lid with Camera Module 3 Wide mounts |
-| `build_base.py` | `base_std_csg.json`, `base_tripod_csg.json` | standard and tripod bases |
+| `build_base.py` | `base_std_csg.json`, `base_tripod_csg.json`, `base_tall_csg.json` | standard, tripod and tall (+8 mm, `DZ`) bases |
 
 `plan.json` and `wall_sections.json` are inputs (lid outline, base wall and antenna-opening
 sections). `to_stl.py [outdir]` turns the JSON meshes into print-oriented STLs.

@@ -38,13 +38,14 @@ def xform(m,cols,origin=(0,0,0)):
 # ---------------- dimensions (Scene world frame of the base objects) ----------------
 X0,X1,Y0,Y1=-101.76,-31.957,-43.0,12.0; CH=1.429
 ZB,ZT=-2.5,21.0; BCH_IN,BCH_TOP=0.7867,0.786
+DZ=0.0   # extra wall height (tall variant); everything tied to the lid rim moves up by DZ
 def octagon(x0,x1,y0,y1,c):
     return [(x0+c,y0),(x1-c,y0),(x1,y0+c),(x1,y1-c),(x1-c,y1),(x0+c,y1),(x0,y1-c),(x0,y0+c)]
 def shell():
     P=ccw(octagon(X0,X1,Y0,Y1,CH))
-    prism=loft([(ZB,P),(ZT,P)])
+    prism=loft([(ZB,P),(ZT+DZ,P)])
     R=[(X0,Y0),(X1,Y0),(X1,Y1),(X0,Y1)]; Ri=[(X0+BCH_IN,Y0+BCH_IN),(X1-BCH_IN,Y0+BCH_IN),(X1-BCH_IN,Y1-BCH_IN),(X0+BCH_IN,Y1-BCH_IN)]
-    fr=loft([(ZB,Ri),(BCH_TOP,R),(ZT+1,R)])
+    fr=loft([(ZB,Ri),(BCH_TOP,R),(ZT+DZ+1,R)])
     return prism^fr
 
 def recess(face):
@@ -52,7 +53,7 @@ def recess(face):
     if face in ('-X','+X'): u0,u1=-40.49,9.49
     elif face=='+Y': u0,u1=-99.25,-34.467
     else: u0,u1=-62.44,-34.467
-    v0,v1=2.02,19.98; W=1.965; C=2.0
+    v0,v1=2.02,19.98+DZ; W=1.965; C=2.0
     rim=ccw(octagon(u0,u1,v0,v1,C)); flo=ccw(octagon(u0+W,u1-W,v0+W,v1-W,C))
     m=loft([(-1.0,rim),(0.0,rim),(1.0,flo)])
     if face=='-X': return xform(m,[(0,1,0),(0,0,1),(1,0,0)],(X0,0,0))
@@ -143,22 +144,32 @@ def build(tripod, antenna_poly):
     CX,CY=-66.8585,-15.5
     if tripod: s=s+boss(CX,CY)
     for f in ('-X','+X','-Y','+Y'): s=s-recess(f)
-    s=s-box(-94.76,-44.154,-40.803,9.803,3.0,22)
-    s=s-box(-44.154,-38.957,-38.938,-20.756,5.0,22)
-    s=s-box(-88.747,-63.743,-44,-40.5,5.0,22)
-    s=s-box(-88.96,-63.743,-44,-41.998,5.0,22)
+    s=s-box(-94.76,-44.154,-40.803,9.803,3.0,22+DZ)
+    s=s-box(-44.154,-38.957,-38.938,-20.756,5.0,22+DZ)
+    # -Y USB opening: one straight-sided cut (no step) with the 0.5 round-over on the outer face (y -43; outside
+    # the recess). Open through the rim when DZ==0; closed over at the old rim height (a window) when DZ>0.
+    zu=ZT if DZ>0 else ZT+3.0
+    U=[(-88.747,5.0),(-63.743,5.0),(-63.743,zu),(-88.747,zu)]
+    s=s-wall_hole(lambda d: offset_rounded(U,d),'-Y',40.0,43.0,44.6)
     for (cx,cy),(bx0,bx1,by0,by1) in (((-91.957,7.0),(-95.26,-89.957,5.0,10.303)),((-46.957,7.0),(-48.957,-43.654,5.0,10.303)),
                                        ((-91.957,-38.0),(-95.26,-89.957,-41.303,-36.0)),((-46.957,-38.0),(-48.957,-43.654,-41.303,-36.0))):
         s=s+(cyl(cx,cy,2.5,2.5,5.0)+box(bx0,bx1,by0,by1,2.5,5.0))
     for cx,cy in ((-91.957,7.0),(-46.957,7.0),(-91.957,-38.0),(-46.957,-38.0)): s=s-cyl(cx,cy,1.0,1.0,5.5)
-    for cx,cy in ((-35.457,7.9),(-35.457,-38.9),(-98.26,7.9),(-98.26,-38.9)): s=s-cyl(cx,cy,1.0,7.73,22,48)
+    for cx,cy in ((-35.457,7.9),(-35.457,-38.9),(-98.26,7.9),(-98.26,-38.9)): s=s-cyl(cx,cy,1.0,7.73,22+DZ,48)
     for cx,cy in ((-97.76,-15.5),(-38.05,-15.5)):
-        s=s-cyl(cx,cy,1.65,17.7,22,48)
-        s=s-loft([(20.7,circle(cx,cy,1.65,48)),(21.0,circle(cx,cy,1.95,48)),(21.5,circle(cx,cy,2.45,48))])
+        s=s-cyl(cx,cy,1.65,17.7+DZ,22+DZ,48)
+        s=s-loft([(20.7+DZ,circle(cx,cy,1.65,48)),(21.0+DZ,circle(cx,cy,1.95,48)),(21.5+DZ,circle(cx,cy,2.45,48))])
     # +Y wall openings (cavity y 9.803 -> recess floor y 11.0)
     s=s-wall_hole(stadium(-69.467,8.27,10.004,4.006),'+Y',9.0,11.0,12.6)
     for cx,cz,r in ((-51.752,8.25,1.5),(-57.563,8.25,1.5),(-62.0,7.5,0.75)):
         s=s-wall_hole(lambda d,cx=cx,cz=cz,r=r: circle(cx,cz,r+d,64),'+Y',9.0,11.0,12.6)
+    # +Y vent slots: a row of vertical stadium slots across the top of the recess floor, over the cavity span
+    # (x -94.76..-44.154), same 0.5 round-over as the other +Y holes. Tops sit 1.5 below the recess floor edge.
+    VN,VW,VH,VP=14,1.5,5.0,3.5; vx0=-69.457-(VN-1)*VP/2; vtop=19.98+DZ-1.965-1.5
+    for i in range(VN):
+        cx=vx0+i*VP
+        # stadium() lies along its first axis, so build it in (z,x) and swap to (x,z) for a vertical slot
+        s=s-wall_hole(lambda d,cx=cx: [(x,z) for z,x in stadium(vtop-VH/2,cx,VH,VW)(d)],'+Y',9.0,11.0,12.6)
     # -Y light hole (cavity y -40.803 -> recess floor y -42.0); w=-y
     s=s-wall_hole(lambda d: circle(-53.632,7.225,1.0+d,64),'-Y',40.0,42.0,43.6)
     # +X antenna opening: traced profile (y,z), prism along x
@@ -170,8 +181,8 @@ def build(tripod, antenna_poly):
 if __name__=='__main__':
     d=json.load(open('wall_sections.json'))
     ant=sorted(d['+X'],key=lambda P: abs(sum(P[i][0]*P[(i+1)%len(P)][1]-P[(i+1)%len(P)][0]*P[i][1] for i in range(len(P)))))[0]
-    for name,tri in (('base_std',False),('base_tripod',True)):
-        m=build(tri,ant); mesh=m.to_mesh()
+    for name,tri,dz in (('base_std',False,0.0),('base_tripod',True,0.0),('base_tall',False,8.0)):
+        DZ=dz; m=build(tri,ant); mesh=m.to_mesh()
         V=np.array(mesh.vert_properties)[:,:3].astype(float); T=np.array(mesh.tri_verts)
         print(name,'status',m.status().name,'genus',m.genus(),'verts',len(V),'tris',len(T),'volume',round(m.volume(),3))
         json.dump({'v':V.tolist(),'f':T.tolist()},open(name+'_csg.json','w'))

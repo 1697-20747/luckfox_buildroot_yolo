@@ -8,6 +8,7 @@ PARTS = {  # csg json -> (STL name, flip)
     'lid_cm3w_csg.json':   ('LuckFox Lid_cm3_wide.stl', True),
     'base_std_csg.json':   ('LuckFox Box.stl', False),
     'base_tripod_csg.json':('LuckFox Box tripod.stl', False),
+    'base_tall_csg.json':  ('LuckFox Box tall.stl', False),
 }
 
 def write(src, dst, flip):
