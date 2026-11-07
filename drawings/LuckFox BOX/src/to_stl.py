@@ -6,6 +6,7 @@ PARTS = {  # csg json -> (STL name, flip)
     'lid_std_csg.json':    ('LuckFox Lid.stl', True),
     'lid_plain_csg.json':  ('LuckFox Lid_plain.stl', True),
     'lid_cm3w_csg.json':   ('LuckFox Lid_cm3_wide.stl', True),
+    'lid_cm3w_tcs_csg.json':('LuckFox Lid_cm3_wide_tcs34725.stl', True),
     'base_std_csg.json':   ('LuckFox Box.stl', False),
     'base_tripod_csg.json':('LuckFox Box tripod.stl', False),
     'base_tall_csg.json':  ('LuckFox Box tall.stl', False),

@@ -150,6 +150,7 @@
         <dt>Mem available</dt><dd id="mem">–</dd>
         <dt>Tilt</dt><dd><span id="tilt">–</span> <button id="levelBtn" class="small" title="With the unit standing level and still, store this as level (saved on the board)">Set level</button> <button id="levelClear" class="small" hidden>Clear</button> <button id="calOpen" class="small" title="6-position accelerometer calibration">Calibrate</button></dd>
         <dt>WiFi</dt><dd><span id="wifiState">–</span> <button id="wifiBtn" class="small" disabled>…</button></dd>
+        <dt>Light</dt><dd><span id="lightState">–</span> <button id="ledBtn" class="small" title="Colour sensor LED: off = passive (ambient light through the filter), on = active (reflected LED light)" hidden>…</button></dd>
       </dl>
     </div>
     <div class="card">
@@ -390,6 +391,26 @@
   };
   wifi();
   setInterval(wifi, 5000);
+
+  // TCS34725 colour sensor in the lid: LED off = passive (ambient), on = active (reflected)
+  let ledOn = false;
+  async function light(query) {
+    try {
+      const l = await fetch('/api/light' + (query || ''), { cache: 'no-store' }).then((r) => r.json());
+      if (!l.present) { $('lightState').textContent = 'no sensor'; $('ledBtn').hidden = true; return; }
+      ledOn = l.led;
+      const mode = l.led ? 'LED on (active)' : 'passive';
+      $('lightState').textContent = !l.valid ? mode + ', reading…'
+        : (l.saturated ? 'saturated' : Math.round(l.lux) + ' lux, ' + Math.round(l.cct) + ' K')
+          + '  RGB ' + l.r + '/' + l.g + '/' + l.b + '  ' + mode;
+      $('ledBtn').textContent = l.led ? 'LED off' : 'LED on';
+      $('ledBtn').hidden = false;
+      $('ledBtn').disabled = false;
+    } catch (e) {}
+  }
+  $('ledBtn').onclick = () => { $('ledBtn').disabled = true; light(ledOn ? '?led=0' : '?led=1'); };
+  light();
+  setInterval(light, 1000);
 
   play();
   poll();

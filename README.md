@@ -39,6 +39,7 @@ The web UI offers:
 - HUD or plain view, and one viewer at a time (a second viewer takes over);
 - a per-session object list (latest 20, a full-list page, CSV export, reset);
 - board stats, and WiFi on/off (off by default);
+- colour sensor readings (lux, colour temperature, RGB) and the sensor LED on/off, when a TCS34725 is fitted;
 - accelerometer tilt with **Set level** and **6-position calibration**;
 - the on-board docs site at `/docs/`.
 
@@ -53,6 +54,7 @@ The board takes its clock from the browser on page load.
 | `/api/detections`, `/api/detections/stream` | navigation output (JSON / SSE): class, score, box, centre, bearing, pitch/roll |
 | `/api/objects?limit=N`, `/api/objects/reset` | session object log |
 | `/api/view?mode=hud\|plain`, `/api/wifi`, `/api/time`, `/api/level`, `/api/accelcal` | controls |
+| `/api/light[?led=0\|1]` | TCS34725 colour sensor: clear/R/G/B, lux, colour temperature; LED off (passive) or on (active) |
 
 ## What runs on the board
 

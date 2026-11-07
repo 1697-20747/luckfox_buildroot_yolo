@@ -3,6 +3,29 @@
 Terse, dated, factual record of real changes to this project. For the full narrative/discovery log
 (why, what was tried, what failed), see `PROJECT_MEMORY.md` — this file is the short version.
 
+## 2026-11-07
+
+- **Tall base `LuckFox Box tall.stl`** (+8 mm, 33.5 mm overall) so GPIO connectors fit inside; the
+  -Y USB opening becomes a closed window. `build_base.py` gains a `DZ` height parameter.
+- **All bases**: the USB cut-out is one straight-sided cut with the 0.5 mm outer round-over (the two
+  overlapping boxes left a 0.21 mm step); a row of 14 vertical 1.5 x 5 mm vent slots across the top
+  of the +Y face; 0.5 mm GPIO connector pockets in the -X/+X inner walls beside the headers
+  (1 mm past each end, from 0.5 mm below the header plastic top up through the rim).
+- **New lid `LuckFox Lid_cm3_wide_tcs34725.stl`**: the Camera Module 3 Wide lid plus a TCS34725
+  colour sensor (Adafruit 1334 layout, DollaTek clone) between the camera and the -Y wall. The board
+  sits flush in a pocket in the lid underside (M2 x 5 self-tappers into 3.3 mm pilots), with
+  separate windows over the sensor (dia 2.4) and the LED (dia 1.8), a baffle between them down onto
+  the PCB, component and pin-tip relief, and a channel along the underside for a right-angle
+  header and connector running -X. Needs the tall base. Layout from Adafruit's fab print; not yet
+  test-fitted.
+- **Colour sensor support in the stream server** (`/api/light`, web UI **Light** row): TCS34725
+  over userspace I2C on `/dev/i2c-2` (shared with the MPU-6050; override `LUCKFOX_TCS_BUS`), 50 ms
+  integration, gain x4, read up to 10 times a second from the frame loop. The LED is switched in
+  software with no extra GPIO: wire the breakout's LED pin to its INT pin; the chip's ambient-light
+  interrupt then holds the LED off (passive, the default) or releases it (active). The choice is
+  saved in `/userdata/tcs-led.conf`. Lux and colour temperature use Adafruit's formulas. Builds
+  for all three server variants; not yet run on the board.
+
 ## 2026-10-28
 
 - **New lid `LuckFox Lid_cm3_wide.stl` for a Raspberry Pi Camera Module 3 Wide**

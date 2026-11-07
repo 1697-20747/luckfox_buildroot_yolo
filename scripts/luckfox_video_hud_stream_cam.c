@@ -96,6 +96,8 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <linux/watchdog.h>
+#include <linux/i2c-dev.h>
+#include <stdint.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -1855,6 +1857,180 @@ static void http_send_accelcal(int fd, const char* query) {
     http_send_simple(fd, "200 OK", "application/json", body, (size_t)len);
 }
 
+/* --- TCS34725 RGB colour sensor over userspace I2C (2026-11-07) ---
+ * Adafruit 1334-style breakout (DollaTek clone) on the same I2C2 bus as the
+ * MPU-6050 (0x29 vs 0x68; the kernel owns only 0x68, /dev/i2c-2 reaches the
+ * rest). Passive by default: the chip reads ambient light through its own
+ * IR-blocking filter. The board's white LED is switched in software with no
+ * spare GPIO: wire the breakout's LED pin to its INT pin. INT is open-drain,
+ * active low; with the ambient-light interrupt enabled and thresholds that
+ * every reading crosses (low 0xFFFF, high 0, persistence every cycle), INT
+ * stays asserted and holds LED low = off. Disabling the interrupt and clearing
+ * it releases INT, and the breakout's pull-up turns the LED on. The web UI's
+ * LED button drives /api/light?led=0|1; the choice is saved to /userdata.
+ * Bus override: LUCKFOX_TCS_BUS=/dev/i2c-N. Lux and colour temperature use the
+ * same simple formulas as Adafruit's library (calculateLux, McCamy CCT); with
+ * the LED on, readings are of reflected LED light, not ambient. */
+#define TCS_ADDR        0x29
+#define TCS_CMD         0x80
+#define TCS_AUTOINC     0x20
+#define TCS_ENABLE      0x00
+#define TCS_ATIME       0x01
+#define TCS_AILTL       0x04
+#define TCS_PERS        0x0C
+#define TCS_CONTROL     0x0F
+#define TCS_ID          0x12
+#define TCS_STATUS      0x13
+#define TCS_CDATAL      0x14
+#define TCS_EN_PON      0x01
+#define TCS_EN_AEN      0x02
+#define TCS_EN_AIEN     0x10
+#define TCS_CLEAR_INT   0xE6   /* special-function command: clear the clear-channel interrupt */
+#define TCS_LED_FILE    "/userdata/tcs-led.conf"
+
+typedef struct {
+    int fd;
+    bool found;
+    bool led_on;
+    bool valid;            /* a reading has been taken since start / the last LED switch */
+    int skip;              /* integration cycles to discard after an LED switch */
+    unsigned id;
+    unsigned c, r, g, b;
+    float lux, cct;
+    double next_poll;      /* monotonic seconds */
+    char bus[32];
+} TcsState;
+static TcsState g_tcs = { -1, false, false, false, 0, 0, 0, 0, 0, 0, 0.0f, 0.0f, 0.0, "" };
+
+static double tcs_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+static bool tcs_write8(int fd, uint8_t reg, uint8_t val) {
+    uint8_t b[2] = { (uint8_t)(TCS_CMD | reg), val };
+    return write(fd, b, 2) == 2;
+}
+
+static bool tcs_read(int fd, uint8_t reg, uint8_t* buf, int n) {
+    uint8_t cmd = (uint8_t)(TCS_CMD | (n > 1 ? TCS_AUTOINC : 0) | reg);
+    if (write(fd, &cmd, 1) != 1) return false;
+    return read(fd, buf, n) == n;
+}
+
+/* Called from the HTTP handler and at start-up: one or two short I2C writes. */
+static bool tcs_set_led(TcsState* t, bool on) {
+    if (!t->found) return false;
+    bool ok = tcs_write8(t->fd, TCS_ENABLE, TCS_EN_PON | TCS_EN_AEN | (on ? 0 : TCS_EN_AIEN));
+    if (ok && on) {
+        uint8_t c = TCS_CLEAR_INT;   /* release INT now, not at the next cycle */
+        ok = write(t->fd, &c, 1) == 1;
+    }
+    if (!ok) return false;
+    t->led_on = on;
+    t->valid = false;
+    t->skip = 2;   /* the cycle in progress mixes both states */
+    return true;
+}
+
+static bool tcs_led_saved(void) {
+    FILE* f = fopen(TCS_LED_FILE, "r");
+    int v = 0;
+    if (f) { if (fscanf(f, "%d", &v) != 1) v = 0; fclose(f); }
+    return v == 1;
+}
+
+static void tcs_led_save(bool on) {
+    const char* tmp = TCS_LED_FILE ".tmp";
+    FILE* f = fopen(tmp, "w");
+    if (!f) return;
+    fprintf(f, "%d\n", on ? 1 : 0);
+    fflush(f);
+    fsync(fileno(f));
+    fclose(f);
+    rename(tmp, TCS_LED_FILE);
+}
+
+static void tcs_init(TcsState* t) {
+    const char* bus = getenv("LUCKFOX_TCS_BUS");
+    snprintf(t->bus, sizeof(t->bus), "%s", bus && *bus ? bus : "/dev/i2c-2");
+    t->fd = open(t->bus, O_RDWR | O_CLOEXEC);
+    if (t->fd < 0 || ioctl(t->fd, I2C_SLAVE, TCS_ADDR) < 0) {
+        printf("RESULT: TCS_NOT_FOUND (%s: %s)\n", t->bus, strerror(errno));
+        if (t->fd >= 0) { close(t->fd); t->fd = -1; }
+        return;
+    }
+    uint8_t id = 0;
+    if (!tcs_read(t->fd, TCS_ID, &id, 1) || (id != 0x44 && id != 0x4D && id != 0x10)) {
+        printf("RESULT: TCS_NOT_FOUND (no TCS3472x at 0x29 on %s, id=0x%02x)\n", t->bus, id);
+        close(t->fd); t->fd = -1;
+        return;
+    }
+    t->id = id;
+    /* 50 ms integration (ATIME 0xEB = 21 cycles x 2.4 ms), gain x4, interrupt every cycle,
+     * thresholds every reading crosses (see above), powered and integrating */
+    uint8_t thr[5] = { (uint8_t)(TCS_CMD | TCS_AUTOINC | TCS_AILTL), 0xFF, 0xFF, 0x00, 0x00 };
+    bool ok = tcs_write8(t->fd, TCS_ATIME, 0xEB) && tcs_write8(t->fd, TCS_CONTROL, 0x01) &&
+              tcs_write8(t->fd, TCS_PERS, 0x00) && write(t->fd, thr, 5) == 5 &&
+              tcs_write8(t->fd, TCS_ENABLE, TCS_EN_PON);
+    if (!ok) {
+        printf("RESULT: TCS_INIT_FAILED (%s)\n", strerror(errno));
+        close(t->fd); t->fd = -1;
+        return;
+    }
+    usleep(3000);   /* >2.4 ms power-on before AEN */
+    t->found = true;
+    tcs_set_led(t, tcs_led_saved());
+    t->next_poll = tcs_now() + 0.06;
+    printf("RESULT: TCS_FOUND %s id=0x%02x led=%s\n", t->bus, id, t->led_on ? "on" : "off");
+}
+
+/* Frame loop: at most ~10 reads a second, each one 1-byte status + 8-byte data. */
+static void tcs_update(TcsState* t) {
+    if (!t->found) return;
+    double now = tcs_now();
+    if (now < t->next_poll) return;
+    t->next_poll = now + 0.1;
+    uint8_t st = 0, d[8];
+    if (!tcs_read(t->fd, TCS_STATUS, &st, 1) || !(st & 0x01)) return;   /* AVALID */
+    if (!tcs_read(t->fd, TCS_CDATAL, d, 8)) return;
+    if (t->skip > 0) { t->skip--; return; }
+    t->c = d[0] | d[1] << 8; t->r = d[2] | d[3] << 8;
+    t->g = d[4] | d[5] << 8; t->b = d[6] | d[7] << 8;
+    t->lux = std::max(0.0f, -0.32466f * t->r + 1.57837f * t->g - 0.73191f * t->b);
+    float X = -0.14282f * t->r + 1.54924f * t->g - 0.95641f * t->b;
+    float Y = -0.32466f * t->r + 1.57837f * t->g - 0.73191f * t->b;
+    float Z = -0.68202f * t->r + 0.77073f * t->g + 0.56332f * t->b;
+    float sum = X + Y + Z;
+    t->cct = 0.0f;
+    if (sum > 0.0f) {
+        float xc = X / sum, yc = Y / sum, n = (xc - 0.3320f) / (0.1858f - yc);
+        t->cct = 449.0f * n * n * n + 3525.0f * n * n + 6823.3f * n + 5520.33f;
+    }
+    t->valid = true;
+}
+
+/* /api/light[?led=0|1] */
+static void http_send_light(int fd, const char* query) {
+    TcsState* t = &g_tcs;
+    bool ok = true;
+    if (query && (strstr(query, "led=1") || strstr(query, "led=0"))) {
+        bool on = strstr(query, "led=1") != NULL;
+        ok = tcs_set_led(t, on);
+        if (ok) { tcs_led_save(on); printf("RESULT: TCS_LED_%s\n", on ? "ON" : "OFF"); }
+    }
+    bool sat = t->valid && t->c >= 21 * 1024 - 1;   /* full scale at ATIME 0xEB */
+    char body[320];
+    int len = snprintf(body, sizeof(body),
+        "{\"present\":%s,\"ok\":%s,\"led\":%s,\"mode\":\"%s\",\"valid\":%s,\"saturated\":%s,"
+        "\"c\":%u,\"r\":%u,\"g\":%u,\"b\":%u,\"lux\":%.1f,\"cct\":%.0f}",
+        t->found ? "true" : "false", ok ? "true" : "false", t->led_on ? "true" : "false",
+        t->led_on ? "active" : "passive", t->valid ? "true" : "false", sat ? "true" : "false",
+        t->c, t->r, t->g, t->b, t->lux, t->cct);
+    http_send_simple(fd, "200 OK", "application/json", body, (size_t)len);
+}
+
 static void http_send_status(int fd) {
     char body[1024];
     int len = snprintf(body, sizeof(body),
@@ -2070,6 +2246,8 @@ static bool http_handle_connection(int fd, const char* ipstr) {
         http_send_simple(fd, "200 OK", "application/json", body, strlen(body));
     } else if (!strcmp(target, "/api/wifi")) {
         http_send_wifi(fd, query);
+    } else if (!strcmp(target, "/api/light")) {
+        http_send_light(fd, query);
     } else if (!strcmp(target, "/api/objects/reset")) {
         session_reset(); /* clears the object log and per-class counts; track ids restart */
         printf("RESULT: OBJECT_LOG_RESET\n");
@@ -2680,6 +2858,7 @@ int main(int argc, char** argv) {
     g_accel = &accel;
     cal_load();     /* 6-position calibration, before the level that was set on top of it */
     level_load();   /* mounting calibration from the web UI's Set level button */
+    tcs_init(&g_tcs);   /* optional TCS34725 colour sensor in the lid */
 
     /* env-controlled, not a new CLI arg. Defaults OFF: real, measured
      * result this session is that RGA-offloaded downscale, even in its
@@ -2918,6 +3097,7 @@ int main(int argc, char** argv) {
             }
 
             accel_update(&accel);
+            tcs_update(&g_tcs);
             int has_tilt;
             float tilt_pitch, tilt_roll;
             accel_tilt(&accel, &has_tilt, &tilt_pitch, &tilt_roll);
@@ -3114,6 +3294,7 @@ int main(int argc, char** argv) {
             double infer_ms = downscale_ms + quant_ms + npu_ms + npu.post_ms[dslot];
 
             accel_update(&accel);
+            tcs_update(&g_tcs);
 
             /* --- draw HUD overlay onto the FULL-res frame -- box
              * coordinates rescaled from MODEL_SIZE space up to
