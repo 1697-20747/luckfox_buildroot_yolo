@@ -116,8 +116,8 @@ newer RV1106 runtime exists, so models are exported with the matching toolkit
 | 40 | GPIO1_A1, wired to MPU-6050 INT (unused: the driver runs polled) |
 | 41 | GND |
 
-- **Enclosure:** STLs and renders in `drawings/LuckFox BOX/`. `tools/render_assembly.py` renders
-  the assembly.
+- **Enclosure:** moved to its own repo, `../luckfox_externals` (STLs, `.blend`, build scripts,
+  renders), shared with other LuckFox projects.
 
 ## Layout
 
@@ -125,9 +125,8 @@ newer RV1106 runtime exists, so models are exported with the matching toolkit
 |---|---|
 | `scripts/` | board software: `luckfox_video_hud_stream_cam.c` (stream server), `yolo_camd.c`, `yolo_supervisor.c`, `www/` (web UI), `app.env` |
 | `buildroot/` | overlay (init scripts, `yolo-app-start`, `yolo-wifi`, `yolo-healthlog`), kernel patches, SDK helper scripts |
-| `tools/` | build, deploy, flash, model export, test and render scripts |
+| `tools/` | build, deploy, flash, model export and test scripts |
 | `docker/` | SDK and model-conversion images |
 | `docs/` | architecture summary, vendor report |
-| `drawings/` | enclosure CAD |
 | `vendor_reference/` | Rockchip `rknn_model_zoo` reference code, kept for comparison |
 | `board/`, `scripts/luckfox_video_hud_stream.c`, `luckfox_yolov8_detect.c`, `luckfox_rknn_test.c` | Ubuntu-era (pre-2026-10-10) files, kept for history |

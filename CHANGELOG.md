@@ -5,6 +5,9 @@ Terse, dated, factual record of real changes to this project. For the full narra
 
 ## 2026-11-08
 
+- **Enclosure moved out** to `../luckfox_externals` (own git repo, history carried over with
+  `git subtree split`): `drawings/` (all STLs, the `.blend`, `src/` build scripts, renders, SC3336
+  reference, superseded parts) and `tools/render_assembly.py` removed here.
 - **New part `LuckFox Box antenna port plug.stl`** (`src/build_plug_antenna.py`) blanks the +X
   antenna opening when no antenna is fitted; fits all bases. Same style as the lid slot plugs: keyed
   stem 0.1 mm under the traced opening per side with a 0.4 mm lead-in chamfer, then a 1 mm lip cap,
