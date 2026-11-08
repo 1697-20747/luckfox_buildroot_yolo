@@ -3,6 +3,15 @@
 Terse, dated, factual record of real changes to this project. For the full narrative/discovery log
 (why, what was tried, what failed), see `PROJECT_MEMORY.md` — this file is the short version.
 
+## 2026-11-08
+
+- **New part `LuckFox Box antenna port plug.stl`** (`src/build_plug_antenna.py`) blanks the +X
+  antenna opening when no antenna is fitted; fits all bases. Same style as the lid slot plugs: keyed
+  stem 0.1 mm under the traced opening per side with a 0.4 mm lead-in chamfer, then a 1 mm lip cap,
+  1 mm thick, with a 0.5 mm round-over; the cap seats on the +X recess floor and stands 0.5 mm proud.
+  Print cap-down. Added to the `.blend` (`Antenna_port_plug`, `Enclosure plugs`); render
+  `LuckFox Box antenna port plug.png`. `to_stl.py` gains the plug's cap-down orientation.
+
 ## 2026-11-07
 
 - **Tall base `LuckFox Box tall.stl`** (+8 mm, 33.5 mm overall) so GPIO connectors fit inside; the

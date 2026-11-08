@@ -1,5 +1,5 @@
 # Convert the *_csg.json meshes written by the build scripts into print-oriented binary STLs.
-# Lids: flipped top-face-down (y and z mirrored); bases: upright. All centred on XY, bed face at z 0.
+# Lids: flipped top-face-down (y and z mirrored); bases: upright; antenna plug: cap-down (+x to -z). All centred on XY, bed face at z 0.
 import json, struct, sys, numpy as np
 
 PARTS = {  # csg json -> (STL name, flip)
@@ -10,11 +10,13 @@ PARTS = {  # csg json -> (STL name, flip)
     'base_std_csg.json':   ('LuckFox Box.stl', False),
     'base_tripod_csg.json':('LuckFox Box tripod.stl', False),
     'base_tall_csg.json':  ('LuckFox Box tall.stl', False),
+    'plug_antenna_csg.json':('LuckFox Box antenna port plug.stl', 'x'),
 }
 
 def write(src, dst, flip):
     d = json.load(open(src)); V = np.array(d['v'], float); F = np.array(d['f'])
-    if flip: V *= (1, -1, -1)   # two mirrored axes = 180 deg turn about X, winding unchanged
+    if flip == 'x': V = np.c_[-V[:, 1], V[:, 2], -V[:, 0]]   # proper rotation: outward +x face down
+    elif flip: V *= (1, -1, -1)   # two mirrored axes = 180 deg turn about X, winding unchanged
     lo, hi = V.min(0), V.max(0); V -= ((lo[0]+hi[0])/2, (lo[1]+hi[1])/2, lo[2])
     with open(dst, 'wb') as f:
         f.write(dst.encode()[:80].ljust(80, b' ')); f.write(struct.pack('<I', len(F)))
